@@ -1,4 +1,48 @@
-//! ferrum_core — zero-dependency neural-network engine (inference + training).
+//! # ferrum_core — Edge Transformer & MLP Engine
+//!
+//! Zero-dependency, pure-Rust library for building and running **hand-crafted
+//! causal Transformer models** (and classical MLPs) on CPU-only, edge, and
+//! WebAssembly targets. No GPU required. No external crates.
+//!
+//! ## Architecture at a glance
+//!
+//! ```text
+//! Tensor ──► ops (matmul, softmax, …)
+//!      │
+//!      └──► Layer trait
+//!             ├── Linear          (y = xW + b)
+//!             ├── ActivationLayer (ReLU / Softmax / …)
+//!             ├── LayerNorm       (per-row normalisation)
+//!             ├── Embedding       (token + positional lookup)
+//!             └── TransformerBlock (causal multi-head self-attention + FFN)
+//!
+//! Sequential ──► ordered pipeline of Layers
+//!
+//! loader     ──► FINF v4 binary format (save / load)
+//! csv        ──► CsvDataset, Normalizer, ModelMetadata
+//! train      ──► Net (trainable MLP), train_epoch, accuracy
+//! loss       ──► softmax_cross_entropy, mse
+//! optim      ──► Sgd (with optional momentum)
+//! rng        ──► seeded xorshift64* PRNG (deterministic)
+//! ```
+//!
+//! ## Quick start — Transformer inference
+//!
+//! ```rust,no_run
+//! use ferrum_core::*;
+//! use ferrum_core::layer::{Embedding, LayerNorm, TransformerBlock};
+//! use ferrum_core::model::Sequential;
+//!
+//! // Load a pre-trained model from FINF v4 bytes
+//! let bytes = std::fs::read("model.bin").unwrap();
+//! let (model, _norm, meta) = from_bytes(&bytes).unwrap();
+//!
+//! // Build a context of token IDs and run one forward pass
+//! let context = Tensor::matrix(1, meta.input_dim,
+//!     vec![0.0f32; meta.input_dim]).unwrap();
+//! let logits = model.forward(&context).unwrap();
+//! ```
+
 pub mod activation;
 pub mod csv;
 pub mod error;
@@ -9,6 +53,7 @@ pub mod model;
 pub mod ops;
 pub mod optim;
 pub mod rng;
+pub mod slm;
 pub mod tensor;
 pub mod train;
 
@@ -17,12 +62,13 @@ pub use csv::{
     fit_normalizer_with_target, train_val_split, CsvDataset, ModelMetadata, Normalizer, TaskType,
 };
 pub use error::{InferError, Result};
-pub use layer::{ActivationLayer, Layer, Linear};
+pub use layer::{ActivationLayer, Embedding, Layer, LayerNorm, Linear, TransformerBlock};
 pub use loader::{from_bytes, load, save, to_bytes};
 pub use loss::{mse, softmax_cross_entropy};
 pub use model::Sequential;
 pub use ops::argmax_rows;
 pub use optim::Sgd;
 pub use rng::Rng;
+pub use slm::GenerativeSLM;
 pub use tensor::Tensor;
 pub use train::{accuracy, train_epoch, Net};

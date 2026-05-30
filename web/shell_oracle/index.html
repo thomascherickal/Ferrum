@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shell Oracle — Cyberpunk Terminal Playground</title>
+    <link rel="stylesheet" href="../shared/style.css">
+    <style>
+        .playground-container {
+            max-width: 1000px;
+            margin: 2rem auto;
+            padding: 0 1.5rem;
+        }
+        .retro-terminal {
+            background-color: #050508;
+            border: 1px solid rgba(16, 185, 129, 0.2);
+            border-radius: 12px;
+            box-shadow: 0 0 30px rgba(16, 185, 129, 0.05);
+            font-family: var(--font-mono);
+            overflow: hidden;
+            margin-top: 1.5rem;
+        }
+        .terminal-header {
+            background: rgba(16, 185, 129, 0.08);
+            border-bottom: 1px solid rgba(16, 185, 129, 0.2);
+            padding: 0.75rem 1.25rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            color: var(--accent-oracle);
+            font-size: 0.85rem;
+            font-weight: 700;
+        }
+        .terminal-dots {
+            display: flex;
+            gap: 0.5rem;
+        }
+        .dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #ef4444;
+        }
+        .dot:nth-child(2) { background: #eab308; }
+        .dot:nth-child(3) { background: #22c55e; }
+        
+        .terminal-body {
+            padding: 1.5rem;
+            min-height: 250px;
+            color: var(--accent-oracle);
+            text-shadow: 0 0 5px rgba(16, 185, 129, 0.4);
+            font-size: 1rem;
+            line-height: 1.6;
+        }
+        .command-line {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+        }
+        .prompt-symbol {
+            color: #10b981;
+            font-weight: bold;
+        }
+        .output-box {
+            white-space: pre-wrap;
+            margin-top: 1rem;
+            border-left: 2px solid rgba(16, 185, 129, 0.3);
+            padding-left: 1rem;
+            min-height: 60px;
+        }
+        .cursor {
+            display: inline-block;
+            width: 8px;
+            height: 18px;
+            background: var(--accent-oracle);
+            animation: blink 1s step-end infinite;
+            vertical-align: middle;
+        }
+        @keyframes blink {
+            from, to { background-color: transparent }
+            50% { background-color: var(--accent-oracle) }
+        }
+        
+        /* Interactive controls */
+        .controls {
+            display: flex;
+            gap: 1rem;
+            margin-top: 1.5rem;
+            flex-wrap: wrap;
+        }
+        .templates-select, .slider-control input, button {
+            background: rgba(16, 185, 129, 0.05);
+            border: 1px solid rgba(16, 185, 129, 0.2);
+            color: var(--text-primary);
+            padding: 0.75rem 1.25rem;
+            border-radius: 8px;
+            font-family: var(--font-sans);
+            font-size: 0.95rem;
+            transition: var(--transition);
+        }
+        .templates-select {
+            color: var(--accent-oracle);
+            flex-grow: 1;
+            cursor: pointer;
+        }
+        .templates-select option {
+            background: var(--bg-primary);
+            color: var(--text-primary);
+        }
+        button {
+            background: var(--accent-oracle);
+            color: #000;
+            font-weight: 700;
+            cursor: pointer;
+            border: none;
+        }
+        button:hover {
+            box-shadow: 0 0 15px rgba(16, 185, 129, 0.4);
+            transform: translateY(-2px);
+        }
+        
+        .slider-group {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            background: rgba(16, 185, 129, 0.03);
+            border: 1px solid rgba(16, 185, 129, 0.1);
+            padding: 0.5rem 1rem;
+            border-radius: 8px;
+        }
+        .slider-group label {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }
+        .slider-group input[type="range"] {
+            accent-color: var(--accent-oracle);
+        }
+        
+        /* Metrics panel */
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1.5rem;
+            margin-top: 2rem;
+        }
+        .metric-card {
+            padding: 1.5rem;
+            border-color: rgba(16, 185, 129, 0.15);
+        }
+        .metric-card h3 {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 0.5rem;
+        }
+        .metric-val {
+            font-size: 1.75rem;
+            font-weight: 700;
+            color: #fff;
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <div class="nav-container">
+            <a href="../index.html" class="logo">🧬 Ferrum Edge AI</a>
+            <div class="nav-links">
+                <a href="../index.html" class="nav-link">Suite</a>
+                <a href="#" class="nav-link active">Shell Oracle</a>
+            </div>
+        </div>
+    </header>
+
+    <div class="playground-container">
+        <h2 class="glow-text" style="font-size: 2rem; font-weight: 700; margin-bottom: 0.5rem; color: var(--accent-oracle);">Shell Oracle</h2>
+        <p style="color: var(--text-secondary); margin-bottom: 1.5rem;">Causal NLP Linux CLI autocompleter running entirely on-device.</p>
+        
+        <!-- Controls -->
+        <div class="controls">
+            <select id="templateSelect" class="templates-select">
+                <option value="tar ">[tar] Gzip compression archive creation</option>
+                <option value="find">[find] Find files matching names or dimensions</option>
+                <option value="ffmp">[ffmpeg] Video/audio operations converter</option>
+                <option value="du -">[du] Disk utilization analysis</option>
+                <option value="ln -">[ln] Create soft symlinks</option>
+            </select>
+            
+            <div class="slider-group">
+                <label for="tempSlider">Temp: <span id="tempVal">0.10</span></label>
+                <input type="range" id="tempSlider" min="0.01" max="1.50" step="0.01" value="0.10">
+            </div>
+            
+            <button id="generateBtn">Weave Command</button>
+        </div>
+
+        <!-- Terminal Playground -->
+        <div class="retro-terminal">
+            <div class="terminal-header">
+                <div class="terminal-dots">
+                    <div class="dot"></div>
+                    <div class="dot"></div>
+                    <div class="dot"></div>
+                </div>
+                <span>shell_oracle_edge_v0.3.0.sh</span>
+            </div>
+            <div class="terminal-body">
+                <div class="command-line">
+                    <span class="prompt-symbol">thomas@edge-node:~$</span>
+                    <span id="terminalPrompt">tar </span>
+                    <span class="cursor"></span>
+                </div>
+                <div class="output-box" id="terminalOutput">Ready to autocomplete terminal weaving...</div>
+            </div>
+        </div>
+
+        <!-- Metrics cards -->
+        <div class="metrics-grid">
+            <div class="glass-card metric-card">
+                <h3>Prediction Model</h3>
+                <div class="metric-val" style="color: var(--accent-oracle);" id="modelName">MLP Causal</div>
+            </div>
+            <div class="glass-card metric-card">
+                <h3>Shannon Entropy</h3>
+                <div class="metric-val" id="entropyVal">0.00 nats</div>
+            </div>
+            <div class="glass-card metric-card">
+                <h3>Tokens Generated</h3>
+                <div class="metric-val" id="tokenCount">0</div>
+            </div>
+        </div>
+    </div>
+
+    <script type="module">
+        import { loadModel, generateAutoregressive, computeEntropy } from '../shared/engine.js';
+
+        let currentModel = null;
+        const terminalPrompt = document.getElementById('terminalPrompt');
+        const terminalOutput = document.getElementById('terminalOutput');
+        const generateBtn = document.getElementById('generateBtn');
+        const templateSelect = document.getElementById('templateSelect');
+        const tempSlider = document.getElementById('tempSlider');
+        const tempVal = document.getElementById('tempVal');
+        const entropyVal = document.getElementById('entropyVal');
+        const tokenCount = document.getElementById('tokenCount');
+
+        // Update Slider Label
+        tempSlider.addEventListener('input', (e) => {
+            tempVal.textContent = parseFloat(e.target.value).toFixed(2);
+        });
+
+        // Load specific binary model file
+        async function initPlayground() {
+            try {
+                terminalOutput.textContent = "Loading WebAssembly environment and model binary...";
+                currentModel = await loadModel('../datasets/shell_oracle/model.bin');
+                terminalOutput.textContent = "Offline neural network loaded. Click 'Weave Command' to generate.";
+                document.getElementById('modelName').textContent = currentModel.metadata.dataset_name;
+            } catch (err) {
+                terminalOutput.textContent = "Error loading model. Make sure model.bin exists and build_wasm was run.";
+                console.error(err);
+            }
+        }
+
+        // Handle selection change
+        templateSelect.addEventListener('change', () => {
+            terminalPrompt.textContent = templateSelect.value;
+            terminalOutput.textContent = `Awaiting autocomplete weaving for: ${templateSelect.value}...`;
+        });
+
+        // Autoregressive generation
+        generateBtn.addEventListener('click', async () => {
+            if (!currentModel) return;
+            
+            generateBtn.disabled = true;
+            generateBtn.textContent = "Weaving...";
+            
+            const seed = templateSelect.value;
+            terminalPrompt.textContent = seed;
+            terminalOutput.textContent = "";
+            tokenCount.textContent = "0";
+            entropyVal.textContent = "0.00 nats";
+            
+            let count = 0;
+            
+            try {
+                await generateAutoregressive(
+                    currentModel,
+                    seed,
+                    40,
+                    parseFloat(tempSlider.value),
+                    (nextChar, probs) => {
+                        if (nextChar === '\n') {
+                            return true; // Stop generation
+                        }
+                        
+                        // Stream character to UI
+                        terminalPrompt.textContent += nextChar;
+                        count++;
+                        tokenCount.textContent = count;
+                        
+                        // Calculate entropy of this token prediction step
+                        const entropy = computeEntropy(probs);
+                        entropyVal.textContent = `${entropy.toFixed(3)} nats`;
+                        
+                        // Small typewriter delay for beautiful animation
+                        return new Promise(resolve => setTimeout(resolve, 30));
+                    }
+                );
+            } catch (err) {
+                console.error(err);
+                terminalOutput.textContent = "An error occurred during next-character generation.";
+            } finally {
+                generateBtn.disabled = false;
+                generateBtn.textContent = "Weave Command";
+                terminalOutput.textContent = "Command complete.";
+            }
+        });
+
+        // Initialize
+        initPlayground();
+    </script>
+</body>
+</html>

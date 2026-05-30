@@ -1,209 +1,102 @@
-# Tabular ML — Pure Rust → WebAssembly
+# 🧬 Ferrum — Hand-Crafted Edge ML & Causal Transformer Engine
 
-Ten real datasets. Ten trained neural networks. Two live statistical terminals
-per page. All running in your browser from a single **128 KB WebAssembly binary**
-— compiled from hand-written Rust with **zero external dependencies**.
+Ferrum is a zero-dependency, pure-Rust workspace designed to compile and run hand-crafted machine learning models—specifically Feedforward MLPs and Decoder-Only Causal Transformers—directly at the edge, on the CPU, and in the browser via WebAssembly. 
 
-No server. No Python. No cloud. Move a slider and the prediction updates in
-microseconds, directly inside the browser tab.
+No GPU required. No PyTorch or Python runtimes. No cloud latency or API keys. Single-threaded CPU execution compiled directly to highly compact binaries under 180 KB.
 
 ---
 
-## Live demo
+## Workspace Layout
 
+```text
+ferrum_lib/
+├── shell_oracle/              # Parent Crate 1: CLI commands weaver
+├── ambient_poet/              # Parent Crate 2: System state Zen haiku poet
+├── brand_alchemist/           # Parent Crate 3: Startup brand & slogan copywriter
+│
+└── ferrum/                    # Core Workspace Crate
+    ├── Cargo.toml             # Workspace definition (members: ferrum_core, tabular_wasm, train_cli, tests)
+    │
+    ├── ferrum_core/           # ML Engine (Pure Rust, std only)
+    │   └── src/
+    │       ├── slm.rs         # [NEW] Causal Small Language Model (SLM) library module
+    │       ├── layer.rs       # Layer trait: Linear, LayerNorm, Embedding, TransformerBlock
+    │       ├── model.rs       # Sequential network pipeline
+    │       ├── tensor.rs      # High-performance row-major float arrays
+    │       ├── ops.rs         # Mathematical operations: matmul, bias, argmax, softmax
+    │       ├── rng.rs         # Seeded xorshift64* pseudo-random generator
+    │       ├── loss.rs        # Loss kernels (Softmax Cross-Entropy & MSE with gradients)
+    │       ├── optim.rs       # SGD optimizer with momentum
+    │       ├── csv.rs         # Robust CSV dataset parser, normalizer, and metadata
+    │       ├── train.rs       # Trainable layer wrappers (DenseT, ReluT, Net)
+    │       └── loader.rs      # Serializer/deserializer for self-contained FINF v4 binaries
+    │
+    ├── tabular_wasm/          # WebAssembly Bindings (wasm-bindgen)
+    │   └── src/lib.rs         # TabularModel and TransformerSLMModel WASM bindings
+    │
+    ├── train_cli/             # Generic CSV tabular model trainer
+    ├── tests/                 # 195+ automated unit and integration tests
+    │
+    └── web/                   # WASM Web Playgrounds
+        ├── index.html         # Suite gateway portal page
+        ├── shared/            # Common assets: style.css & engine.js WASM interface
+        ├── shell_oracle/      # Cyberpunk terminal autocompleter playground
+        ├── ambient_poet/      # Calming Zen telemetry composer playground
+        └── brand_alchemist/   # Modern gradient startup weaver playground
 ```
-https://<your-github-username>.github.io/tabular-ml/
-```
-
-Landing page shows all 10 dataset cards. Each card opens an interactive page with:
-- **Sliders** built dynamically from embedded feature metadata
-- **Prediction display** with probability bars (classification) or a scaled value gauge (regression)
-- **Terminal 1 — Model Statistics**: input vector z-scores, feature range positions, architecture summary
-- **Terminal 2 — Quantitative Report**: entropy analysis, log-probabilities, odds ratios (classification) or z-score, quartile, reference intervals (regression)
 
 ---
 
-## Datasets
+## Key Features
 
-| | Dataset | Task | Features | Rows | Result |
-|---|---------|------|----------|------|--------|
-| 🌸 | Iris Species | 3-class | 4 | 150 | 98.7% acc |
-| 🐧 | Palmer Penguins | 3-class | 4 | 342 | 99.4% acc |
-| 🌾 | Wheat Seeds | 3-class | 7 | 210 | 99.5% acc |
-| 🍷 | Wine Quality | 3-class | 11 | 1,599 | 80.9% acc |
-| 🩺 | Pima Diabetes | binary | 8 | 768 | 93.0% acc |
-| ❤️ | Heart Disease | binary | 13 | 297 | 96.3% acc |
-| 🔬 | Breast Cancer | binary | 30 | 569 | 99.3% acc |
-| 🚢 | Titanic Survival | binary | 6 | 891 | 86.9% acc |
-| 🚗 | Auto MPG | regression | 6 | 392 | RMSE 1.95 mpg |
-| 🏠 | California Housing | regression | 8 | 20,433 | RMSE ~$52k |
+1. **`ferrum_core` as an Independent Library**: A lightweight, auditable Rust engine that compiles cleanly to OS-less targets (like `wasm32-unknown-unknown`) because it relies strictly on `std` and zero external crates.
+2. **Generic `slm` Causal Module**: An out-of-the-box library engine inside `ferrum_core` designed to train small next-character language models from scratch on custom raw text corpora, utilizing hex-encoded vocabulary mappings to maintain 100% data integrity within CSV rows.
+3. **Decoder-Only Causal Transformer Blocks**: Includes `Embedding` (token + positional), `LayerNorm`, and `TransformerBlock` (Causal Multi-Head Self-Attention + FFN) layers for running complex Small Language Models (SLMs) in WASM.
+4. **Stunning Web Playgrounds**: Three highly optimized, beautiful, responsive interactive browser applications that stream characters, output Shannon entropy, and render probability distributions dynamically.
 
 ---
 
-## Quick start
+## Quick Start
 
+### 1. Pre-requisites (One-time)
 ```bash
-# Prerequisites (one-time)
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.122 --locked
-
-# 1  Run all 131 tests
-cargo test --workspace
-
-# 2  Train all 10 models (~60 seconds)
-bash scripts/train_all.sh
-
-# 3  Compile to WASM
-bash scripts/build_wasm.sh
-
-# 4  Serve
-python3 -m http.server 8080 --directory web
-#     → open http://localhost:8080
 ```
 
-For a fresh clone without pre-downloaded CSVs, also run:
-
+### 2. Run the 196 Automated Tests
 ```bash
-bash scripts/download_datasets.sh   # fetches + cleans all 10 source files
+cargo test --workspace
 ```
 
----
-
-## Repository layout
-
-```
-tabular_ml/
-├── .github/workflows/deploy.yml  # CI: test → train → WASM → GitHub Pages
-├── scripts/
-│   ├── download_datasets.sh      # fetch + clean all source CSVs
-│   ├── train_all.sh              # train all 10 models
-│   └── build_wasm.sh             # compile to WASM
-│
-├── ferrum_core/                  # ML engine — pure Rust, std only
-│   └── src/
-│       ├── error.rs              # InferError, Result<T>
-│       ├── tensor.rs             # Tensor: Vec<f32> + row-major shape
-│       ├── ops.rs                # matmul, bias-add, transpose, argmax, softmax
-│       ├── activation.rs         # ReLU, Sigmoid, Tanh, Softmax, Identity
-│       ├── layer.rs              # Layer trait, Linear, ActivationLayer
-│       ├── model.rs              # Sequential pipeline
-│       ├── rng.rs                # xorshift64* PRNG
-│       ├── loss.rs               # softmax cross-entropy + MSE (both with gradients)
-│       ├── optim.rs              # SGD with momentum
-│       ├── csv.rs                # CSV parser, Normalizer, ModelMetadata, TaskType
-│       ├── train.rs              # DenseT, ReluT, Net, backprop, train_epoch
-│       └── loader.rs             # FINF v3 binary format
-│
-├── tabular_wasm/src/lib.rs       # WASM bindings: TabularModel { predict, metadata, norm_encoded }
-├── train_cli/src/main.rs         # Generic CSV trainer (auto-detects task type)
-├── tests/integration_test.rs     # 39 end-to-end integration tests
-│
-├── *.csv / iris.data             # 10 cleaned training datasets
-│
-└── web/                          # ← serve this directory
-    ├── index.html                # Landing page (10 dataset cards)
-    ├── shared/
-    │   ├── engine.js             # WASM loader + inference + slider builder
-    │   ├── stats.js              # Live statistical terminals (392 lines)
-    │   └── style.css             # Dark theme + terminal CSS
-    ├── pkg/
-    │   ├── tabular_wasm_bg.wasm  # Compiled ML engine (~128 KB)
-    │   └── tabular_wasm.js       # wasm-bindgen glue (~8 KB)
-    └── datasets/
-        └── <slug>/
-            ├── index.html        # Dataset page (identical structure, metadata-driven)
-            └── model.bin         # FINF v3: weights + normalizer + metadata JSON
+### 3. Compile the WebAssembly Package
+```bash
+bash scripts/build_wasm.sh
 ```
 
----
+### 4. Run the Standalone Parent Applications
+To train, export, and run interactive generation loops:
+```bash
+# Shell Oracle
+cd ../shell_oracle && cargo run --release
 
-## The FINF v3 model format
+# Ambient Poet
+cd ../ambient_poet && cargo run --release
 
-Each `model.bin` is a self-contained binary file in the **FINF v3** format:
-
-```
-4 bytes  b"FINF"                      magic
-u32      version = 3
-u32      normalizer_byte_length
-[bytes]  "mean0,std0;mean1,std1;…"    z-score stats (features + optional target)
-u32      metadata_byte_length
-[bytes]  { JSON }                     ModelMetadata (feature names, ranges,
-                                      class names, task type, input/output dims)
-u32      num_layers
-[layers] u8 tag, then layer bytes
+# Brand Alchemist
+cd ../brand_alchemist && cargo run --release
 ```
 
-The embedded metadata is what allows the browser to build sliders, label
-probability bars, and power both statistical terminals — without any per-dataset
-JavaScript or additional configuration files.
+### 5. Launch the Web Playgrounds
+Copy the trained models to the web folder and host a local server:
+```bash
+# From workspace root (ferrum/)
+mkdir -p web/datasets/shell_oracle web/datasets/ambient_poet web/datasets/brand_alchemist
+cp ../shell_oracle/shell_oracle.bin web/datasets/shell_oracle/model.bin
+cp ../ambient_poet/ambient_poet.bin web/datasets/ambient_poet/model.bin
+cp ../brand_alchemist/brand_alchemist.bin web/datasets/brand_alchemist/model.bin
 
----
-
-## The statistical terminals
-
-Every dataset page updates two terminals on every slider drag:
-
-**Terminal 1 — Model Statistics**
-
-| Column | What it shows |
-|--------|--------------|
-| Feature | Name from CSV header |
-| Value | Current raw slider value |
-| Z-score | (value − μ) / σ from training data; colour-coded by magnitude |
-| Range% | Mini bar: position within [dataset min, dataset max] |
-| Z-bar | Centred bar: direction and distance from the training mean |
-
-Plus a static architecture card showing layer dimensions, task, and file format.
-
-**Terminal 2 — Quantitative Report (classification)**
-
-- Confidence badge: Certain / Confident / Uncertain / Toss-up (from Shannon entropy)
-- Full probability table: P, log P, odds ratio for every class
-- Shannon entropy H(p) gauge: 0 nats = model certain, ln(C) = maximally confused
-- Top-2 margin (P(winner) − P(runner-up))
-
-**Terminal 2 — Quantitative Report (regression)**
-
-- Prediction on a range scale with dataset mean marker
-- Z-score of the prediction relative to training targets
-- Percentage above/below the dataset mean
-- ±1σ reference interval; approximate quartile
-
----
-
-## Test coverage
-
+# Serve
+python3 -m http.server 8080 --directory web
+# Open http://localhost:8080
 ```
-cargo test --workspace    →   131 tests, 0 failures
-```
-
-| Suite | Tests | What it verifies |
-|-------|-------|-----------------|
-| `ferrum_core` unit | 86 | Every arithmetic kernel, loss (finite-diff gradient check), normalizer, CSV parser, metadata JSON roundtrip, FINF v3 serialisation |
-| Integration | 39 | All 10 datasets: parse → train → serialise → reload → infer; classification outputs sum to 1; regression predictions in plausible ranges |
-| `tabular_wasm` unit | 6 | WASM glue: load, infer, metadata fields, norm_encoded, batch vs individual agreement, corrupt-byte rejection |
-
----
-
-## Deployment
-
-See **[DEPLOYMENT.md](DEPLOYMENT.md)** for:
-
-- Full build-from-source walkthrough (download → test → train → WASM → serve)
-- GitHub Pages (manual + GitHub Actions CI/CD)
-- Cloudflare Pages and Netlify
-- Custom domain + HTTPS
-- Adding a new dataset (3-step process)
-- Troubleshooting common issues
-
----
-
-## Why zero dependencies?
-
-- The `wasm32-unknown-unknown` WASM target has no OS, no file system, no libc.
-  A `std`-only crate compiles to it cleanly; any crate with OS dependencies won't.
-- The binary contains exactly what inference needs — no Python interpreter,
-  no framework, no runtime overhead.
-- Every line of the ML pipeline is in this repository and auditable.
-- The deployment story *is* the architecture story: the same constraint that
-  requires zero dependencies is what makes a 128 KB browser-side ML engine possible.

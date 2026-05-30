@@ -1,22 +1,36 @@
-//! FINF binary format v3: weights + normalizer + ModelMetadata JSON.
+//! FINF binary format v4: weights + normalizer + ModelMetadata JSON.
 //!
 //! Layout (all integers little-endian):
 //!   4 bytes  b"FINF"
-//!   u32      version = 3
-//!   u32      norm_len;    [bytes] normalizer string
+//!   u32      version = 4
+//!   u32      norm_len;    [bytes] normalizer string  (empty string for SLM)
 //!   u32      meta_len;    [bytes] ModelMetadata JSON
 //!   u32      num_layers
 //!   per layer: u8 tag, then layer bytes
+//!
+//! Layer Tags:
+//!   0 = Linear
+//!   1 = ActivationLayer
+//!   2 = Embedding
+//!   3 = LayerNorm
+//!   4 = TransformerBlock
 use crate::activation::Activation;
 use crate::csv::{ModelMetadata, Normalizer};
 use crate::error::{InferError, Result};
-use crate::layer::{ActivationLayer, Linear};
+use crate::layer::{ActivationLayer, Embedding, LayerNorm, Linear, TransformerBlock};
 use crate::model::Sequential;
 
 const MAGIC: &[u8; 4] = b"FINF";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const TAG_LINEAR: u8 = 0;
 const TAG_ACTIVATION: u8 = 1;
+const TAG_EMBEDDING: u8 = 2;
+const TAG_LAYERNORM: u8 = 3;
+const TAG_TRANSFORMER_BLOCK: u8 = 4;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reader helper
+// ─────────────────────────────────────────────────────────────────────────────
 
 struct Reader<'a> {
     bytes: &'a [u8],
@@ -45,6 +59,9 @@ impl<'a> Reader<'a> {
         let b = self.take(4)?;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
+    fn usize(&mut self) -> Result<usize> {
+        Ok(self.u32()? as usize)
+    }
     fn f32(&mut self) -> Result<f32> {
         let b = self.take(4)?;
         Ok(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -58,44 +75,107 @@ impl<'a> Reader<'a> {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Writer helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn push_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+fn push_usize(out: &mut Vec<u8>, v: usize) {
+    push_u32(out, v as u32);
+}
+fn push_f32s(out: &mut Vec<u8>, data: &[f32]) {
+    for &x in data {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+}
+fn push_str(out: &mut Vec<u8>, s: &str) {
+    push_u32(out, s.len() as u32);
+    out.extend_from_slice(s.as_bytes());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Serialization (to_bytes)
+// ─────────────────────────────────────────────────────────────────────────────
+
 pub fn to_bytes(model: &Sequential, norm: &Normalizer, meta: &ModelMetadata) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&VERSION.to_le_bytes());
+    push_u32(&mut out, VERSION);
 
-    let norm_s = norm.encode();
-    out.extend_from_slice(&(norm_s.len() as u32).to_le_bytes());
-    out.extend_from_slice(norm_s.as_bytes());
+    // Normalizer (can be empty string for SLM tasks)
+    push_str(&mut out, &norm.encode());
 
-    let meta_s = meta.to_json();
-    out.extend_from_slice(&(meta_s.len() as u32).to_le_bytes());
-    out.extend_from_slice(meta_s.as_bytes());
+    // Metadata JSON
+    push_str(&mut out, &meta.to_json());
 
-    out.extend_from_slice(&(model.len() as u32).to_le_bytes());
+    push_u32(&mut out, model.len() as u32);
     for layer in model.layers() {
         let any = layer.as_any();
+
         if let Some(lin) = any.downcast_ref::<Linear>() {
             out.push(TAG_LINEAR);
-            out.extend_from_slice(&(lin.in_features() as u32).to_le_bytes());
-            out.extend_from_slice(&(lin.out_features() as u32).to_le_bytes());
-            for x in &lin.weight.data {
-                out.extend_from_slice(&x.to_le_bytes());
-            }
-            for x in &lin.bias.data {
-                out.extend_from_slice(&x.to_le_bytes());
-            }
+            push_usize(&mut out, lin.in_features());
+            push_usize(&mut out, lin.out_features());
+            push_f32s(&mut out, &lin.weight.data);
+            push_f32s(&mut out, &lin.bias.data);
+
         } else if let Some(act) = any.downcast_ref::<ActivationLayer>() {
             out.push(TAG_ACTIVATION);
             out.push(act.kind.tag());
+
+        } else if let Some(emb) = any.downcast_ref::<Embedding>() {
+            out.push(TAG_EMBEDDING);
+            push_usize(&mut out, emb.vocab_size());
+            push_usize(&mut out, emb.max_seq_len());
+            push_usize(&mut out, emb.embedding_dim());
+            push_f32s(&mut out, &emb.token_weight.data);
+            push_f32s(&mut out, &emb.pos_weight.data);
+
+        } else if let Some(ln) = any.downcast_ref::<LayerNorm>() {
+            out.push(TAG_LAYERNORM);
+            push_usize(&mut out, ln.dim());
+            push_f32s(&mut out, &ln.gamma.data);
+            push_f32s(&mut out, &ln.beta.data);
+
+        } else if let Some(tb) = any.downcast_ref::<TransformerBlock>() {
+            out.push(TAG_TRANSFORMER_BLOCK);
+            push_usize(&mut out, tb.context_len());
+            push_usize(&mut out, tb.num_heads());
+            push_usize(&mut out, tb.embedding_dim());
+            push_usize(&mut out, tb.hidden_dim());
+            // Serialize all projection weights in order: ln1, q, k, v, out, ln2, ffn1, ffn2
+            push_f32s(&mut out, &tb.ln1.gamma.data);
+            push_f32s(&mut out, &tb.ln1.beta.data);
+            push_f32s(&mut out, &tb.q_proj.weight.data);
+            push_f32s(&mut out, &tb.q_proj.bias.data);
+            push_f32s(&mut out, &tb.k_proj.weight.data);
+            push_f32s(&mut out, &tb.k_proj.bias.data);
+            push_f32s(&mut out, &tb.v_proj.weight.data);
+            push_f32s(&mut out, &tb.v_proj.bias.data);
+            push_f32s(&mut out, &tb.out_proj.weight.data);
+            push_f32s(&mut out, &tb.out_proj.bias.data);
+            push_f32s(&mut out, &tb.ln2.gamma.data);
+            push_f32s(&mut out, &tb.ln2.beta.data);
+            push_f32s(&mut out, &tb.ffn1.weight.data);
+            push_f32s(&mut out, &tb.ffn1.bias.data);
+            push_f32s(&mut out, &tb.ffn2.weight.data);
+            push_f32s(&mut out, &tb.ffn2.bias.data);
+
         } else {
             return Err(InferError::Format(format!(
-                "unknown layer: {}",
+                "unknown layer type: {}",
                 layer.name()
             )));
         }
     }
     Ok(out)
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Deserialization (from_bytes)
+// ─────────────────────────────────────────────────────────────────────────────
 
 pub fn from_bytes(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata)> {
     let mut r = Reader::new(bytes);
@@ -108,21 +188,28 @@ pub fn from_bytes(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata
             "unsupported FINF v{ver} (need v{VERSION})"
         )));
     }
-    let norm_len = r.u32()? as usize;
-    let norm = Normalizer::decode(r.utf8(norm_len)?)?;
-    let meta_len = r.u32()? as usize;
+
+    let norm_len = r.usize()?;
+    let norm_str = r.utf8(norm_len)?;
+    // SLM models may have empty normalizer — return trivial identity norm
+    let norm = if norm_str.is_empty() {
+        Normalizer { means: vec![], stds: vec![] }
+    } else {
+        Normalizer::decode(norm_str)?
+    };
+
+    let meta_len = r.usize()?;
     let meta = ModelMetadata::from_json(r.utf8(meta_len)?)?;
 
-    let num_layers = r.u32()? as usize;
+    let num_layers = r.usize()?;
     let mut model = Sequential::new();
     for _ in 0..num_layers {
         match r.u8()? {
             TAG_LINEAR => {
-                let in_f = r.u32()? as usize;
-                let out_f = r.u32()? as usize;
+                let in_f = r.usize()?;
+                let out_f = r.usize()?;
                 model.push(Box::new(Linear::new(
-                    in_f,
-                    out_f,
+                    in_f, out_f,
                     r.f32_vec(in_f * out_f)?,
                     r.f32_vec(out_f)?,
                 )?));
@@ -133,6 +220,43 @@ pub fn from_bytes(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata
                     Activation::from_tag(t)
                         .ok_or_else(|| InferError::Format(format!("bad act tag {t}")))?,
                 )));
+            }
+            TAG_EMBEDDING => {
+                let vocab_size = r.usize()?;
+                let max_seq_len = r.usize()?;
+                let embedding_dim = r.usize()?;
+                model.push(Box::new(Embedding::new(
+                    vocab_size, max_seq_len, embedding_dim,
+                    r.f32_vec(vocab_size * embedding_dim)?,
+                    r.f32_vec(max_seq_len * embedding_dim)?,
+                )?));
+            }
+            TAG_LAYERNORM => {
+                let dim = r.usize()?;
+                model.push(Box::new(LayerNorm::new(
+                    dim,
+                    r.f32_vec(dim)?,
+                    r.f32_vec(dim)?,
+                )?));
+            }
+            TAG_TRANSFORMER_BLOCK => {
+                let context_len = r.usize()?;
+                let num_heads = r.usize()?;
+                let embedding_dim = r.usize()?;
+                let hidden_dim = r.usize()?;
+                let c = embedding_dim;
+                let h = hidden_dim;
+                model.push(Box::new(TransformerBlock::new(
+                    context_len, num_heads, embedding_dim,
+                    r.f32_vec(c)?,  r.f32_vec(c)?,    // ln1 gamma, beta
+                    r.f32_vec(c*c)?, r.f32_vec(c)?,    // q weight, bias
+                    r.f32_vec(c*c)?, r.f32_vec(c)?,    // k weight, bias
+                    r.f32_vec(c*c)?, r.f32_vec(c)?,    // v weight, bias
+                    r.f32_vec(c*c)?, r.f32_vec(c)?,    // out weight, bias
+                    r.f32_vec(c)?,  r.f32_vec(c)?,    // ln2 gamma, beta
+                    r.f32_vec(c*h)?, r.f32_vec(h)?,    // ffn1 weight, bias
+                    r.f32_vec(h*c)?, r.f32_vec(c)?,    // ffn2 weight, bias
+                )?));
             }
             t => return Err(InferError::Format(format!("bad layer tag {t}"))),
         }
@@ -148,6 +272,9 @@ pub fn load(path: &str) -> Result<(Sequential, Normalizer, ModelMetadata)> {
     from_bytes(&std::fs::read(path)?)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,19 +285,15 @@ mod tests {
 
     fn make_bundle() -> (Sequential, Normalizer, ModelMetadata) {
         let l1 = Linear::new(
-            4,
-            8,
+            4, 8,
             (0..32).map(|i| i as f32 * 0.01).collect(),
             vec![0.0; 8],
-        )
-        .unwrap();
+        ).unwrap();
         let l2 = Linear::new(
-            8,
-            3,
+            8, 3,
             (0..24).map(|i| i as f32 * -0.01).collect(),
             vec![0.1; 3],
-        )
-        .unwrap();
+        ).unwrap();
         let model = Sequential::new()
             .with(Box::new(l1))
             .with(Box::new(ActivationLayer::new(Activation::ReLU)))
@@ -190,6 +313,40 @@ mod tests {
             target_range: [0.0, 2.0],
             input_dim: 4,
             output_dim: 3,
+        };
+        (model, norm, meta)
+    }
+
+    fn make_embedding_bundle() -> (Sequential, Normalizer, ModelMetadata) {
+        let vocab_size = 5;
+        let max_seq_len = 4;
+        let embedding_dim = 8;
+        let emb = Embedding::new(
+            vocab_size, max_seq_len, embedding_dim,
+            (0..vocab_size * embedding_dim).map(|i| i as f32 * 0.1).collect(),
+            (0..max_seq_len * embedding_dim).map(|i| i as f32 * 0.01).collect(),
+        ).unwrap();
+        let lm_head = Linear::new(
+            embedding_dim, vocab_size,
+            (0..embedding_dim * vocab_size).map(|i| i as f32 * 0.01).collect(),
+            vec![0.0; vocab_size],
+        ).unwrap();
+        let model = Sequential::new()
+            .with(Box::new(emb))
+            .with(Box::new(ActivationLayer::new(Activation::Softmax)))
+            .with(Box::new(lm_head));
+        let norm = Normalizer { means: vec![], stds: vec![] };
+        let vocab: Vec<String> = "abcde".chars().map(|c| c.to_string()).collect();
+        let meta = ModelMetadata {
+            dataset_name: "tiny_slm".into(),
+            task: TaskType::TransformerSLM,
+            feature_names: (0..max_seq_len).map(|i| format!("c_{i}")).collect(),
+            feature_ranges: vec![[0.0, vocab_size as f32]; max_seq_len],
+            class_names: vocab,
+            target_name: "next_char".into(),
+            target_range: [0.0, vocab_size as f32],
+            input_dim: max_seq_len,
+            output_dim: vocab_size,
         };
         (model, norm, meta)
     }
@@ -218,9 +375,21 @@ mod tests {
     }
 
     #[test]
+    fn embedding_bundle_roundtrips() {
+        let (model, norm, meta) = make_embedding_bundle();
+        let bytes = to_bytes(&model, &norm, &meta).unwrap();
+        let (m2, _, m2meta) = from_bytes(&bytes).unwrap();
+        assert_eq!(m2meta.task, TaskType::TransformerSLM);
+        assert_eq!(m2meta.class_names, vec!["a", "b", "c", "d", "e"]);
+        // Forward should still work
+        let x = Tensor::matrix(1, 4, vec![0.0, 1.0, 2.0, 3.0]).unwrap();
+        assert!(m2.forward(&x).is_ok());
+    }
+
+    #[test]
     fn bad_magic_errors() {
         assert!(matches!(
-            from_bytes(b"XXXX\x03\x00\x00\x00"),
+            from_bytes(b"XXXX\x04\x00\x00\x00"),
             Err(InferError::Format(_))
         ));
     }
@@ -243,4 +412,97 @@ mod tests {
         bytes.truncate(bytes.len() - 8);
         assert!(from_bytes(&bytes).is_err());
     }
+
+    #[derive(Debug)]
+    struct DummyLayer;
+    impl crate::layer::Layer for DummyLayer {
+        fn forward(&self, x: &Tensor) -> Result<Tensor> { Ok(x.clone()) }
+        fn name(&self) -> String { "DummyLayer".to_string() }
+        fn as_any(&self) -> &dyn std::any::Any { self }
+    }
+
+    #[test]
+    fn to_bytes_unknown_layer_error() {
+        let mut model = Sequential::new();
+        model.push(Box::new(DummyLayer));
+        let norm = Normalizer { means: vec![], stds: vec![] };
+        let meta = ModelMetadata {
+            dataset_name: "test".into(),
+            task: TaskType::Classification,
+            feature_names: vec![],
+            feature_ranges: vec![],
+            class_names: vec![],
+            target_name: "".into(),
+            target_range: [0.0, 0.0],
+            input_dim: 0,
+            output_dim: 0,
+        };
+        assert!(matches!(to_bytes(&model, &norm, &meta), Err(InferError::Format(_))));
+    }
+
+    #[test]
+    fn unknown_layer_tag_error() {
+        let (_, _, meta) = make_bundle();
+        let mut malformed = Vec::new();
+        malformed.extend_from_slice(MAGIC);
+        push_u32(&mut malformed, VERSION);
+        push_str(&mut malformed, ""); // empty normalizer
+        push_str(&mut malformed, &meta.to_json()); // metadata JSON
+        push_u32(&mut malformed, 1); // 1 layer
+        malformed.push(99); // bad layer tag!
+        assert!(matches!(from_bytes(&malformed), Err(InferError::Format(_))));
+    }
+
+    #[test]
+    fn layernorm_and_transformerblock_roundtrip() {
+        let context_len = 4;
+        let num_heads = 2;
+        let embedding_dim = 8;
+        let hidden_dim = 16;
+        let c = embedding_dim;
+        let h = hidden_dim;
+
+        let ln = LayerNorm::new(embedding_dim, vec![1.0; c], vec![0.0; c]).unwrap();
+        let tb = TransformerBlock::new(
+            context_len, num_heads, embedding_dim,
+            vec![1.0; c], vec![0.0; c],
+            vec![0.1; c*c], vec![0.0; c],
+            vec![0.1; c*c], vec![0.0; c],
+            vec![0.1; c*c], vec![0.0; c],
+            vec![0.1; c*c], vec![0.0; c],
+            vec![1.0; c], vec![0.0; c],
+            vec![0.1; c*h], vec![0.0; h],
+            vec![0.1; h*c], vec![0.0; c],
+        ).unwrap();
+
+        let mut model = Sequential::new();
+        model.push(Box::new(ln));
+        model.push(Box::new(tb));
+
+        let norm = Normalizer { means: vec![], stds: vec![] };
+        let meta = ModelMetadata {
+            dataset_name: "tb_test".into(),
+            task: TaskType::TransformerSLM,
+            feature_names: vec![],
+            feature_ranges: vec![],
+            class_names: vec![],
+            target_name: "".into(),
+            target_range: [0.0, 0.0],
+            input_dim: embedding_dim,
+            output_dim: embedding_dim,
+        };
+
+        let bytes = to_bytes(&model, &norm, &meta).unwrap();
+        let (m2, _, m2meta) = from_bytes(&bytes).unwrap();
+        assert_eq!(m2.len(), 2);
+        assert_eq!(m2meta.task, TaskType::TransformerSLM);
+
+        let input = Tensor::matrix(4, embedding_dim, vec![0.5; 4 * embedding_dim]).unwrap();
+        let out1 = model.forward(&input).unwrap();
+        let out2 = m2.forward(&input).unwrap();
+        for (a, b) in out1.data.iter().zip(&out2.data) {
+            assert!((a - b).abs() < 1e-6);
+        }
+    }
 }
+

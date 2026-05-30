@@ -52,11 +52,40 @@ mod tests {
 
     #[test]
     fn display_shape_mismatch() {
-        let e = InferError::ShapeMismatch {
-            expected: 4,
-            got: 3,
-        };
-        assert!(e.to_string().contains("expected 4"));
+        let e = InferError::ShapeMismatch { expected: 4, got: 3 };
+        let s = e.to_string();
+        assert!(s.contains("expected 4") && s.contains("got 3"));
+    }
+
+    #[test]
+    fn display_dim_mismatch() {
+        let e = InferError::DimMismatch("test msg".into());
+        assert!(e.to_string().contains("test msg"));
+    }
+
+    #[test]
+    fn display_not_a_matrix() {
+        let e = InferError::NotAMatrix(vec![3]);
+        let s = e.to_string();
+        assert!(s.contains("rank-2") && s.contains("[3]"));
+    }
+
+    #[test]
+    fn display_io() {
+        let e = InferError::Io("disk full".into());
+        assert!(e.to_string().contains("disk full"));
+    }
+
+    #[test]
+    fn display_format() {
+        let e = InferError::Format("bad magic".into());
+        assert!(e.to_string().contains("bad magic"));
+    }
+
+    #[test]
+    fn display_parse_error() {
+        let e = InferError::ParseError("not a float".into());
+        assert!(e.to_string().contains("not a float"));
     }
 
     #[test]
@@ -73,4 +102,19 @@ mod tests {
         let e: InferError = r.unwrap_err().into();
         assert!(matches!(e, InferError::ParseError(_)));
     }
+
+    #[test]
+    fn infer_error_implements_std_error() {
+        // Ensures InferError satisfies the std::error::Error bound.
+        let e: Box<dyn std::error::Error> = Box::new(InferError::Format("x".into()));
+        assert!(!e.to_string().is_empty());
+    }
+
+    #[test]
+    fn clone_and_eq() {
+        let a = InferError::DimMismatch("a".into());
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
 }
+

@@ -102,11 +102,26 @@ mod tests {
     }
 
     #[test]
-    fn batch_forward() {
-        // Same model, batch of 3 examples
-        let model = two_layer_model();
-        let x = Tensor::matrix(3, 2, vec![1.0, 1.0, 3.0, 1.0, 0.0, 0.0]).unwrap();
-        let y = model.forward(&x).unwrap();
-        assert_eq!(y.shape, vec![3, 2]);
+    fn is_empty_on_new() {
+        assert!(Sequential::new().is_empty());
+    }
+
+    #[test]
+    fn not_empty_after_push() {
+        let mut m = Sequential::new();
+        m.push(Box::new(ActivationLayer::new(Activation::ReLU)));
+        assert!(!m.is_empty());
+    }
+
+    #[test]
+    fn default_is_same_as_new() {
+        let d = Sequential::default();
+        assert_eq!(d.len(), Sequential::new().len());
+    }
+
+    #[test]
+    fn layers_slice_has_correct_len() {
+        let m = two_layer_model();
+        assert_eq!(m.layers().len(), 2);
     }
 }

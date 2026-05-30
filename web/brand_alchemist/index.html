@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Brand Alchemist — Startup & Slogan Creative Playground</title>
+    <link rel="stylesheet" href="../shared/style.css">
+    <style>
+        .alchemist-container {
+            max-width: 1000px;
+            margin: 2rem auto;
+            padding: 0 1.5rem;
+        }
+        .alchemist-grid {
+            display: grid;
+            grid-template-columns: 1fr 1.2fr;
+            gap: 2rem;
+            margin-top: 1.5rem;
+        }
+        @media (max-width: 768px) {
+            .alchemist-grid { grid-template-columns: 1fr; }
+        }
+        
+        .output-card {
+            background: linear-gradient(135deg, rgba(20, 20, 30, 0.6) 0%, rgba(10, 10, 15, 0.9) 100%);
+            padding: 3rem 2rem;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+            border: 1px solid rgba(245, 158, 11, 0.15);
+            border-radius: 16px;
+            min-height: 300px;
+            box-shadow: 0 15px 40px rgba(0, 0, 0, 0.4);
+        }
+        
+        .brand-output {
+            font-size: 2.75rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, #fff 0%, #fbbf24 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 1rem;
+            text-transform: capitalize;
+            letter-spacing: -0.02em;
+        }
+        .slogan-output {
+            font-size: 1.2rem;
+            color: var(--text-secondary);
+            font-weight: 500;
+            max-width: 80%;
+            line-height: 1.6;
+        }
+        
+        /* Options Card */
+        .options-card {
+            padding: 2rem;
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+        }
+        .option-group {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+        .option-group label {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        
+        .select-input, .range-input {
+            width: 100%;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--border-color);
+            color: #fff;
+            padding: 0.8rem 1.2rem;
+            border-radius: 8px;
+            font-family: var(--font-sans);
+            font-size: 0.95rem;
+            outline: none;
+            transition: var(--transition);
+        }
+        .select-input:focus {
+            border-color: rgba(245, 158, 11, 0.4);
+        }
+        .range-input {
+            accent-color: var(--accent-alchemist);
+        }
+        
+        .alchemist-btn {
+            background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+            color: #000;
+            font-weight: 700;
+            border: none;
+            padding: 1rem 2rem;
+            font-size: 1.05rem;
+            border-radius: 8px;
+            cursor: pointer;
+            box-shadow: 0 4px 15px rgba(245, 158, 11, 0.25);
+            transition: var(--transition);
+        }
+        .alchemist-btn:hover {
+            box-shadow: 0 6px 20px rgba(245, 158, 11, 0.45);
+            transform: translateY(-2px);
+        }
+        
+        /* Distribution panel */
+        .dist-card {
+            margin-top: 2rem;
+            padding: 2rem;
+        }
+        .bar-chart {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+            margin-top: 1rem;
+        }
+        .bar-row {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+        .bar-label {
+            font-family: var(--font-mono);
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            width: 60px;
+        }
+        .bar-wrapper {
+            flex-grow: 1;
+            height: 10px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 9999px;
+            overflow: hidden;
+        }
+        .bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #f59e0b 0%, #fbbf24 100%);
+            border-radius: 9999px;
+            transition: var(--transition);
+        }
+        .bar-value {
+            font-family: var(--font-mono);
+            font-size: 0.85rem;
+            color: var(--accent-alchemist);
+            width: 60px;
+            text-align: right;
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <div class="nav-container">
+            <a href="../index.html" class="logo">🧬 Ferrum Edge AI</a>
+            <div class="nav-links">
+                <a href="../index.html" class="nav-link">Suite</a>
+                <a href="#" class="nav-link active">Brand Alchemist</a>
+            </div>
+        </div>
+    </header>
+
+    <div class="alchemist-container">
+        <h2 class="glow-text" style="font-size: 2rem; font-weight: 700; margin-bottom: 0.5rem; color: var(--accent-alchemist);">Brand Alchemist</h2>
+        <p style="color: var(--text-secondary); margin-bottom: 1.5rem;">Unicorn brand naming & matched slogan causal weaver.</p>
+        
+        <div class="alchemist-grid">
+            <!-- Left Panel: Option Parameters -->
+            <div class="glass-card options-card">
+                <div class="option-group">
+                    <label for="brandSeed">Select Brand Prefix</label>
+                    <select id="brandSeed" class="select-input">
+                        <option value="stri">stri (Stripe style payment infrastructure)</option>
+                        <option value="noti">noti (Notion style workspace documents)</option>
+                        <option value="figm">figm (Figma style interface design)</option>
+                        <option value="slac">slac (Slack style team messaging)</option>
+                        <option value="zoom">zoom (Zoom style video streaming)</option>
+                        <option value="canv">canv (Canva style graphical design)</option>
+                        <option value="rust">rust (Rust style safe fast systems)</option>
+                    </select>
+                </div>
+                
+                <div class="option-group">
+                    <label for="tempInput">Composition Temp: <span id="tempVal">0.10</span></label>
+                    <input type="range" id="tempInput" class="range-input" min="0.01" max="1.20" step="0.01" value="0.10">
+                </div>
+                
+                <button id="alchemizeBtn" class="alchemist-btn">Alchemize Brand</button>
+            </div>
+
+            <!-- Right Panel: Generative Visual Output -->
+            <div class="output-card">
+                <div id="loadingMessage" style="color: var(--text-secondary); margin-bottom: 1rem;">Reloading model weights...</div>
+                <div id="brandOutput" class="brand-output" style="display: none;">Stripe</div>
+                <div id="sloganOutput" class="slogan-output" style="display: none;">Payments infrastructure for the internet.</div>
+            </div>
+        </div>
+
+        <!-- Token Distribution Statistics -->
+        <div class="glass-card dist-card">
+            <h3 style="font-size: 1rem; font-weight: 700; border-bottom: 1px solid var(--border-color); padding-bottom: 0.5rem; margin-bottom: 1rem;">Shannon Entropy & Next-Token Probabilities</h3>
+            <div style="display: flex; gap: 2rem; margin-bottom: 1.5rem;">
+                <div>
+                    <div style="font-size: 0.8rem; color: var(--text-secondary); text-transform: uppercase;">Entropy Metric</div>
+                    <div id="entropyVal" style="font-size: 1.5rem; font-weight: 700; color: #fff;">0.000 nats</div>
+                </div>
+            </div>
+            
+            <div class="bar-chart" id="chartBody">
+                <!-- Bar rows streamed dynamically during generation -->
+                <div style="color: var(--text-muted); font-size: 0.9rem; text-align: center; padding: 1rem;">Probabilities render here during alchemization.</div>
+            </div>
+        </div>
+    </div>
+
+    <script type="module">
+        import { loadModel, generateAutoregressive, computeEntropy, hexToChar } from '../shared/engine.js';
+
+        let currentModel = null;
+        const brandSeed = document.getElementById('brandSeed');
+        const tempInput = document.getElementById('tempInput');
+        const tempVal = document.getElementById('tempVal');
+        const alchemizeBtn = document.getElementById('alchemizeBtn');
+        
+        const loadingMessage = document.getElementById('loadingMessage');
+        const brandOutput = document.getElementById('brandOutput');
+        const sloganOutput = document.getElementById('sloganOutput');
+        
+        const entropyVal = document.getElementById('entropyVal');
+        const chartBody = document.getElementById('chartBody');
+
+        // Update Slider Value Label
+        tempInput.addEventListener('input', (e) => {
+            tempVal.textContent = parseFloat(e.target.value).toFixed(2);
+        });
+
+        // Load specific binary model file
+        async function initPlayground() {
+            try {
+                loadingMessage.textContent = "Loading WebAssembly environment and model binary...";
+                currentModel = await loadModel('../datasets/brand_alchemist/model.bin');
+                loadingMessage.textContent = "Offline neural network loaded. Select a prefix and alchemize.";
+            } catch (err) {
+                loadingMessage.textContent = "Error loading model.bin file. Make sure build is complete.";
+            }
+        }
+
+        // Render top-5 class index predictions inside the bar chart dynamically
+        function updateChart(probs, vocab) {
+            chartBody.innerHTML = "";
+            
+            // Map index to probability and character
+            const list = probs.map((p, idx) => ({
+                prob: p,
+                char: hexToChar(vocab[idx])
+            }));
+
+            // Sort by probability descending, take top 5
+            list.sort((a, b) => b.prob - a.prob);
+            const top5 = list.slice(0, 5);
+
+            top5.forEach(item => {
+                const row = document.createElement('div');
+                row.className = "bar-row";
+                
+                // Represent spaces and newlines clearly
+                let label = item.char;
+                if (label === ' ') label = "space";
+                if (label === '\n') label = "newln";
+
+                row.innerHTML = `
+                    <div class="bar-label">${label}</div>
+                    <div class="bar-wrapper">
+                        <div class="bar-fill" style="width: ${(item.prob * 100).toFixed(1)}%"></div>
+                    </div>
+                    <div class="bar-value">${(item.prob * 100).toFixed(1)}%</div>
+                `;
+                chartBody.appendChild(row);
+            });
+        }
+
+        // Generate brand and slogan autoregressively
+        alchemizeBtn.addEventListener('click', async () => {
+            if (!currentModel) return;
+
+            alchemizeBtn.disabled = true;
+            alchemizeBtn.textContent = "Alchemizing...";
+            
+            loadingMessage.style.display = "block";
+            loadingMessage.textContent = "Composing copy...";
+            brandOutput.style.display = "none";
+            sloganOutput.style.display = "none";
+            entropyVal.textContent = "0.000 nats";
+            chartBody.innerHTML = "";
+
+            const seed = brandSeed.value;
+            
+            try {
+                const result = await generateAutoregressive(
+                    currentModel,
+                    seed,
+                    45,
+                    parseFloat(tempInput.value),
+                    (nextChar, probs, vocab) => {
+                        if (nextChar === '\n') return true; // Stop generation on newline
+                        
+                        // Live metrics updates
+                        const entropy = computeEntropy(probs);
+                        entropyVal.textContent = `${entropy.toFixed(3)} nats`;
+                        
+                        // Render probability bar chart live
+                        updateChart(probs, vocab);
+                    }
+                );
+
+                // Parse generated brand and slogan (format was "brand: slogan description")
+                loadingMessage.style.display = "none";
+                brandOutput.style.display = "block";
+                sloganOutput.style.display = "block";
+
+                const parts = result.split(":");
+                if (parts.length >= 2) {
+                    brandOutput.textContent = parts[0].trim();
+                    sloganOutput.textContent = parts.slice(1).join(":").trim();
+                } else {
+                    brandOutput.textContent = result.trim();
+                    sloganOutput.textContent = "A premium high-converting digital product.";
+                }
+            } catch (err) {
+                console.error(err);
+                loadingMessage.textContent = "Alchemization failed.";
+            } finally {
+                alchemizeBtn.disabled = false;
+                alchemizeBtn.textContent = "Alchemize Brand";
+            }
+        });
+
+        // Initialize
+        initPlayground();
+    </script>
+</body>
+</html>

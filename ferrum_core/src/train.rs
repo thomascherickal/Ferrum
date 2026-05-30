@@ -216,6 +216,7 @@ impl Net {
         let final_act = match task {
             crate::csv::TaskType::Classification => Activation::Softmax,
             crate::csv::TaskType::Regression => Activation::Identity,
+            crate::csv::TaskType::TransformerSLM => Activation::Softmax,
         };
         m.push(Box::new(ActivationLayer::new(final_act)));
         Ok(m)
@@ -389,4 +390,27 @@ mod tests {
         let acc = accuracy(&mut net, &x, &y).unwrap();
         assert!((0.0..=1.0).contains(&acc));
     }
+
+    #[test]
+    fn to_inference_task_branches() {
+        let net = small_net();
+        let m_reg = net.to_inference_task(crate::csv::TaskType::Regression).unwrap();
+        assert_eq!(m_reg.len(), 4);
+        assert_eq!(m_reg.layers()[3].name(), "Activation(Identity)");
+
+        let m_slm = net.to_inference_task(crate::csv::TaskType::TransformerSLM).unwrap();
+        assert_eq!(m_slm.len(), 4);
+        assert_eq!(m_slm.layers()[3].name(), "Activation(Softmax)");
+    }
+
+    #[test]
+    fn backward_before_forward_errors() {
+        let mut d = DenseT::new_random(4, 3, 0.1, &mut Rng::new(1));
+        let dy = Tensor::zeros(vec![1, 3]);
+        assert!(matches!(d.backward(&dy), Err(InferError::Format(_))));
+
+        let mut r = ReluT::new();
+        assert!(matches!(r.backward(&dy), Err(InferError::Format(_))));
+    }
 }
+

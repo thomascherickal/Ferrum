@@ -10,7 +10,6 @@ export class TabularModel {
         wasm.__wbg_tabularmodel_free(ptr, 0);
     }
     /**
-     * Return the ModelMetadata as a JSON string so JS can build the UI.
      * @returns {string}
      */
     metadata() {
@@ -26,7 +25,6 @@ export class TabularModel {
         }
     }
     /**
-     * Construct from FINF v3 bytes (call once after fetch).
      * @param {Uint8Array} bytes
      */
     constructor(bytes) {
@@ -41,8 +39,6 @@ export class TabularModel {
         return this;
     }
     /**
-     * Return the normaliser encoded string ("mean0,std0;mean1,std1;…") so that
-     * JavaScript can reconstruct per-feature z-scores for the statistics panes.
      * @returns {string}
      */
     norm_encoded() {
@@ -58,8 +54,6 @@ export class TabularModel {
         }
     }
     /**
-     * Run inference on one row. `values` must have length == input_dim.
-     * Returns JSON: { "prediction": ..., "confidence": ..., "probabilities": [...] }
      * @param {Float32Array} values
      * @returns {string}
      */
@@ -85,6 +79,172 @@ export class TabularModel {
     }
 }
 if (Symbol.dispose) TabularModel.prototype[Symbol.dispose] = TabularModel.prototype.free;
+
+/**
+ * Edge Small Language Model — causal Transformer running in WASM.
+ *
+ * JavaScript usage:
+ * ```js
+ * const resp = await fetch('model.bin');
+ * const bytes = new Uint8Array(await resp.arrayBuffer());
+ * const slm = new TransformerSLMModel(bytes);
+ *
+ * const meta = JSON.parse(slm.metadata());
+ * const vocab = meta.class_names;           // idx → char mapping
+ * const contextLen = meta.input_dim;
+ *
+ * // Feed a context of integer token IDs
+ * const context = new Float32Array([12, 5, 3, ...]);
+ * const probs = slm.predict_next(context);  // Float32Array length vocab_size
+ *
+ * // After inference, read attention weights for visualization
+ * const attn = slm.get_last_attention_weights(); // Float32Array [heads × T × T]
+ * const numHeads = slm.num_heads();
+ * const contextLength = slm.context_len();
+ * ```
+ */
+export class TransformerSLMModel {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        TransformerSLMModelFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_transformerslmmodel_free(ptr, 0);
+    }
+    /**
+     * Context length (number of characters the model sees at once).
+     * @returns {number}
+     */
+    context_len() {
+        const ret = wasm.transformerslmmodel_context_len(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * Compute Shannon entropy of a probability distribution (0 = certain, ln(V) = uniform).
+     * @param {Float32Array} probs
+     * @returns {number}
+     */
+    entropy(probs) {
+        const ptr0 = passArrayF32ToWasm0(probs, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.transformerslmmodel_entropy(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
+     * Return the self-attention weights from the LAST Transformer block's last forward pass.
+     *
+     * Returns a flat Float32Array of shape [num_heads × context_len × context_len].
+     * For `num_heads=4` and `context_len=32`, this is 4096 floats.
+     *
+     * In JavaScript, index as: `attn[h * T * T + i * T + j]` where h=head, i=query pos, j=key pos.
+     * @returns {Float32Array}
+     */
+    get_last_attention_weights() {
+        const ret = wasm.transformerslmmodel_get_last_attention_weights(this.__wbg_ptr);
+        var v1 = getArrayF32FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v1;
+    }
+    /**
+     * Return model metadata JSON (vocab, context length, architecture details).
+     * @returns {string}
+     */
+    metadata() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.transformerslmmodel_metadata(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * Construct from FINF v4 bytes.
+     * @param {Uint8Array} bytes
+     */
+    constructor(bytes) {
+        const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.transformerslmmodel_new(ptr0, len0);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        this.__wbg_ptr = ret[0];
+        TransformerSLMModelFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * Number of attention heads.
+     * @returns {number}
+     */
+    num_heads() {
+        const ret = wasm.transformerslmmodel_num_heads(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * Number of Transformer blocks.
+     * @returns {number}
+     */
+    num_layers() {
+        const ret = wasm.transformerslmmodel_num_layers(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * Run inference on a context of token indices.
+     *
+     * `context` must have exactly `context_len` elements (Float32Array of usize-as-f32).
+     * Returns a Float32Array of length `vocab_size` with next-token probabilities.
+     * @param {Float32Array} context
+     * @returns {Float32Array}
+     */
+    predict_next(context) {
+        const ptr0 = passArrayF32ToWasm0(context, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.transformerslmmodel_predict_next(this.__wbg_ptr, ptr0, len0);
+        if (ret[3]) {
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        var v2 = getArrayF32FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v2;
+    }
+    /**
+     * Sample a next token index from probabilities using temperature scaling.
+     * `probs` = output of `predict_next`. `temperature` = 1.0 is neutral.
+     * Lower temperature → more deterministic. Higher → more random.
+     * @param {Float32Array} probs
+     * @param {number} temperature
+     * @param {number} random_value
+     * @returns {number}
+     */
+    sample_from_probs(probs, temperature, random_value) {
+        const ptr0 = passArrayF32ToWasm0(probs, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.transformerslmmodel_sample_from_probs(this.__wbg_ptr, ptr0, len0, temperature, random_value);
+        return ret >>> 0;
+    }
+    /**
+     * Return the top-k token indices sorted by probability (descending).
+     * @param {Float32Array} probs
+     * @param {number} k
+     * @returns {Uint32Array}
+     */
+    top_k_indices(probs, k) {
+        const ptr0 = passArrayF32ToWasm0(probs, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.transformerslmmodel_top_k_indices(this.__wbg_ptr, ptr0, len0, k);
+        var v2 = getArrayU32FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v2;
+    }
+}
+if (Symbol.dispose) TransformerSLMModel.prototype[Symbol.dispose] = TransformerSLMModel.prototype.free;
 function __wbg_get_imports() {
     const import0 = {
         __proto__: null,
@@ -115,6 +275,19 @@ function __wbg_get_imports() {
 const TabularModelFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_tabularmodel_free(ptr, 1));
+const TransformerSLMModelFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_transformerslmmodel_free(ptr, 1));
+
+function getArrayF32FromWasm0(ptr, len) {
+    ptr = ptr >>> 0;
+    return getFloat32ArrayMemory0().subarray(ptr / 4, ptr / 4 + len);
+}
+
+function getArrayU32FromWasm0(ptr, len) {
+    ptr = ptr >>> 0;
+    return getUint32ArrayMemory0().subarray(ptr / 4, ptr / 4 + len);
+}
 
 let cachedFloat32ArrayMemory0 = null;
 function getFloat32ArrayMemory0() {
@@ -126,6 +299,14 @@ function getFloat32ArrayMemory0() {
 
 function getStringFromWasm0(ptr, len) {
     return decodeText(ptr >>> 0, len);
+}
+
+let cachedUint32ArrayMemory0 = null;
+function getUint32ArrayMemory0() {
+    if (cachedUint32ArrayMemory0 === null || cachedUint32ArrayMemory0.byteLength === 0) {
+        cachedUint32ArrayMemory0 = new Uint32Array(wasm.memory.buffer);
+    }
+    return cachedUint32ArrayMemory0;
 }
 
 let cachedUint8ArrayMemory0 = null;
@@ -178,6 +359,7 @@ function __wbg_finalize_init(instance, module) {
     wasm = instance.exports;
     wasmModule = module;
     cachedFloat32ArrayMemory0 = null;
+    cachedUint32ArrayMemory0 = null;
     cachedUint8ArrayMemory0 = null;
     wasm.__wbindgen_start();
     return wasm;

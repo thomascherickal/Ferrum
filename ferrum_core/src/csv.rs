@@ -17,11 +17,12 @@ use crate::tensor::Tensor;
 // Task type
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Whether the network predicts a class label or a continuous value.
+/// Whether the network predicts a class label, a continuous value, or is a generative small language model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskType {
     Classification,
     Regression,
+    TransformerSLM,
 }
 
 impl TaskType {
@@ -29,6 +30,7 @@ impl TaskType {
         match self {
             TaskType::Classification => "classification",
             TaskType::Regression => "regression",
+            TaskType::TransformerSLM => "transformer_slm",
         }
     }
     #[allow(clippy::should_implement_trait)]
@@ -36,6 +38,7 @@ impl TaskType {
         match s {
             "classification" => Some(Self::Classification),
             "regression" => Some(Self::Regression),
+            "transformer_slm" => Some(Self::TransformerSLM),
             _ => None,
         }
     }
@@ -385,6 +388,12 @@ impl CsvDataset {
                     });
                     (idx, idx as f32)
                 }
+                // SLM datasets are not loaded through CsvDataset
+                TaskType::TransformerSLM => {
+                    return Err(InferError::Format(
+                        "TransformerSLM task cannot be loaded through CsvDataset".into()
+                    ));
+                }
             };
             rows.push(CsvRow {
                 features,
@@ -396,6 +405,7 @@ impl CsvDataset {
         let (num_classes, target_range) = match task {
             TaskType::Classification => (class_names.len(), [0.0, (class_names.len() - 1) as f32]),
             TaskType::Regression => (1, [tgt_min, tgt_max]),
+            TaskType::TransformerSLM => (0, [0.0, 0.0]),
         };
 
         Ok(Self {
@@ -762,4 +772,22 @@ x1,x2,price
         let back = norm.denormalise_target(norm.normalise_target(300000.0));
         assert!((back - 300000.0).abs() < 1.0);
     }
+
+    #[test]
+    fn transformer_slm_csv_error() {
+        let csv = "a,b,label\n1.0,2.0,3.0\n";
+        let res = CsvDataset::from_str_with_task(csv, Some(TaskType::TransformerSLM));
+        assert!(matches!(res, Err(InferError::Format(_))));
+    }
+
+    #[test]
+    fn single_feature_dataset_normalizer() {
+        let csv = "a,label\n1.0,x\n2.0,y\n";
+        let ds = CsvDataset::from_str(csv).unwrap();
+        let (x, _, _) = ds.to_tensors().unwrap();
+        let norm = Normalizer::fit(&x).unwrap();
+        assert_eq!(norm.means.len(), 1);
+        assert_eq!(norm.stds.len(), 1);
+    }
 }
+

@@ -1,137 +1,164 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Tabular ML — Pure Rust → WebAssembly</title>
-  <link rel="stylesheet" href="shared/style.css" />
-  <style>
-    .section-label {
-      width: 100%; max-width: 900px; padding: .25rem 1rem .1rem;
-      font-size: .72rem; font-weight: 700; letter-spacing: .1em;
-      text-transform: uppercase; color: var(--muted);
-    }
-    .grid { padding-bottom: 1rem; }
-    .grid + .section-label { margin-top: .75rem; }
-  </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ferrum Edge Generative AI Playground Suite</title>
+    <link rel="stylesheet" href="shared/style.css">
+    <style>
+        .hero {
+            max-width: 1000px;
+            margin: 4rem auto 2rem auto;
+            text-align: center;
+            padding: 0 1.5rem;
+        }
+        .hero h1 {
+            font-size: 3.5rem;
+            font-weight: 800;
+            margin-bottom: 1rem;
+            background: linear-gradient(135deg, #fff 20%, #a78bfa 60%, #8b5cf6 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .hero p {
+            font-size: 1.25rem;
+            color: var(--text-secondary);
+            max-width: 600px;
+            margin: 0 auto;
+        }
+        .grid-container {
+            max-width: 1100px;
+            margin: 3rem auto;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 2rem;
+            padding: 0 1.5rem;
+        }
+        .card {
+            padding: 2.5rem 2rem;
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+            position: relative;
+            overflow: hidden;
+            text-decoration: none;
+            color: inherit;
+        }
+        .card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 4px;
+            transition: var(--transition);
+        }
+        .card-oracle::before { background: var(--accent-oracle); }
+        .card-poet::before { background: var(--accent-poet); }
+        .card-alchemist::before { background: var(--accent-alchemist); }
+        
+        .card:hover {
+            transform: translateY(-8px);
+        }
+        .card-oracle:hover {
+            box-shadow: 0 20px 40px rgba(16, 185, 129, 0.12);
+            border-color: rgba(16, 185, 129, 0.3);
+        }
+        .card-poet:hover {
+            box-shadow: 0 20px 40px rgba(139, 92, 246, 0.12);
+            border-color: rgba(139, 92, 246, 0.3);
+        }
+        .card-alchemist:hover {
+            box-shadow: 0 20px 40px rgba(245, 158, 11, 0.12);
+            border-color: rgba(245, 158, 11, 0.3);
+        }
+
+        .icon {
+            font-size: 2.5rem;
+            margin-bottom: 1.5rem;
+        }
+        .card-title {
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin-bottom: 0.75rem;
+            color: #fff;
+        }
+        .card-desc {
+            color: var(--text-secondary);
+            font-size: 0.95rem;
+            line-height: 1.6;
+            margin-bottom: 2rem;
+            flex-grow: 1;
+        }
+        .badge {
+            align-self: flex-start;
+            padding: 0.4rem 0.8rem;
+            border-radius: 9999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .badge-oracle { background: rgba(16, 185, 129, 0.1); color: var(--accent-oracle); border: 1px solid rgba(16, 185, 129, 0.2); }
+        .badge-poet { background: rgba(139, 92, 246, 0.1); color: var(--accent-poet); border: 1px solid rgba(139, 92, 246, 0.2); }
+        .badge-alchemist { background: rgba(245, 158, 11, 0.1); color: var(--accent-alchemist); border: 1px solid rgba(245, 158, 11, 0.2); }
+        
+        .footer {
+            text-align: center;
+            padding: 3rem;
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            border-top: 1px solid var(--border-color);
+            margin-top: 4rem;
+        }
+    </style>
 </head>
 <body>
-  <div class="hero">
-    <div class="badge">⚡ Pure Rust · WebAssembly · Zero Dependencies · Zero Backend</div>
-    <h1>Tabular ML Demo</h1>
-    <p>
-      Ten real datasets. Ten trained neural networks. All running live in your
-      browser — compiled from hand-written Rust to a single 125 KB WebAssembly
-      binary. No server. No Python. No cloud.
-      Move sliders, get instant predictions.
-    </p>
-  </div>
 
-  <div class="section-label">Classification</div>
-  <div class="grid">
-    <a class="ds-card" href="datasets/iris/index.html">
-      <div class="ds-icon">🌸</div>
-      <div class="ds-name">Iris Species</div>
-      <div class="ds-desc">Classify iris flowers from petal and sepal measurements. The original ML benchmark — 3 species.</div>
-      <div class="ds-tags">
-        <span class="ds-tag">4 features</span><span class="ds-tag">3 classes</span>
-        <span class="ds-tag">150 rows</span><span class="ds-tag">98.7% acc</span>
-      </div>
-    </a>
-    <a class="ds-card" href="datasets/penguins/index.html">
-      <div class="ds-icon">🐧</div>
-      <div class="ds-name">Palmer Penguins</div>
-      <div class="ds-desc">Identify Adelie, Chinstrap, and Gentoo penguins from bill and body measurements.</div>
-      <div class="ds-tags">
-        <span class="ds-tag">4 features</span><span class="ds-tag">3 classes</span>
-        <span class="ds-tag">342 rows</span><span class="ds-tag">99.4% acc</span>
-      </div>
-    </a>
-    <a class="ds-card" href="datasets/seeds/index.html">
-      <div class="ds-icon">🌾</div>
-      <div class="ds-name">Wheat Seeds</div>
-      <div class="ds-desc">Classify wheat varieties (Kama, Rosa, Canadian) from 7 X-ray geometric kernel measurements.</div>
-      <div class="ds-tags">
-        <span class="ds-tag">7 features</span><span class="ds-tag">3 classes</span>
-        <span class="ds-tag">210 rows</span><span class="ds-tag">99.5% acc</span>
-      </div>
-    </a>
-    <a class="ds-card" href="datasets/wine/index.html">
-      <div class="ds-icon">🍷</div>
-      <div class="ds-name">Wine Quality</div>
-      <div class="ds-desc">Rate Portuguese red wine quality (low/medium/high) from 11 physicochemical properties.</div>
-      <div class="ds-tags">
-        <span class="ds-tag">11 features</span><span class="ds-tag">3 classes</span>
-        <span class="ds-tag">1,599 rows</span><span class="ds-tag">80.9% acc</span>
-      </div>
-    </a>
-    <a class="ds-card" href="datasets/diabetes/index.html">
-      <div class="ds-icon">🩺</div>
-      <div class="ds-name">Pima Diabetes</div>
-      <div class="ds-desc">Predict diabetes onset in Pima Indian women from 8 health measurements. Binary classification.</div>
-      <div class="ds-tags">
-        <span class="ds-tag">8 features</span><span class="ds-tag">2 classes</span>
-        <span class="ds-tag">768 rows</span><span class="ds-tag">93.0% acc</span>
-      </div>
-    </a>
-    <a class="ds-card" href="datasets/heart/index.html">
-      <div class="ds-icon">❤️</div>
-      <div class="ds-name">Heart Disease</div>
-      <div class="ds-desc">Detect heart disease from 13 clinical variables — age, BP, cholesterol, ECG results, and more.</div>
-      <div class="ds-tags">
-        <span class="ds-tag">13 features</span><span class="ds-tag">2 classes</span>
-        <span class="ds-tag">297 rows</span><span class="ds-tag">96.3% acc</span>
-      </div>
-    </a>
-    <a class="ds-card" href="datasets/cancer/index.html">
-      <div class="ds-icon">🔬</div>
-      <div class="ds-name">Breast Cancer</div>
-      <div class="ds-desc">Classify tumours as malignant or benign from 30 nuclear features derived from cell images.</div>
-      <div class="ds-tags">
-        <span class="ds-tag">30 features</span><span class="ds-tag">2 classes</span>
-        <span class="ds-tag">569 rows</span><span class="ds-tag">99.3% acc</span>
-      </div>
-    </a>
-    <a class="ds-card" href="datasets/titanic/index.html">
-      <div class="ds-icon">🚢</div>
-      <div class="ds-name">Titanic Survival</div>
-      <div class="ds-desc">Predict passenger survival from class, sex, age, family size, and fare paid.</div>
-      <div class="ds-tags">
-        <span class="ds-tag">6 features</span><span class="ds-tag">2 classes</span>
-        <span class="ds-tag">891 rows</span><span class="ds-tag">86.9% acc</span>
-      </div>
-    </a>
-  </div>
+    <header>
+        <div class="nav-container">
+            <a href="#" class="logo">🧬 Ferrum Edge AI</a>
+            <div class="nav-links">
+                <a href="#" class="nav-link active">Suite</a>
+                <a href="https://github.com/thomascherickal/Ferrum" target="_blank" class="nav-link">GitHub</a>
+            </div>
+        </div>
+    </header>
 
-  <div class="section-label">Regression</div>
-  <div class="grid">
-    <a class="ds-card" href="datasets/mpg/index.html">
-      <div class="ds-icon">🚗</div>
-      <div class="ds-name">Auto MPG</div>
-      <div class="ds-desc">Estimate fuel efficiency (miles per gallon) from engine specs and model year. 1970–1982 cars.</div>
-      <div class="ds-tags">
-        <span class="ds-tag">6 features</span><span class="ds-tag tag-reg">regression</span>
-        <span class="ds-tag">392 rows</span><span class="ds-tag">RMSE 1.95 mpg</span>
-      </div>
-    </a>
-    <a class="ds-card" href="datasets/housing/index.html">
-      <div class="ds-icon">🏠</div>
-      <div class="ds-name">CA Housing Prices</div>
-      <div class="ds-desc">Estimate median house values in California census tracts from location and demographics.</div>
-      <div class="ds-tags">
-        <span class="ds-tag">8 features</span><span class="ds-tag tag-reg">regression</span>
-        <span class="ds-tag">20,433 rows</span><span class="ds-tag">RMSE ~$52k</span>
-      </div>
-    </a>
-  </div>
+    <div class="hero">
+        <h1 class="glow-text">Edge Generative AI Suite</h1>
+        <p>Run hand-crafted, zero-dependency small language models 100% locally and privately directly inside your browser tab.</p>
+    </div>
 
-  <div style="text-align:center;color:var(--muted);font-size:.78rem;padding:0 1rem 2.5rem;max-width:640px">
-    One 125 KB WASM binary, ten model files (1–10 KB each). The entire ML stack — tensor
-    math, backpropagation, normalizer, binary format — written from scratch in Rust,
-    zero external dependencies. Each model file embeds its own feature metadata so
-    the UI builds itself dynamically.
-    <br><br>
-    <a href="https://github.com" style="color:var(--accent)">View source on GitHub</a>
-  </div>
+    <div class="grid-container">
+        <!-- Card 1: Shell Oracle -->
+        <a href="shell_oracle/index.html" class="glass-card card card-oracle">
+            <div class="icon">🐚</div>
+            <h2 class="card-title">Shell Oracle</h2>
+            <p class="card-desc">An offline natural language to Linux terminal command autocomplete weaver. Watch character predictions generate live in an interactive hacker console.</p>
+            <span class="badge badge-oracle">Terminal Assistant</span>
+        </a>
+
+        <!-- Card 2: Ambient Poet -->
+        <a href="ambient_poet/index.html" class="glass-card card card-poet">
+            <div class="icon">🌸</div>
+            <h2 class="card-title">Ambient Poet</h2>
+            <p class="card-desc">A Zen system state haiku composer. Slide system metrics like CPU load, temperature, and RAM to trigger dynamic on-device haiku creations.</p>
+            <span class="badge badge-poet">Hardware Poet</span>
+        </a>
+
+        <!-- Card 3: Brand Alchemist -->
+        <a href="brand_alchemist/index.html" class="glass-card card card-alchemist">
+            <div class="icon">🔮</div>
+            <h2 class="card-title">Brand Alchemist</h2>
+            <p class="card-desc">A startup name and slogan weaver. Select product sectors and watch high-converting slogans and names get constructed, analyzing live probabilities.</p>
+            <span class="badge badge-alchemist">Startup Weaver</span>
+        </a>
+    </div>
+
+    <div class="footer">
+        <p>© 2026 Thomas Cherickal. Zero External Dependencies. Running entirely on client CPU.</p>
+    </div>
+
 </body>
 </html>

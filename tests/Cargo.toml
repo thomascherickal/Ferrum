@@ -5,8 +5,36 @@ edition.workspace = true
 license.workspace = true
 
 [[test]]
-name = "integration_test"
-path = "integration_test.rs"
+name = "test_tensor"
+path = "tests/test_tensor.rs"
+
+[[test]]
+name = "test_layer"
+path = "tests/test_layer.rs"
+
+[[test]]
+name = "test_loader"
+path = "tests/test_loader.rs"
+
+[[test]]
+name = "test_slm"
+path = "tests/test_slm.rs"
+
+[[test]]
+name = "test_train"
+path = "tests/test_train.rs"
+
+[[test]]
+name = "test_csv"
+path = "tests/test_csv.rs"
+
+[[test]]
+name = "test_regression"
+path = "tests/test_regression.rs"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [dependencies]
 ferrum_core = { path = "../ferrum_core" }

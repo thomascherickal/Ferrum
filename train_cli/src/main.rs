@@ -33,6 +33,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw =
         std::fs::read_to_string(csv_path).map_err(|e| format!("cannot read {csv_path}: {e}"))?;
     let ds = CsvDataset::from_str(&raw)?;
+    if ds.task == TaskType::TransformerSLM {
+        return Err("TransformerSLM is not supported by the tabular train_cli. Use train_transformer instead.".into());
+    }
     println!("╔══════════════════════════════════════════════════════════╗");
     println!("  Dataset : {ds_name}");
     println!("  File    : {csv_path}");
@@ -63,6 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let norm = match ds.task {
         TaskType::Regression => fit_normalizer_with_target(&x_train_raw, &y_train_reg)?,
         TaskType::Classification => Normalizer::fit(&x_train_raw)?,
+        TaskType::TransformerSLM => unreachable!(),
     };
     let x_train = norm.transform(&x_train_raw)?;
     let x_val = norm.transform(&x_val_raw)?;
@@ -81,6 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_dim = match ds.task {
         TaskType::Classification => ds.num_classes,
         TaskType::Regression => 1,
+        TaskType::TransformerSLM => unreachable!(),
     };
     let mut net = Net::mlp(ds.num_features, hidden, output_dim, &mut rng);
     println!(
@@ -132,6 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     net.step(&opt)?;
                 }
             }
+            TaskType::TransformerSLM => unreachable!(),
         }
 
         if ep % (epochs / 10).max(1) == 0 || ep == 1 {
@@ -147,12 +153,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let rmse_raw = (vl * norm.stds[norm.stds.len() - 1].powi(2)).sqrt();
                     (loss, format!("val_rmse={:.0}", rmse_raw))
                 }
+                TaskType::TransformerSLM => unreachable!(),
             };
             let vl = match ds.task {
                 TaskType::Classification => {
                     softmax_cross_entropy(&net.forward(&x_val)?, &y_val_cls)?.0
                 }
                 TaskType::Regression => mse(&net.forward(&x_val)?, &y_val_norm)?.0,
+                TaskType::TransformerSLM => unreachable!(),
             };
             println!("{ep:>6}  {tl:>10.4}  {vl:>10.4}  {metric_str}");
         }
@@ -176,6 +184,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let rmse_raw = rmse_norm * norm.stds[norm.stds.len() - 1];
             println!("Full-dataset RMSE : {:.2} (raw scale)", rmse_raw);
         }
+        TaskType::TransformerSLM => unreachable!(),
     }
 
     // ── Build metadata ────────────────────────────────────────────────────────
@@ -225,6 +234,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ds.rows[0].target
             );
         }
+        TaskType::TransformerSLM => unreachable!(),
     }
     Ok(())
 }
