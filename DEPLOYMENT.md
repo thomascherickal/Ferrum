@@ -243,12 +243,11 @@ The included `.github/workflows/deploy.yml` runs on every push to `main`:
 Enable it by pushing `.github/workflows/deploy.yml` and activating GitHub Pages
 under **Settings → Pages → Source → GitHub Actions**.
 
-Full deploy cycle takes ~4 minutes on GitHub's free runners.
 
 ### Cloudflare Pages
 
 ```bash
-npm install -g wrangler
+npm install -g wrangler 
 wrangler login
 wrangler pages deploy web --project-name tabular-ml
 ```
