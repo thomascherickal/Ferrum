@@ -6,19 +6,18 @@ Because the playgounds run 100% locally inside the client's browser (compiled to
 
 ---
 
-## 1. Hosting Pre-requisites
+## 1. Decoupled Playgrounds Architecture
 
-Make sure you have compiled the latest WebAssembly package and copied the pre-trained `.bin` models into the web directory:
+Each playground is fully decoupled and lives in the repository that holds its code:
+- `/brand_alchemist/web/`
+- `/ambient_poet/web/`
+- `/shell_oracle/web/`
+
+To compile the core WebAssembly engine (`tabular_wasm`) and automatically build, copy, and distribute all JS/WASM assets and trained `.bin` model files to each decoupled repository's `/web` folder, run:
 
 ```bash
-# 1. Compile WASM
+# Compile and auto-distribute to all use-case repos
 bash scripts/build_wasm.sh
-
-# 2. Copy pre-trained binaries
-mkdir -p web/datasets/shell_oracle web/datasets/ambient_poet web/datasets/brand_alchemist
-cp ../shell_oracle/shell_oracle.bin web/datasets/shell_oracle/model.bin
-cp ../ambient_poet/ambient_poet.bin web/datasets/ambient_poet/model.bin
-cp ../brand_alchemist/brand_alchemist.bin web/datasets/brand_alchemist/model.bin
 ```
 
 ---

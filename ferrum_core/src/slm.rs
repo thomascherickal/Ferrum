@@ -33,18 +33,49 @@ impl GenerativeSLM {
         batch_size: usize,
         rng: &mut Rng,
     ) -> Result<Self> {
+        Self::train_with_callback(
+            corpus,
+            context_len,
+            hidden_size,
+            epochs,
+            lr,
+            momentum,
+            batch_size,
+            rng,
+            |_, _| {},
+        )
+    }
+
+    /// Train a hand-crafted edge Generative SLM with a callback invoked at each epoch with loss.
+    pub fn train_with_callback<F>(
+        corpus: &str,
+        context_len: usize,
+        hidden_size: usize,
+        epochs: usize,
+        lr: f32,
+        momentum: f32,
+        batch_size: usize,
+        rng: &mut Rng,
+        mut progress_callback: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(usize, f32),
+    {
         let csv_data = build_csv_dataset(corpus, context_len)?;
         let ds = CsvDataset::from_str(&csv_data)?;
 
         let (x_raw, y_cls, _) = ds.to_tensors()?;
-        let norm = Normalizer::fit(&x_raw)?;
+        let mut norm = Normalizer::fit(&x_raw)?;
+        for m in &mut norm.means { *m = 0.0; }
+        for s in &mut norm.stds { *s = 1.0; }
         let x_train = norm.transform(&x_raw)?;
 
         let mut net = Net::mlp(context_len, hidden_size, ds.num_classes, rng);
         let opt = Sgd::with_momentum(lr, momentum);
 
-        for _ in 0..epochs {
-            train_epoch(&mut net, &x_train, &y_cls, batch_size, &opt, rng)?;
+        for ep in 1..=epochs {
+            let loss = train_epoch(&mut net, &x_train, &y_cls, batch_size, &opt, rng)?;
+            progress_callback(ep, loss);
         }
 
         let model = net.to_inference_task(TaskType::Classification)?;
@@ -150,6 +181,14 @@ pub fn build_csv_dataset(corpus: &str, context_len: usize) -> Result<String> {
     }
     csv.push_str("label\n");
 
+    // Vocabulary alignment padding to force class_names to cover all characters in exact sorted order at the beginning
+    for &ch in &vocab_vec {
+        for _ in 0..context_len {
+            csv.push_str("0.0,");
+        }
+        csv.push_str(&format!("{}\n", char_to_hex(ch)));
+    }
+
     // Sliding windows
     for i in 0..chars.len().saturating_sub(context_len) {
         let context = &chars[i..i + context_len];
@@ -160,14 +199,6 @@ pub fn build_csv_dataset(corpus: &str, context_len: usize) -> Result<String> {
             csv.push_str(&format!("{}.0,", idx));
         }
         csv.push_str(&format!("{}\n", char_to_hex(target)));
-    }
-
-    // Vocabulary alignment padding to force class_names to cover all characters
-    for &ch in &vocab_vec {
-        for _ in 0..context_len {
-            csv.push_str("0.0,");
-        }
-        csv.push_str(&format!("{}\n", char_to_hex(ch)));
     }
 
     Ok(csv)
