@@ -1,6 +1,6 @@
 # .github/workflows/deploy.yml
 # Builds, tests, trains all 10 models, compiles to WASM, and deploys to GitHub Pages.
-# Triggered on every push to main.
+# Triggered on every push to master.
 
 name: Build, Test & Deploy
 
@@ -101,14 +101,14 @@ jobs:
 
       # ── Upload Pages artefact ────────────────────────────────────────────────
       - name: Upload Pages artefact
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/master'
         uses: actions/upload-pages-artifact@v3
         with:
           path: web
 
   # ─────────────────────────────────────────────────────────────────────────────
   deploy:
-    if:      github.ref == 'refs/heads/main'
+    if:      github.ref == 'refs/heads/master'
     needs:   build
     runs-on: ubuntu-latest
     environment:
