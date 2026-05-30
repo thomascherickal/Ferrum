@@ -1,0 +1,9 @@
+[package]
+name        = "ferrum_core"
+description = "Zero-dependency neural-network engine (inference + training). No std collections beyond Vec/HashMap."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# intentionally empty — std only

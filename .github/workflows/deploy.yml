@@ -1,0 +1,120 @@
+# .github/workflows/deploy.yml
+# Builds, tests, trains all 10 models, compiles to WASM, and deploys to GitHub Pages.
+# Triggered on every push to main.
+
+name: Build, Test & Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages:    write
+  id-token: write
+
+concurrency:
+  group:              pages
+  cancel-in-progress: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - uses: actions/checkout@v4
+
+      # ── Rust toolchain (stable + wasm32 target) ──────────────────────────
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets:    wasm32-unknown-unknown
+          components: clippy,rustfmt
+
+      # ── Cache ───────────────────────────────────────────────────────────────
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # ── wasm-bindgen CLI ────────────────────────────────────────────────────
+      - name: Install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli --version 0.2.122 --locked
+
+      # ── Format check ────────────────────────────────────────────────────────
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # ── Clippy (all native crates) ──────────────────────────────────────────
+      - name: Clippy
+        run: cargo clippy --workspace --exclude tabular_wasm -- -D warnings
+
+      # ── Unit + integration tests ─────────────────────────────────────────────
+      - name: Test
+        run: cargo test --workspace
+
+      # ── Train all 10 dataset models ─────────────────────────────────────────
+      - name: Train models
+        run: |
+          cargo build --release -p train_cli
+          cargo run -p train_cli --release -- iris.data      web/datasets/iris/model.bin      "Iris"               32 500
+          cargo run -p train_cli --release -- wine.csv       web/datasets/wine/model.bin      "Wine Quality"       64 600
+          cargo run -p train_cli --release -- diabetes.csv   web/datasets/diabetes/model.bin  "Pima Diabetes"      48 600
+          cargo run -p train_cli --release -- titanic.csv    web/datasets/titanic/model.bin   "Titanic"            32 500
+          cargo run -p train_cli --release -- housing.csv    web/datasets/housing/model.bin   "California Housing" 64 400
+          cargo run -p train_cli --release -- heart.csv      web/datasets/heart/model.bin     "Heart Disease"      32 600
+          cargo run -p train_cli --release -- cancer.csv     web/datasets/cancer/model.bin    "Breast Cancer"      64 600
+          cargo run -p train_cli --release -- penguins.csv   web/datasets/penguins/model.bin  "Palmer Penguins"    32 500
+          cargo run -p train_cli --release -- mpg.csv        web/datasets/mpg/model.bin       "Auto MPG"           48 500
+          cargo run -p train_cli --release -- seeds.csv      web/datasets/seeds/model.bin     "Wheat Seeds"        24 500
+
+      # ── Compile to WebAssembly ───────────────────────────────────────────────
+      - name: Build WASM
+        run: |
+          cargo build -p tabular_wasm --target wasm32-unknown-unknown --release
+          wasm-bindgen \
+            target/wasm32-unknown-unknown/release/tabular_wasm.wasm \
+            --out-dir web/pkg \
+            --target web \
+            --no-typescript
+          echo "WASM binary: $(du -sh web/pkg/tabular_wasm_bg.wasm | cut -f1)"
+
+      # ── Verify all model files exist and are valid FINF ─────────────────────
+      - name: Verify model files
+        run: |
+          for ds in iris wine diabetes titanic housing heart cancer penguins mpg seeds; do
+            f="web/datasets/$ds/model.bin"
+            [ -f "$f" ] || { echo "MISSING: $f"; exit 1; }
+            magic=$(head -c4 "$f")
+            [ "$magic" = "FINF" ] || { echo "BAD MAGIC in $f"; exit 1; }
+            echo "OK ($( wc -c < $f) bytes): $f"
+          done
+
+      # ── Upload Pages artefact ────────────────────────────────────────────────
+      - name: Upload Pages artefact
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  deploy:
+    if:      github.ref == 'refs/heads/main'
+    needs:   build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url:  ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id:   deployment
+        uses: actions/deploy-pages@v4

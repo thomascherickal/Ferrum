@@ -1,0 +1,30 @@
+# Build artefacts
+target/
+
+# Raw download files (rebuilt by scripts/download_datasets.sh)
+*_raw.csv
+*_raw.data
+*_raw.txt
+iris_wasm_old_lib.rs
+
+# Old iris-specific WASM (replaced by tabular_wasm)
+web/pkg/iris_wasm.js
+web/pkg/iris_wasm_bg.wasm
+web/pkg/.gitignore
+
+# Stale web-root artefacts from v1
+web/app.js
+web/style.css
+web/model.bin
+
+# Generated WASM (rebuilt by CI — committed for local dev convenience)
+# Remove these lines if you prefer to commit the WASM artefacts:
+# web/pkg/tabular_wasm.js
+# web/pkg/tabular_wasm_bg.wasm
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/settings.json

@@ -1,0 +1,12 @@
+[package]
+name    = "train_cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "train_cli"
+path = "src/main.rs"
+
+[dependencies]
+ferrum_core = { path = "../ferrum_core" }
