@@ -4,6 +4,7 @@
 //! divided by batch size. This clean form is why we fuse the two operations.
 use crate::error::{InferError, Result};
 use crate::tensor::Tensor;
+use crate::verbose;
 
 /// Returns (mean_loss, dL/d_logits) for a batch.
 /// `logits` shape: [batch, num_classes]. `targets`: one class index per row.
@@ -16,6 +17,8 @@ pub fn softmax_cross_entropy(logits: &Tensor, targets: &[usize]) -> Result<(f32,
             targets.len()
         )));
     }
+    vprintln!("[loss::softmax_cross_entropy] batch={}, vocab={}", batch, vocab);
+
     let mut grad = vec![0.0f32; batch * vocab];
     let mut total_loss = 0.0f32;
     let inv_batch = 1.0 / batch as f32;
@@ -44,12 +47,35 @@ pub fn softmax_cross_entropy(logits: &Tensor, targets: &[usize]) -> Result<(f32,
                 "target index {t} ≥ num_classes {vocab}"
             )));
         }
-        total_loss += -(probs[t].max(1e-12)).ln();
+        let sample_loss = -(probs[t].max(1e-12)).ln();
+        total_loss += sample_loss;
+
+        if verbose::is_verbose() && batch <= 16 {
+            vprintln!("[loss::softmax_cross_entropy]   sample[{}]: target={}, prob[t]={:.6}, loss={:.6}, max_logit={:.4}, softmax_sum={:.6}",
+                i, t, probs[t], sample_loss, max, sum);
+        }
+
         for j in 0..vocab {
             grad[base + j] = (probs[j] - if j == t { 1.0 } else { 0.0 }) * inv_batch;
         }
     }
-    Ok((total_loss * inv_batch, Tensor::matrix(batch, vocab, grad)?))
+
+    let mean_loss = total_loss * inv_batch;
+    vprintln!("[loss::softmax_cross_entropy] mean_loss={:.6}", mean_loss);
+
+    if verbose::is_verbose() {
+        if mean_loss.is_nan() {
+            println!("[ferrum_core::WARN] ⚠️  softmax_cross_entropy returned NaN loss!");
+        }
+        if mean_loss.is_infinite() {
+            println!("[ferrum_core::WARN] ⚠️  softmax_cross_entropy returned Infinite loss!");
+        }
+        let (gmin, gmax, gmean) = verbose::stats(&grad);
+        vprintln!("[loss::softmax_cross_entropy] gradient stats: min={:.6e}, max={:.6e}, mean={:.6e}", gmin, gmax, gmean);
+        verbose::check_nan_inf(&grad, "softmax_cross_entropy gradient");
+    }
+
+    Ok((mean_loss, Tensor::matrix(batch, vocab, grad)?))
 }
 
 #[cfg(test)]
@@ -156,6 +182,8 @@ pub fn mse(preds: &crate::tensor::Tensor, targets: &[f32]) -> Result<(f32, crate
             targets.len()
         )));
     }
+    vprintln!("[loss::mse] batch={}", batch);
+
     let inv = 1.0 / batch as f32;
     let mut loss = 0.0f32;
     let mut grad = vec![0.0f32; batch];
@@ -163,8 +191,24 @@ pub fn mse(preds: &crate::tensor::Tensor, targets: &[f32]) -> Result<(f32, crate
         let diff = preds.data[i] - targets[i];
         loss += diff * diff;
         grad[i] = 2.0 * diff * inv;
+
+        if verbose::is_verbose() && batch <= 16 {
+            vprintln!("[loss::mse]   sample[{}]: pred={:.6}, target={:.6}, diff={:.6}", i, preds.data[i], targets[i], diff);
+        }
     }
-    Ok((loss * inv, crate::tensor::Tensor::matrix(batch, 1, grad)?))
+
+    let mean_loss = loss * inv;
+    vprintln!("[loss::mse] mean_loss={:.6}", mean_loss);
+
+    if verbose::is_verbose() {
+        if mean_loss.is_nan() {
+            println!("[ferrum_core::WARN] ⚠️  MSE returned NaN loss!");
+        }
+        let (gmin, gmax, gmean) = verbose::stats(&grad);
+        vprintln!("[loss::mse] gradient stats: min={:.6e}, max={:.6e}, mean={:.6e}", gmin, gmax, gmean);
+    }
+
+    Ok((mean_loss, crate::tensor::Tensor::matrix(batch, 1, grad)?))
 }
 
 #[cfg(test)]

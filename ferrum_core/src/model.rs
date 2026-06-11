@@ -2,6 +2,7 @@
 use crate::error::Result;
 use crate::layer::Layer;
 use crate::tensor::Tensor;
+use crate::verbose;
 
 pub struct Sequential {
     layers: Vec<Box<dyn Layer>>,
@@ -13,10 +14,12 @@ impl Sequential {
     }
 
     pub fn with(mut self, l: Box<dyn Layer>) -> Self {
+        vprintln!("[model::Sequential::with] Adding layer: {}", l.name());
         self.layers.push(l);
         self
     }
     pub fn push(&mut self, l: Box<dyn Layer>) {
+        vprintln!("[model::Sequential::push] Adding layer: {}", l.name());
         self.layers.push(l);
     }
 
@@ -31,9 +34,16 @@ impl Sequential {
     }
 
     pub fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        vprintln!("[model::Sequential::forward] input shape={:?}, {} layers", input.shape, self.layers.len());
         let mut cur = input.clone();
-        for l in &self.layers {
+        for (i, l) in self.layers.iter().enumerate() {
             cur = l.forward(&cur)?;
+            if verbose::is_verbose() {
+                let (vmin, vmax, vmean) = verbose::stats(&cur.data);
+                vprintln!("[model::Sequential::forward]   [{}/{}] {} → shape={:?}, stats: min={:.6}, max={:.6}, mean={:.6}",
+                    i+1, self.layers.len(), l.name(), cur.shape, vmin, vmax, vmean);
+                verbose::check_nan_inf(&cur.data, &format!("Sequential::forward layer[{}] {}", i, l.name()));
+            }
         }
         Ok(cur)
     }

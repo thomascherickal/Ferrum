@@ -3,6 +3,7 @@ use crate::activation::Activation;
 use crate::error::{InferError, Result};
 use crate::ops;
 use crate::tensor::Tensor;
+use crate::verbose;
 use std::any::Any;
 use std::cell::RefCell;
 
@@ -35,6 +36,7 @@ impl Linear {
                 bias.len()
             )));
         }
+        vprintln!("[layer::Linear::new] in={}, out={}, weight_len={}, bias_len={}", in_f, out_f, weight.len(), bias.len());
         Ok(Self {
             weight: Tensor::matrix(in_f, out_f, weight)?,
             bias: Tensor::vector(bias),
@@ -59,7 +61,14 @@ impl Layer for Linear {
                 self.in_f
             )));
         }
-        ops::add_bias(&ops::matmul(input, &self.weight)?, &self.bias)
+        vprintln!("[layer::Linear::forward] input={:?}, weight=[{},{}]", input.shape, self.in_f, self.out_f);
+        let result = ops::add_bias(&ops::matmul(input, &self.weight)?, &self.bias)?;
+        if verbose::is_verbose() {
+            let (vmin, vmax, vmean) = verbose::stats(&result.data);
+            vprintln!("[layer::Linear::forward]   output={:?}, stats: min={:.6}, max={:.6}, mean={:.6}", result.shape, vmin, vmax, vmean);
+            verbose::check_nan_inf(&result.data, &format!("Linear({}→{}) output", self.in_f, self.out_f));
+        }
+        Ok(result)
     }
     fn name(&self) -> String {
         format!("Linear({}→{})", self.in_f, self.out_f)
@@ -114,6 +123,7 @@ impl LayerNorm {
                 "LayerNorm weights len {}/{} != dim {}", gamma.len(), beta.len(), dim
             )));
         }
+        vprintln!("[layer::LayerNorm::new] dim={}", dim);
         Ok(Self {
             gamma: Tensor::vector(gamma),
             beta: Tensor::vector(beta),
@@ -133,6 +143,7 @@ impl Layer for LayerNorm {
                 "LayerNorm expects width {}, got {}", self.dim, cols
             )));
         }
+        vprintln!("[layer::LayerNorm::forward] [{},{}]", rows, cols);
         let mut out = vec![0.0f32; rows * cols];
         for r in 0..rows {
             let base = r * cols;
@@ -140,9 +151,17 @@ impl Layer for LayerNorm {
             let mean = row_slice.iter().sum::<f32>() / cols as f32;
             let var = row_slice.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / cols as f32;
             let std = (var + 1e-5).sqrt();
+
+            if verbose::is_verbose() && rows <= 8 {
+                vprintln!("[layer::LayerNorm::forward]   row[{}]: mean={:.6}, var={:.6}, std={:.6}", r, mean, var, std);
+            }
+
             for c in 0..cols {
                 out[base + c] = ((row_slice[c] - mean) / std) * self.gamma.data[c] + self.beta.data[c];
             }
+        }
+        if verbose::is_verbose() {
+            verbose::check_nan_inf(&out, "LayerNorm output");
         }
         Tensor::matrix(rows, cols, out)
     }
@@ -181,6 +200,7 @@ impl Embedding {
         if pos_weight.len() != max_seq_len * embedding_dim {
             return Err(InferError::ShapeMismatch { expected: max_seq_len * embedding_dim, got: pos_weight.len() });
         }
+        vprintln!("[layer::Embedding::new] vocab={}, max_seq={}, dim={}", vocab_size, max_seq_len, embedding_dim);
         Ok(Self {
             token_weight: Tensor::matrix(vocab_size, embedding_dim, token_weight)?,
             pos_weight: Tensor::matrix(max_seq_len, embedding_dim, pos_weight)?,
@@ -214,6 +234,9 @@ impl Layer for Embedding {
                 "Sequence length {} exceeds max_seq_len {}", seq_len, self.max_seq_len
             )));
         }
+        vprintln!("[layer::Embedding::forward] batch={}, seq_len={}, vocab={}, dim={}",
+            batch, seq_len, self.vocab_size, self.embedding_dim);
+
         let out_cols = self.embedding_dim;
         let mut out_data = vec![0.0f32; batch * seq_len * out_cols];
         for b in 0..batch {
@@ -231,6 +254,11 @@ impl Layer for Embedding {
                     out_data[out_base + d] = self.token_weight.data[tok_base + d] + self.pos_weight.data[pos_base + d];
                 }
             }
+        }
+        if verbose::is_verbose() {
+            let (vmin, vmax, vmean) = verbose::stats(&out_data);
+            vprintln!("[layer::Embedding::forward]   output=[{},{}], stats: min={:.6}, max={:.6}, mean={:.6}",
+                batch * seq_len, out_cols, vmin, vmax, vmean);
         }
         Tensor::matrix(batch * seq_len, out_cols, out_data)
     }
@@ -279,6 +307,17 @@ impl TransformerBlock {
         ffn1_w: Vec<f32>, ffn1_b: Vec<f32>,
         ffn2_w: Vec<f32>, ffn2_b: Vec<f32>,
     ) -> Result<Self> {
+        if context_len == 0 {
+            return Err(InferError::DimMismatch("context_len must be > 0".into()));
+        }
+        if num_heads == 0 || embedding_dim % num_heads != 0 {
+            return Err(InferError::DimMismatch(format!(
+                "embedding_dim {embedding_dim} must be divisible by num_heads {num_heads}"
+            )));
+        }
+        vprintln!("[layer::TransformerBlock::new] ctx={}, heads={}, dim={}, hidden={}",
+            context_len, num_heads, embedding_dim, ffn1_b.len());
+
         let ln1 = LayerNorm::new(embedding_dim, ln1_g, ln1_b)?;
         let q_proj = Linear::new(embedding_dim, embedding_dim, q_w, q_b)?;
         let k_proj = Linear::new(embedding_dim, embedding_dim, k_w, k_b)?;
@@ -335,15 +374,38 @@ impl Layer for TransformerBlock {
         }
         let b = m / t;
 
+        vprintln!("[layer::TransformerBlock::forward] input=[{},{}], batch={}, ctx={}, heads={}, dim={}",
+            m, c, b, t, self.num_heads, self.embedding_dim);
+
         // ── 1. LayerNorm 1 ───────────────────────────────────────────────────────
+        vprintln!("[layer::TransformerBlock::forward]   ┌─ LayerNorm1");
         let norm1 = self.ln1.forward(input)?;
+        if verbose::is_verbose() {
+            let (vmin, vmax, vmean) = verbose::stats(&norm1.data);
+            vprintln!("[layer::TransformerBlock::forward]   │  LN1 output: min={:.6}, max={:.6}, mean={:.6}", vmin, vmax, vmean);
+            verbose::check_nan_inf(&norm1.data, "TransformerBlock LN1");
+        }
 
         // ── 2. Q, K, V Projections ────────────────────────────────────────────────
+        vprintln!("[layer::TransformerBlock::forward]   ├─ Q/K/V projections");
         let q = self.q_proj.forward(&norm1)?;
         let k = self.k_proj.forward(&norm1)?;
         let v = self.v_proj.forward(&norm1)?;
+        if verbose::is_verbose() {
+            let (qmin, qmax, qmean) = verbose::stats(&q.data);
+            let (kmin, kmax, kmean) = verbose::stats(&k.data);
+            let (vmin, vmax, vmean) = verbose::stats(&v.data);
+            vprintln!("[layer::TransformerBlock::forward]   │  Q: min={:.6}, max={:.6}, mean={:.6}", qmin, qmax, qmean);
+            vprintln!("[layer::TransformerBlock::forward]   │  K: min={:.6}, max={:.6}, mean={:.6}", kmin, kmax, kmean);
+            vprintln!("[layer::TransformerBlock::forward]   │  V: min={:.6}, max={:.6}, mean={:.6}", vmin, vmax, vmean);
+            verbose::check_nan_inf(&q.data, "TransformerBlock Q");
+            verbose::check_nan_inf(&k.data, "TransformerBlock K");
+            verbose::check_nan_inf(&v.data, "TransformerBlock V");
+        }
 
         // ── 3. Multi-Head Attention ──────────────────────────────────────────────
+        vprintln!("[layer::TransformerBlock::forward]   ├─ Multi-Head Attention ({} heads, head_dim={})",
+            self.num_heads, self.embedding_dim / self.num_heads);
         let num_heads = self.num_heads;
         let head_dim = self.embedding_dim / num_heads;
         let head_scale = 1.0 / (head_dim as f32).sqrt();
@@ -398,6 +460,13 @@ impl Layer for TransformerBlock {
                     }
                 }
 
+                if verbose::is_verbose() {
+                    let (amin, amax, amean) = verbose::stats(&s);
+                    vprintln!("[layer::TransformerBlock::forward]   │  batch[{}] head[{}]: attn_weights: min={:.6}, max={:.6}, mean={:.6}",
+                        batch_idx, head_idx, amin, amax, amean);
+                    verbose::check_nan_inf(&s, &format!("TransformerBlock attn_weights batch={} head={}", batch_idx, head_idx));
+                }
+
                 // Store attention weights for visualization
                 let attn_store_base = (batch_idx * num_heads + head_idx) * t * t;
                 all_attns[attn_store_base..attn_store_base + t * t].copy_from_slice(&s);
@@ -420,26 +489,47 @@ impl Layer for TransformerBlock {
         self.last_attention.replace(all_attns);
 
         let attn_out_tensor = Tensor::matrix(m, c, attn_out)?;
+        vprintln!("[layer::TransformerBlock::forward]   ├─ Output projection");
         let projected = self.out_proj.forward(&attn_out_tensor)?;
 
         // Residual connection
+        vprintln!("[layer::TransformerBlock::forward]   ├─ Residual connection 1 (input + attention)");
         let mut x_attn_data = vec![0.0f32; m * c];
         for i in 0..m * c {
             x_attn_data[i] = input.data[i] + projected.data[i];
         }
         let x_attn = Tensor::matrix(m, c, x_attn_data)?;
+        if verbose::is_verbose() {
+            let (vmin, vmax, vmean) = verbose::stats(&x_attn.data);
+            vprintln!("[layer::TransformerBlock::forward]   │  post-residual-1: min={:.6}, max={:.6}, mean={:.6}", vmin, vmax, vmean);
+            verbose::check_nan_inf(&x_attn.data, "TransformerBlock post-residual-1");
+        }
 
         // ── 4. LayerNorm 2 & FFN ─────────────────────────────────────────────────
+        vprintln!("[layer::TransformerBlock::forward]   ├─ LayerNorm2");
         let norm2 = self.ln2.forward(&x_attn)?;
+
+        vprintln!("[layer::TransformerBlock::forward]   ├─ FFN (in → hidden → out)");
         let ff1 = self.ffn1.forward(&norm2)?;
         // ReLU
         let ffn_hidden = ff1.map(|x| x.max(0.0));
+        if verbose::is_verbose() {
+            let zeros = ffn_hidden.data.iter().filter(|&&v| v == 0.0).count();
+            vprintln!("[layer::TransformerBlock::forward]   │  FFN ReLU: {}/{} zeros ({:.1}% dead)",
+                zeros, ffn_hidden.data.len(), 100.0 * zeros as f32 / ffn_hidden.data.len() as f32);
+        }
         let ff2 = self.ffn2.forward(&ffn_hidden)?;
 
         // Residual connection
+        vprintln!("[layer::TransformerBlock::forward]   └─ Residual connection 2 (attn + ffn)");
         let mut out_data = vec![0.0f32; m * c];
         for i in 0..m * c {
             out_data[i] = x_attn.data[i] + ff2.data[i];
+        }
+        if verbose::is_verbose() {
+            let (vmin, vmax, vmean) = verbose::stats(&out_data);
+            vprintln!("[layer::TransformerBlock::forward]   Final output: min={:.6}, max={:.6}, mean={:.6}", vmin, vmax, vmean);
+            verbose::check_nan_inf(&out_data, "TransformerBlock final output");
         }
         Tensor::matrix(m, c, out_data)
     }
@@ -846,4 +936,3 @@ mod tests {
         assert!(y.data.iter().any(|&v| v.abs() > 0.01));
     }
 }
-

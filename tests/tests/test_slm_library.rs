@@ -27,8 +27,11 @@ fn test_build_csv_dataset_sliding_windows() {
     let context_len = 3;
     let csv = build_csv_dataset(corpus, context_len).unwrap();
 
-    // Verify CSV header
-    assert!(csv.starts_with("c0,c1,c2,label\n"));
+    // Verify CSV header: one-hot columns c{pos}_v{vocab_idx}, vocab = {a..g, ' ', '\n'} = 9 chars
+    let header = csv.lines().next().unwrap();
+    assert!(header.starts_with("c0_v0,"));
+    assert!(header.ends_with("label"));
+    assert_eq!(header.split(',').count(), 3 * 9 + 1);
 
     // Verify sliding windows:
     // abc -> d
@@ -66,9 +69,9 @@ fn test_slm_training_and_generation_roundtrip() {
         &mut rng,
     ).unwrap();
 
-    // Verify Model Metadata
-    assert_eq!(slm.meta.input_dim, context_len);
+    // Verify Model Metadata: inputs are one-hot, so input_dim = context_len × vocab_size
     assert_eq!(slm.meta.output_dim, slm.meta.class_names.len());
+    assert_eq!(slm.meta.input_dim, context_len * slm.meta.output_dim);
 
     // Autoregressively generate text from seed
     let seed = "stri";

@@ -19,15 +19,27 @@ use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("usage: train_cli <csv> <model.bin> [name] [hidden] [epochs]");
+
+    // Parse --verbose flag from command-line arguments
+    if args.iter().any(|a| a == "--verbose" || a == "-v") {
+        ferrum_core::set_verbose(true);
+        println!("Verbose mode: all ferrum_core internals will be printed.");
+    }
+
+    // Filter out --verbose/-v flags for positional arg parsing
+    let positional: Vec<&String> = args.iter()
+        .filter(|a| *a != "--verbose" && *a != "-v")
+        .collect();
+
+    if positional.len() < 3 {
+        eprintln!("usage: train_cli <csv> <model.bin> [name] [hidden] [epochs] [--verbose]");
         std::process::exit(1);
     }
-    let csv_path = &args[1];
-    let model_path = &args[2];
-    let ds_name = args.get(3).map(|s| s.as_str()).unwrap_or("Dataset");
-    let hidden: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(64);
-    let epochs: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(500);
+    let csv_path = positional[1];
+    let model_path = positional[2];
+    let ds_name = positional.get(3).map(|s| s.as_str()).unwrap_or("Dataset");
+    let hidden: usize = positional.get(4).and_then(|s| s.parse().ok()).unwrap_or(64);
+    let epochs: usize = positional.get(5).and_then(|s| s.parse().ok()).unwrap_or(500);
 
     // ── Load ─────────────────────────────────────────────────────────────────
     let raw =

@@ -144,6 +144,11 @@ impl TransformerSLMModel {
         self.num_heads
     }
 
+    /// Vocabulary size (number of distinct tokens).
+    pub fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
     /// Context length (number of characters the model sees at once).
     pub fn context_len(&self) -> usize {
         self.context_len
@@ -226,7 +231,7 @@ impl TransformerSLMModel {
     /// Return the top-k token indices sorted by probability (descending).
     pub fn top_k_indices(&self, probs: &[f32], k: usize) -> Vec<usize> {
         let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
         indexed.iter().take(k).map(|&(i, _)| i).collect()
     }
 }

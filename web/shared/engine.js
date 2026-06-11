@@ -54,7 +54,9 @@ export async function generateAutoregressive(
 ) {
     const { model, metadata } = modelObj;
     const vocab = metadata.class_names; // Array of hex strings representing chars
-    const contextLen = metadata.input_dim;
+    const vocabSize = vocab.length;
+    const inputDim = metadata.input_dim;
+    const contextLen = Math.floor(inputDim / vocabSize);
     
     // Build char-to-index mapping for fast lookup
     const vocabToIdx = {};
@@ -67,15 +69,22 @@ export async function generateAutoregressive(
     // Slide the context window forward
     for (let step = 0; step < numCharsToGenerate; step++) {
         const currentLen = generated.length;
-        if (currentLen < contextLen) break;
         
         const contextStr = generated.slice(-contextLen);
-        const contextIndices = new Float32Array(contextLen);
+        const contextIndices = new Float32Array(inputDim);
+        
+        let paddedContext = contextStr;
+        if (contextStr.length < contextLen) {
+            paddedContext = " ".repeat(contextLen - contextStr.length) + contextStr;
+        }
         
         for (let i = 0; i < contextLen; i++) {
-            const hex = charToHex(contextStr[i]);
+            const hex = charToHex(paddedContext[i]);
             const idx = vocabToIdx[hex] !== undefined ? vocabToIdx[hex] : 0;
-            contextIndices[i] = idx;
+            // One-hot encode position i
+            for (let j = 0; j < vocabSize; j++) {
+                contextIndices[i * vocabSize + j] = (j === idx) ? 1.0 : 0.0;
+            }
         }
 
         // Run inference in WASM

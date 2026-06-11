@@ -2,6 +2,7 @@
 //! own velocity buffers and calls `step` once per parameter tensor.
 use crate::error::{InferError, Result};
 use crate::tensor::Tensor;
+use crate::verbose;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Sgd {
@@ -11,9 +12,11 @@ pub struct Sgd {
 
 impl Sgd {
     pub fn new(lr: f32) -> Self {
+        vprintln!("[optim::Sgd::new] lr={}", lr);
         Self { lr, momentum: 0.0 }
     }
     pub fn with_momentum(lr: f32, m: f32) -> Self {
+        vprintln!("[optim::Sgd::with_momentum] lr={}, momentum={}", lr, m);
         Self { lr, momentum: m }
     }
 
@@ -25,9 +28,26 @@ impl Sgd {
                 param.shape, grad.shape, vel.shape
             )));
         }
+        if verbose::is_verbose() {
+            let (gmin, gmax, gmean) = verbose::stats(&grad.data);
+            vprintln!("[optim::Sgd::step] shape={:?}, lr={}, momentum={}, grad stats: min={:.6e}, max={:.6e}, mean={:.6e}",
+                param.shape, self.lr, self.momentum, gmin, gmax, gmean);
+        }
+
+        let mut max_update = 0.0f32;
         for i in 0..param.data.len() {
             vel.data[i] = self.momentum * vel.data[i] + grad.data[i];
-            param.data[i] -= self.lr * vel.data[i];
+            let update = self.lr * vel.data[i];
+            if update.abs() > max_update { max_update = update.abs(); }
+            param.data[i] -= update;
+        }
+
+        if verbose::is_verbose() {
+            vprintln!("[optim::Sgd::step]   max |update|={:.6e}", max_update);
+            let (pmin, pmax, pmean) = verbose::stats(&param.data);
+            vprintln!("[optim::Sgd::step]   post-step param: min={:.6e}, max={:.6e}, mean={:.6e}", pmin, pmax, pmean);
+            verbose::check_nan_inf(&param.data, "Sgd::step param");
+            verbose::check_nan_inf(&vel.data, "Sgd::step velocity");
         }
         Ok(())
     }

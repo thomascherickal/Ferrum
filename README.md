@@ -1,102 +1,193 @@
-# 🧬 Ferrum — Hand-Crafted Edge ML & Causal Transformer Engine
+# Ferrum — Edge SLM Inference & Training Engine
 
-Ferrum is a zero-dependency, pure-Rust workspace designed to compile and run hand-crafted machine learning models—specifically Feedforward MLPs and Decoder-Only Causal Transformers—directly at the edge, on the CPU, and in the browser via WebAssembly. 
+Ferrum is a **zero-dependency, pure-Rust** workspace for building, training, and running
+small machine-learning models — feedforward MLPs and decoder-only causal Transformers —
+on CPU-only, edge, and WebAssembly targets.
 
-No GPU required. No PyTorch or Python runtimes. No cloud latency or API keys. Single-threaded CPU execution compiled directly to highly compact binaries under 180 KB.
+- **No GPU.** Single-threaded CPU kernels, cache-friendly loop ordering.
+- **No external crates** in the core engine (`ferrum_core` uses `std` only).
+- **Deterministic.** Seeded xorshift64* PRNG; the same seed reproduces the same model.
+- **Self-contained models.** One FINF v4 binary holds weights + normalizer + metadata.
+- **Browser-ready.** `tabular_wasm` exposes the engine to JavaScript via `wasm-bindgen`.
 
 ---
 
 ## Workspace Layout
 
 ```text
-ferrum_lib/
-├── shell_oracle/              # Parent Crate 1: CLI commands weaver
-├── ambient_poet/              # Parent Crate 2: System state Zen haiku poet
-├── brand_alchemist/           # Parent Crate 3: Startup brand & slogan copywriter
+ferrum/
+├── Cargo.toml             # Workspace: ferrum_core, tabular_wasm, train_cli, tests
 │
-└── ferrum/                    # Core Workspace Crate
-    ├── Cargo.toml             # Workspace definition (members: ferrum_core, tabular_wasm, train_cli, tests)
-    │
-    ├── ferrum_core/           # ML Engine (Pure Rust, std only)
-    │   └── src/
-    │       ├── slm.rs         # [NEW] Causal Small Language Model (SLM) library module
-    │       ├── layer.rs       # Layer trait: Linear, LayerNorm, Embedding, TransformerBlock
-    │       ├── model.rs       # Sequential network pipeline
-    │       ├── tensor.rs      # High-performance row-major float arrays
-    │       ├── ops.rs         # Mathematical operations: matmul, bias, argmax, softmax
-    │       ├── rng.rs         # Seeded xorshift64* pseudo-random generator
-    │       ├── loss.rs        # Loss kernels (Softmax Cross-Entropy & MSE with gradients)
-    │       ├── optim.rs       # SGD optimizer with momentum
-    │       ├── csv.rs         # Robust CSV dataset parser, normalizer, and metadata
-    │       ├── train.rs       # Trainable layer wrappers (DenseT, ReluT, Net)
-    │       └── loader.rs      # Serializer/deserializer for self-contained FINF v4 binaries
-    │
-    ├── tabular_wasm/          # WebAssembly Bindings (wasm-bindgen)
-    │   └── src/lib.rs         # TabularModel and TransformerSLMModel WASM bindings
-    │
-    ├── train_cli/             # Generic CSV tabular model trainer
-    ├── tests/                 # 195+ automated unit and integration tests
-    │
-    └── web/                   # WASM Web Playgrounds
-        ├── index.html         # Suite gateway portal page
-        ├── shared/            # Common assets: style.css & engine.js WASM interface
-        ├── shell_oracle/      # Cyberpunk terminal autocompleter playground
-        ├── ambient_poet/      # Calming Zen telemetry composer playground
-        └── brand_alchemist/   # Modern gradient startup weaver playground
+├── ferrum_core/           # The engine (pure Rust, std only)
+│   └── src/
+│       ├── tensor.rs      # Flat row-major f32 tensor with shape checking
+│       ├── ops.rs         # matmul, add_bias, transpose, softmax_rows, argmax_rows…
+│       ├── activation.rs  # Identity / ReLU / Sigmoid / Tanh / Softmax (serialisable)
+│       ├── layer.rs       # Layer trait: Linear, ActivationLayer, LayerNorm,
+│       │                  #   Embedding (token+positional), TransformerBlock (causal MHA)
+│       ├── model.rs       # Sequential — ordered pipeline of layers
+│       ├── loss.rs        # Fused softmax cross-entropy + MSE, both with gradients
+│       ├── optim.rs       # SGD with optional momentum
+│       ├── train.rs       # Trainable MLP (DenseT/ReluT/Net), backprop, train_epoch
+│       ├── csv.rs         # CSV parser, Normalizer, task auto-detection, ModelMetadata
+│       ├── slm.rs         # GenerativeSLM — character-level causal language model
+│       ├── loader.rs      # FINF v4 binary save/load (all 5 layer types)
+│       ├── rng.rs         # Seeded xorshift64* PRNG
+│       └── verbose.rs     # Opt-in tracing (set_verbose) + vprintln! macro
+│
+├── tabular_wasm/          # WASM bindings: TabularModel + TransformerSLMModel
+├── train_cli/             # CLI: train any CSV (classification/regression) → FINF
+├── tests/                 # Integration test crate (200+ tests in the workspace)
+└── web/                   # Browser playgrounds consuming the WASM package
 ```
 
 ---
 
-## Key Features
+## Architecture at a Glance
 
-1. **`ferrum_core` as an Independent Library**: A lightweight, auditable Rust engine that compiles cleanly to OS-less targets (like `wasm32-unknown-unknown`) because it relies strictly on `std` and zero external crates.
-2. **Generic `slm` Causal Module**: An out-of-the-box library engine inside `ferrum_core` designed to train small next-character language models from scratch on custom raw text corpora, utilizing hex-encoded vocabulary mappings to maintain 100% data integrity within CSV rows.
-3. **Decoder-Only Causal Transformer Blocks**: Includes `Embedding` (token + positional), `LayerNorm`, and `TransformerBlock` (Causal Multi-Head Self-Attention + FFN) layers for running complex Small Language Models (SLMs) in WASM.
-4. **Stunning Web Playgrounds**: Three highly optimized, beautiful, responsive interactive browser applications that stream characters, output Shannon entropy, and render probability distributions dynamically.
+```text
+Tensor ──► ops (matmul, softmax, …)
+     │
+     └──► Layer trait
+            ├── Linear           (y = xW + b, W is [in, out] — no transpose at inference)
+            ├── ActivationLayer  (ReLU / Softmax / …)
+            ├── LayerNorm        (per-row normalisation, ε = 1e-5)
+            ├── Embedding        (token lookup + learned positional encoding)
+            └── TransformerBlock (pre-norm causal multi-head self-attention + FFN,
+                                  residual connections, attention maps exposed)
+
+Sequential ──► ordered pipeline of Layers
+loader     ──► FINF v4 binary format (save / load / to_bytes / from_bytes)
+slm        ──► GenerativeSLM: corpus → train → generate (char-level, temperature sampling)
+train      ──► Net (trainable MLP), train_epoch, accuracy
+```
 
 ---
 
 ## Quick Start
 
-### 1. Pre-requisites (One-time)
+### Build & test
+
+```bash
+cargo build --workspace
+cargo test  --workspace      # 200+ tests, all passing
+```
+
+### Train a tabular model from any CSV
+
+```bash
+cargo run -p train_cli -- tests/fixtures/iris.data /tmp/iris.bin "Iris" 32 200
+# Auto-detects classification vs regression, trains, validates, exports FINF.
+# Add --verbose to trace every kernel call.
+```
+
+### Train and run a character-level SLM (library API)
+
+```rust
+use ferrum_core::{GenerativeSLM, Rng};
+
+let corpus = std::fs::read_to_string("corpus.txt")?;
+let mut rng = Rng::new(42);
+
+// corpus, context_len, hidden_size, epochs, lr, momentum, batch_size, rng
+let slm = GenerativeSLM::train(&corpus, 8, 64, 200, 0.05, 0.9, 16, &mut rng)?;
+
+let text = slm.generate("once upo", 100, 0.8, &mut rng)?;   // seed, n_chars, temperature
+std::fs::write("model.bin", slm.to_bytes()?)?;              // self-contained binary
+let reloaded = GenerativeSLM::from_bytes(&std::fs::read("model.bin")?)?;
+```
+
+See **[example.md](example.md)** for a complete walkthrough, including hand-building a
+true Transformer SLM with `Embedding` + `TransformerBlock`.
+
+### Run a pre-trained model (inference only)
+
+```rust
+use ferrum_core::{from_bytes, Tensor};
+
+let bytes = std::fs::read("model.bin")?;
+let (model, norm, meta) = from_bytes(&bytes)?;
+let input = norm.transform(&Tensor::row(vec![5.1, 3.5, 1.4, 0.2])?)?;
+let probs = model.forward(&input)?;          // softmax already applied
+```
+
+### WebAssembly
+
 ```bash
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.122 --locked
+bash scripts/build_wasm.sh
+python3 -m http.server 8080 --directory web   # open http://localhost:8080
 ```
 
-### 2. Run the 196 Automated Tests
+JavaScript side:
+
+```js
+const bytes = new Uint8Array(await (await fetch('model.bin')).arrayBuffer());
+const slm   = new TransformerSLMModel(bytes);
+const probs = slm.predict_next(new Float32Array([12, 5, 3, 7]));  // token IDs
+const attn  = slm.get_last_attention_weights();  // [heads × T × T] for visualisation
+```
+
+---
+
+## The FINF v4 Model Format
+
+One little-endian binary blob, fully self-describing:
+
+| Field        | Size | Contents                                         |
+|--------------|------|--------------------------------------------------|
+| magic        | 4 B  | `"FINF"`                                         |
+| version      | u32  | `4`                                              |
+| norm_len     | u32  | length of normalizer string (empty for SLMs)     |
+| norm         | …    | `mean,std;mean,std;…` per feature                |
+| meta_len     | u32  | length of metadata JSON                          |
+| meta         | …    | dataset name, task, feature/class names, dims    |
+| num_layers   | u32  |                                                  |
+| layers       | …    | per layer: `u8` tag + raw f32 weights            |
+
+Layer tags: `0` Linear, `1` Activation, `2` Embedding, `3` LayerNorm, `4` TransformerBlock.
+
+The embedded metadata means a browser UI can build itself from the model file alone — no
+separate config request.
+
+---
+
+## Verbose Diagnostics
+
+Every module is instrumented. Enable tracing once at startup:
+
+```rust
+ferrum_core::set_verbose(true);
+```
+
+You get per-call shape logs, min/max/mean activation stats, dead-ReLU percentages,
+NaN/Inf detection, per-epoch loss/ETA, and attention-weight statistics. Overhead when
+off is a single atomic load per call site.
+
+---
+
+## Testing
+
 ```bash
 cargo test --workspace
 ```
 
-### 3. Compile the WebAssembly Package
-```bash
-bash scripts/build_wasm.sh
-```
+The suite covers tensor/shape validation, every kernel against hand-computed values,
+analytic-vs-finite-difference gradient checks for the full backprop path, causal-mask
+enforcement, attention rows summing to 1, FINF round-trips for all layer types,
+corrupt/truncated-file handling, and an end-to-end train→generate→serialize→reload SLM
+pipeline.
 
-### 4. Run the Standalone Parent Applications
-To train, export, and run interactive generation loops:
-```bash
-# Shell Oracle
-cd ../shell_oracle && cargo run --release
+---
 
-# Ambient Poet
-cd ../ambient_poet && cargo run --release
+## Documentation
 
-# Brand Alchemist
-cd ../brand_alchemist && cargo run --release
-```
+- **[evaluation.md](evaluation.md)** — engineering evaluation: strengths, fixed defects, gaps, roadmap.
+- **[example.md](example.md)** — build your own SLM with Ferrum, step by step.
+- **[INSTALLATION.md](INSTALLATION.md)** / **[DEPLOYMENT.md](DEPLOYMENT.md)** — setup and hosting.
+- `docs/` — user guide, manual, FAQs.
 
-### 5. Launch the Web Playgrounds
-Copy the trained models to the web folder and host a local server:
-```bash
-# From workspace root (ferrum/)
-mkdir -p web/datasets/shell_oracle web/datasets/ambient_poet web/datasets/brand_alchemist
-cp ../shell_oracle/shell_oracle.bin web/datasets/shell_oracle/model.bin
-cp ../ambient_poet/ambient_poet.bin web/datasets/ambient_poet/model.bin
-cp ../brand_alchemist/brand_alchemist.bin web/datasets/brand_alchemist/model.bin
+## License
 
-# Serve
-python3 -m http.server 8080 --directory web
-# Open http://localhost:8080
-```
+MIT OR Apache-2.0

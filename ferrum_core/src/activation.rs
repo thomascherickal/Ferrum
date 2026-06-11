@@ -2,6 +2,7 @@
 use crate::error::Result;
 use crate::ops;
 use crate::tensor::Tensor;
+use crate::verbose;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Activation {
@@ -14,13 +15,20 @@ pub enum Activation {
 
 impl Activation {
     pub fn apply(&self, input: &Tensor) -> Result<Tensor> {
-        match self {
+        vprintln!("[activation::apply] {:?} on shape={:?}", self, input.shape);
+        let result = match self {
             Activation::Identity => Ok(input.clone()),
             Activation::ReLU => Ok(input.map(|x| x.max(0.0))),
             Activation::Sigmoid => Ok(input.map(|x| 1.0 / (1.0 + (-x).exp()))),
             Activation::Tanh => Ok(input.map(|x| x.tanh())),
             Activation::Softmax => ops::softmax_rows(input),
+        }?;
+        if verbose::is_verbose() {
+            let (vmin, vmax, vmean) = verbose::stats(&result.data);
+            vprintln!("[activation::apply] {:?} output: min={:.6}, max={:.6}, mean={:.6}", self, vmin, vmax, vmean);
+            verbose::check_nan_inf(&result.data, &format!("Activation::{:?}", self));
         }
+        Ok(result)
     }
 
     pub fn tag(&self) -> u8 {

@@ -100,6 +100,7 @@ fn push_str(out: &mut Vec<u8>, s: &str) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub fn to_bytes(model: &Sequential, norm: &Normalizer, meta: &ModelMetadata) -> Result<Vec<u8>> {
+    vprintln!("[loader::to_bytes] Serializing FINF v{} model ({} layers)", VERSION, model.len());
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
     push_u32(&mut out, VERSION);
@@ -111,7 +112,8 @@ pub fn to_bytes(model: &Sequential, norm: &Normalizer, meta: &ModelMetadata) -> 
     push_str(&mut out, &meta.to_json());
 
     push_u32(&mut out, model.len() as u32);
-    for layer in model.layers() {
+    for (layer_idx, layer) in model.layers().iter().enumerate() {
+        vprintln!("[loader::to_bytes]   layer[{}]: {}", layer_idx, layer.name());
         let any = layer.as_any();
 
         if let Some(lin) = any.downcast_ref::<Linear>() {
@@ -170,6 +172,7 @@ pub fn to_bytes(model: &Sequential, norm: &Normalizer, meta: &ModelMetadata) -> 
             )));
         }
     }
+    vprintln!("[loader::to_bytes] Total size: {} bytes", out.len());
     Ok(out)
 }
 
@@ -178,11 +181,13 @@ pub fn to_bytes(model: &Sequential, norm: &Normalizer, meta: &ModelMetadata) -> 
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub fn from_bytes(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata)> {
+    vprintln!("[loader::from_bytes] Deserializing {} bytes", bytes.len());
     let mut r = Reader::new(bytes);
     if r.take(4)? != MAGIC {
         return Err(InferError::Format("bad FINF magic".into()));
     }
     let ver = r.u32()?;
+    vprintln!("[loader::from_bytes] FINF version: {}", ver);
     if ver != VERSION {
         return Err(InferError::Format(format!(
             "unsupported FINF v{ver} (need v{VERSION})"
@@ -202,12 +207,14 @@ pub fn from_bytes(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata
     let meta = ModelMetadata::from_json(r.utf8(meta_len)?)?;
 
     let num_layers = r.usize()?;
+    vprintln!("[loader::from_bytes] Loading {} layers", num_layers);
     let mut model = Sequential::new();
-    for _ in 0..num_layers {
+    for layer_i in 0..num_layers {
         match r.u8()? {
             TAG_LINEAR => {
                 let in_f = r.usize()?;
                 let out_f = r.usize()?;
+                vprintln!("[loader::from_bytes]   layer[{}]: Linear({}→{})", layer_i, in_f, out_f);
                 model.push(Box::new(Linear::new(
                     in_f, out_f,
                     r.f32_vec(in_f * out_f)?,
@@ -216,15 +223,16 @@ pub fn from_bytes(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata
             }
             TAG_ACTIVATION => {
                 let t = r.u8()?;
-                model.push(Box::new(ActivationLayer::new(
-                    Activation::from_tag(t)
-                        .ok_or_else(|| InferError::Format(format!("bad act tag {t}")))?,
-                )));
+                let act = Activation::from_tag(t)
+                    .ok_or_else(|| InferError::Format(format!("bad act tag {t}")))?;
+                vprintln!("[loader::from_bytes]   layer[{}]: Activation({:?})", layer_i, act);
+                model.push(Box::new(ActivationLayer::new(act)));
             }
             TAG_EMBEDDING => {
                 let vocab_size = r.usize()?;
                 let max_seq_len = r.usize()?;
                 let embedding_dim = r.usize()?;
+                vprintln!("[loader::from_bytes]   layer[{}]: Embedding(vocab={}, seq={}, dim={})", layer_i, vocab_size, max_seq_len, embedding_dim);
                 model.push(Box::new(Embedding::new(
                     vocab_size, max_seq_len, embedding_dim,
                     r.f32_vec(vocab_size * embedding_dim)?,
@@ -233,6 +241,7 @@ pub fn from_bytes(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata
             }
             TAG_LAYERNORM => {
                 let dim = r.usize()?;
+                vprintln!("[loader::from_bytes]   layer[{}]: LayerNorm(dim={})", layer_i, dim);
                 model.push(Box::new(LayerNorm::new(
                     dim,
                     r.f32_vec(dim)?,
@@ -244,6 +253,8 @@ pub fn from_bytes(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata
                 let num_heads = r.usize()?;
                 let embedding_dim = r.usize()?;
                 let hidden_dim = r.usize()?;
+                vprintln!("[loader::from_bytes]   layer[{}]: TransformerBlock(ctx={}, heads={}, dim={}, hidden={})",
+                    layer_i, context_len, num_heads, embedding_dim, hidden_dim);
                 let c = embedding_dim;
                 let h = hidden_dim;
                 model.push(Box::new(TransformerBlock::new(
@@ -261,15 +272,23 @@ pub fn from_bytes(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata
             t => return Err(InferError::Format(format!("bad layer tag {t}"))),
         }
     }
+    vprintln!("[loader::from_bytes] Deserialized: {} layers", model.len());
     Ok((model, norm, meta))
 }
 
 pub fn save(model: &Sequential, norm: &Normalizer, meta: &ModelMetadata, path: &str) -> Result<()> {
-    std::fs::write(path, to_bytes(model, norm, meta)?)?;
+    vprintln!("[loader::save] Saving model to: {}", path);
+    let bytes = to_bytes(model, norm, meta)?;
+    vprintln!("[loader::save] Writing {} bytes to disk", bytes.len());
+    std::fs::write(path, bytes)?;
+    vprintln!("[loader::save] Done");
     Ok(())
 }
 pub fn load(path: &str) -> Result<(Sequential, Normalizer, ModelMetadata)> {
-    from_bytes(&std::fs::read(path)?)
+    vprintln!("[loader::load] Loading model from: {}", path);
+    let bytes = std::fs::read(path)?;
+    vprintln!("[loader::load] Read {} bytes from disk", bytes.len());
+    from_bytes(&bytes)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

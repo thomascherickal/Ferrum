@@ -12,6 +12,7 @@
 
 use crate::error::{InferError, Result};
 use crate::tensor::Tensor;
+use crate::verbose;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Task type
@@ -256,6 +257,8 @@ impl CsvDataset {
 
     /// Like `from_str` but lets the caller override task detection.
     pub fn from_str_with_task(text: &str, force_task: Option<TaskType>) -> Result<Self> {
+        vprintln!("[csv::CsvDataset::from_str_with_task] Parsing CSV ({} bytes), force_task={:?}",
+            text.len(), force_task);
         let mut lines = text.lines().peekable();
         while lines.peek().map(|l| l.trim().is_empty()) == Some(true) {
             lines.next();
@@ -340,6 +343,9 @@ impl CsvDataset {
             }
         });
 
+        vprintln!("[csv::CsvDataset] Detected task: {:?}, {} distinct targets, all_numeric={}",
+            task, distinct_targets.len(), all_numeric);
+
         // Build feature ranges
         let mut feat_min = vec![f32::MAX; num_features];
         let mut feat_max = vec![f32::MIN; num_features];
@@ -412,10 +418,10 @@ impl CsvDataset {
             rows,
             num_features,
             num_classes,
-            class_names,
-            feature_names,
+            class_names: class_names.clone(),
+            feature_names: feature_names.clone(),
             task,
-            feature_ranges,
+            feature_ranges: feature_ranges.clone(),
             target_range,
         })
     }
@@ -456,6 +462,7 @@ pub struct Normalizer {
 impl Normalizer {
     pub fn fit(x: &Tensor) -> Result<Self> {
         let (rows, cols) = x.matrix_dims()?;
+        vprintln!("[csv::Normalizer::fit] Fitting on [{},{}] matrix", rows, cols);
         if rows == 0 {
             return Err(InferError::Format("cannot fit on 0 rows".into()));
         }
@@ -482,11 +489,21 @@ impl Normalizer {
                 *s = 1.0;
             }
         }
+        vprintln!("[csv::Normalizer::fit] Computed {} column stats", cols);
+        if verbose::is_verbose() {
+            for c in 0..cols.min(8) {
+                vprintln!("[csv::Normalizer::fit]   col[{}]: mean={:.6}, std={:.6}", c, means[c], stds[c]);
+            }
+            if cols > 8 {
+                vprintln!("[csv::Normalizer::fit]   ... ({} more columns)", cols - 8);
+            }
+        }
         Ok(Self { means, stds })
     }
 
     pub fn transform(&self, x: &Tensor) -> Result<Tensor> {
         let (rows, cols) = x.matrix_dims()?;
+        vprintln!("[csv::Normalizer::transform] [{},{}]", rows, cols);
         // Allow normalizer to have one extra column for the target (regression).
         if cols != self.means.len() && cols != self.means.len().saturating_sub(1) {
             return Err(InferError::DimMismatch(format!(
@@ -571,6 +588,7 @@ pub fn train_val_split(
     val_fraction: f32,
     rng: &mut crate::rng::Rng,
 ) -> (CsvDataset, CsvDataset) {
+    vprintln!("[csv::train_val_split] total={}, val_fraction={:.2}", ds.rows.len(), val_fraction);
     let n = ds.rows.len();
     let mut idx: Vec<usize> = (0..n).collect();
     for i in (1..n).rev() {
@@ -589,6 +607,7 @@ pub fn train_val_split(
         feature_ranges: ds.feature_ranges.clone(),
         target_range: ds.target_range,
     };
+    vprintln!("[csv::train_val_split] train={}, val={}", train_idx.len(), val_idx.len());
     (make(train_idx), make(val_idx))
 }
 

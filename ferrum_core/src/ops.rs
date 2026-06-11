@@ -2,6 +2,7 @@
 //! this module does floating-point arithmetic directly.
 use crate::error::{InferError, Result};
 use crate::tensor::Tensor;
+use crate::verbose;
 
 /// Matrix multiply: [m,k] × [k,n] → [m,n]. Uses i-k-j loop order for cache
 /// friendliness: the innermost loop walks contiguous memory in b and the output.
@@ -13,6 +14,7 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
             "matmul: [{m},{ka}] × [{kb},{n}] — inner dims disagree"
         )));
     }
+    vprintln!("[ops::matmul] [{},{}] × [{},{}] → [{},{}]", m, ka, kb, n, m, n);
     let mut out = vec![0.0f32; m * n];
     for i in 0..m {
         let a_row = i * ka;
@@ -24,6 +26,9 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
                 out[o_row + j] += a_ik * b.data[b_row + j];
             }
         }
+    }
+    if verbose::is_verbose() {
+        verbose::check_nan_inf(&out, &format!("ops::matmul result [{m},{n}]"));
     }
     Tensor::matrix(m, n, out)
 }
@@ -37,12 +42,16 @@ pub fn add_bias(matrix: &Tensor, bias: &Tensor) -> Result<Tensor> {
             bias.numel()
         )));
     }
+    vprintln!("[ops::add_bias] [{},{}] + bias[{}]", rows, cols, cols);
     let mut out = matrix.data.clone();
     for r in 0..rows {
         let base = r * cols;
         for c in 0..cols {
             out[base + c] += bias.data[c];
         }
+    }
+    if verbose::is_verbose() {
+        verbose::check_nan_inf(&out, "ops::add_bias result");
     }
     Tensor::matrix(rows, cols, out)
 }
@@ -55,6 +64,7 @@ pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
             a.shape, b.shape
         )));
     }
+    vprintln!("[ops::add] shapes {:?} + {:?}", a.shape, b.shape);
     let data = a.data.iter().zip(&b.data).map(|(x, y)| x + y).collect();
     Tensor::new(a.shape.clone(), data)
 }
@@ -62,6 +72,7 @@ pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
 /// Transpose a rank-2 tensor: [r,c] → [c,r].
 pub fn transpose(m: &Tensor) -> Result<Tensor> {
     let (r, c) = m.matrix_dims()?;
+    vprintln!("[ops::transpose] [{},{}] → [{},{}]", r, c, c, r);
     let mut out = vec![0.0f32; r * c];
     for i in 0..r {
         for j in 0..c {
@@ -74,6 +85,7 @@ pub fn transpose(m: &Tensor) -> Result<Tensor> {
 /// Sum a [rows, cols] matrix along axis-0 → a length-cols vector.
 pub fn sum_axis0(m: &Tensor) -> Result<Tensor> {
     let (rows, cols) = m.matrix_dims()?;
+    vprintln!("[ops::sum_axis0] [{},{}] → [{}]", rows, cols, cols);
     let mut out = vec![0.0f32; cols];
     for i in 0..rows {
         let base = i * cols;
@@ -87,6 +99,7 @@ pub fn sum_axis0(m: &Tensor) -> Result<Tensor> {
 
 /// Scale all elements by a scalar.
 pub fn scale(t: &Tensor, s: f32) -> Tensor {
+    vprintln!("[ops::scale] shape={:?}, scalar={:.6}", t.shape, s);
     t.map(|x| x * s)
 }
 
@@ -98,6 +111,7 @@ pub fn mul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
             a.shape, b.shape
         )));
     }
+    vprintln!("[ops::mul] shapes {:?} ⊙ {:?}", a.shape, b.shape);
     let data = a.data.iter().zip(&b.data).map(|(x, y)| x * y).collect();
     Tensor::new(a.shape.clone(), data)
 }
@@ -105,15 +119,12 @@ pub fn mul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
 /// Index of the largest value in each row → one class label per example.
 pub fn argmax_rows(matrix: &Tensor) -> Result<Vec<usize>> {
     let (rows, cols) = matrix.matrix_dims()?;
+    vprintln!("[ops::argmax_rows] [{},{}]", rows, cols);
     let mut out = Vec::with_capacity(rows);
     for r in 0..rows {
         let base = r * cols;
         let best = (0..cols)
-            .max_by(|&a, &b| {
-                matrix.data[base + a]
-                    .partial_cmp(&matrix.data[base + b])
-                    .unwrap()
-            })
+            .max_by(|&a, &b| matrix.data[base + a].total_cmp(&matrix.data[base + b]))
             .unwrap_or(0);
         out.push(best);
     }
@@ -123,6 +134,7 @@ pub fn argmax_rows(matrix: &Tensor) -> Result<Vec<usize>> {
 /// Row-wise softmax → probability distribution per row.
 pub fn softmax_rows(m: &Tensor) -> Result<Tensor> {
     let (rows, cols) = m.matrix_dims()?;
+    vprintln!("[ops::softmax_rows] [{},{}]", rows, cols);
     let mut out = vec![0.0f32; rows * cols];
     for r in 0..rows {
         let base = r * cols;
@@ -139,6 +151,9 @@ pub fn softmax_rows(m: &Tensor) -> Result<Tensor> {
         for c in 0..cols {
             out[base + c] /= sum;
         }
+    }
+    if verbose::is_verbose() {
+        verbose::check_nan_inf(&out, "ops::softmax_rows result");
     }
     Tensor::matrix(rows, cols, out)
 }

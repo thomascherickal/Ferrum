@@ -43,6 +43,9 @@
 //! let logits = model.forward(&context).unwrap();
 //! ```
 
+#[macro_use]
+pub mod verbose;
+
 pub mod activation;
 pub mod csv;
 pub mod error;
@@ -72,3 +75,4 @@ pub use rng::Rng;
 pub use slm::GenerativeSLM;
 pub use tensor::Tensor;
 pub use train::{accuracy, train_epoch, Net};
+pub use verbose::{set_verbose, is_verbose};

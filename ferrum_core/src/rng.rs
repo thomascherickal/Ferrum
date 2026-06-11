@@ -5,8 +5,10 @@ pub struct Rng {
 
 impl Rng {
     pub fn new(seed: u64) -> Self {
+        let actual_seed = if seed == 0 { 0x9E3779B97F4A7C15 } else { seed };
+        crate::vprintln!("[rng::Rng::new] seed={} (effective={})", seed, actual_seed);
         Self {
-            state: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed },
+            state: actual_seed,
         }
     }
 
