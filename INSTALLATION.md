@@ -48,7 +48,7 @@ cargo install wasm-bindgen-cli --version 0.2.122 --locked
 
 ## 4. Run the Automated Tests
 
-Ferrum features a comprehensive test suite of 196 unit and integration tests verifying all operations:
+Ferrum features a comprehensive test suite of 217 unit and integration tests verifying all operations:
 
 ```bash
 cargo test --workspace

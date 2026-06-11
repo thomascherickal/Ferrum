@@ -1,6 +1,6 @@
 //! Unit and integration tests for the GenerativeSLM edge library module.
 use ferrum_core::{
-    slm::{GenerativeSLM, char_to_hex, hex_to_char, build_csv_dataset},
+    slm::{GenerativeSLM, char_to_hex, hex_to_char, build_csv_dataset, corpus_vocab},
     Rng, TaskType,
 };
 
@@ -38,9 +38,24 @@ fn test_build_csv_dataset_sliding_windows() {
     // bcd -> e
     // cde -> f
     // def -> g
-    // Total of 4 sliding window rows, plus 9 vocabulary padding rows (a,b,c,d,e,f,g,' ','\n')
+    // Exactly 4 sliding-window rows — class coverage now comes from explicit
+    // registration (CsvDataset::from_str_with_classes), not padding rows.
     let lines: Vec<&str> = csv.trim().lines().collect();
-    assert_eq!(lines.len(), 1 + 4 + 9);
+    assert_eq!(lines.len(), 1 + 4);
+}
+
+#[test]
+fn test_trained_slm_covers_full_vocab_in_sorted_order() {
+    // Characters that never appear as a target (here: nothing after the last
+    // 'g'... vocab includes ' ' and '\n' which never appear at all) must still
+    // be registered classes, in sorted order — the guarantee the padding rows
+    // used to provide.
+    let corpus = "abcdefg";
+    let mut rng = Rng::new(5);
+    let slm = GenerativeSLM::train(corpus, 3, 8, 5, 0.05, 0.9, 4, &mut rng).unwrap();
+    let expected: Vec<String> = corpus_vocab(corpus).iter().map(|&c| char_to_hex(c)).collect();
+    assert_eq!(slm.meta.class_names, expected);
+    assert_eq!(slm.meta.output_dim, expected.len());
 }
 
 #[test]
@@ -98,6 +113,72 @@ fn test_transformer_slm_training_and_generation_roundtrip() {
     let a = slm.generate("abca", 8, 0.1, &mut rng2).unwrap();
     let b = reloaded.generate("abca", 8, 0.1, &mut rng3).unwrap();
     assert_eq!(a, b, "reloaded model generates differently");
+}
+
+#[test]
+fn test_embedded_slm_training_and_generation_roundtrip() {
+    let corpus = "abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc";
+    let context_len = 4;
+    let mut rng = Rng::new(11);
+
+    let mut losses: Vec<f32> = Vec::new();
+    let slm = GenerativeSLM::train_embedded_with_callback(
+        corpus,
+        context_len,
+        8,     // embed_dim
+        32,    // hidden_size
+        60,    // epochs
+        0.05,  // lr
+        0.9,   // momentum
+        8,     // batch_size
+        &mut rng,
+        |_, loss| losses.push(loss),
+    ).unwrap();
+
+    assert!(losses.last().unwrap() < &(losses[0] * 0.5),
+        "loss did not halve: {} → {}", losses[0], losses.last().unwrap());
+
+    // Token-ID input contract: input_dim = context_len, NOT context_len × vocab.
+    assert_eq!(slm.meta.input_dim, context_len);
+    assert_eq!(slm.meta.output_dim, slm.meta.class_names.len());
+
+    let generated = slm.generate("abca", 12, 0.1, &mut rng).unwrap();
+    assert!(generated.starts_with("abca"));
+    assert_eq!(generated.chars().count(), 4 + 12);
+    assert!(generated.contains("bcabc"), "unexpected generation: {generated:?}");
+
+    // Roundtrip through FINF v5 (Flatten layer forces v5) preserves behaviour.
+    let bytes = slm.to_bytes().unwrap();
+    let reloaded = GenerativeSLM::from_bytes(&bytes).unwrap();
+    let mut rng2 = Rng::new(123);
+    let mut rng3 = Rng::new(123);
+    let a = slm.generate("abca", 8, 0.1, &mut rng2).unwrap();
+    let b = reloaded.generate("abca", 8, 0.1, &mut rng3).unwrap();
+    assert_eq!(a, b, "reloaded model generates differently");
+
+    // Quantized serialization also reloads and generates.
+    let qbytes = slm.to_bytes_quantized().unwrap();
+    assert!(qbytes.len() <= bytes.len());
+    let qmodel = GenerativeSLM::from_bytes(&qbytes).unwrap();
+    let q = qmodel.generate("abca", 8, 0.1, &mut Rng::new(123)).unwrap();
+    assert!(q.starts_with("abca"));
+}
+
+#[test]
+fn test_embedded_slm_is_smaller_than_one_hot() {
+    // Same corpus, context, and hidden width: the embedded model file must be
+    // much smaller because the first layer no longer scales with the one-hot
+    // width (context_len × vocab_size).
+    let corpus = "the quick brown fox jumps over the lazy dog 0123456789\n";
+    let mut rng = Rng::new(2);
+    let onehot = GenerativeSLM::train(corpus, 6, 64, 2, 0.05, 0.9, 8, &mut rng).unwrap();
+    let embedded = GenerativeSLM::train_embedded(corpus, 6, 16, 64, 2, 0.05, 0.9, 8, &mut rng).unwrap();
+    let onehot_len = onehot.to_bytes().unwrap().len();
+    let embedded_len = embedded.to_bytes().unwrap().len();
+    assert!(
+        (embedded_len as f32) < (onehot_len as f32) * 0.5,
+        "embedded model not smaller: {embedded_len} vs {onehot_len} bytes"
+    );
 }
 
 #[test]

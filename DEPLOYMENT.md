@@ -30,10 +30,10 @@ You can publish the playground directly from your GitHub repository using GitHub
 1. Commit the `web/` folder containing the compiled JS, WASM, and `.bin` dataset files to your master/main branch.
 2. Go to your repository settings on GitHub -> **Pages**.
 3. Under **Build and deployment**, select **Deploy from a branch**.
-4. Choose the `master` (or `main`) branch and select the `/web` folder, then click **Save**.
+4. Choose the `master` (or `main`) branch and select the `/ (root)` folder, then click **Save**. (GitHub Pages only offers `/ (root)` or `/docs` as publishing folders, so the playground is served under the `web/` sub-path.)
 
 Your playgrounds will be live in minutes at:
-`https://<your-username>.github.io/Ferrum/`
+`https://<your-username>.github.io/Ferrum/web/`
 
 ---
 

@@ -106,6 +106,37 @@ impl Layer for ActivationLayer {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Flatten
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Flattens any input into a single row: [r, c] → [1, r·c].
+///
+/// Used between `Embedding` and `Linear` in embedded-MLP language models so
+/// the per-position embeddings become one flat feature vector. Serialised in
+/// FINF v5 as tag 5 with no payload.
+#[derive(Default)]
+pub struct Flatten;
+
+impl Flatten {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Layer for Flatten {
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        vprintln!("[layer::Flatten::forward] {:?} → [1, {}]", input.shape, input.data.len());
+        Tensor::matrix(1, input.data.len(), input.data.clone())
+    }
+    fn name(&self) -> String {
+        "Flatten".to_string()
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Layer Normalization
 // ─────────────────────────────────────────────────────────────────────────────
 

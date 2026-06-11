@@ -2,14 +2,15 @@
 
 **Scope:** the `ferrum` workspace only (`ferrum_core`, `tabular_wasm`, `train_cli`, `tests`).
 **Date:** 2026-06-11.
-**Method:** full source review of all 17 Rust source files (~6,200 lines), build,
+**Method:** full source review of all 18 Rust source files (~6,700 lines), build,
 complete test-suite run, and an end-to-end CLI smoke test (iris → 98% accuracy →
 FINF export → reload → predict).
 
 **Verdict:** Ferrum is a well-architected, genuinely zero-dependency educational/edge
-ML engine with unusually good test discipline (200+ tests including analytic gradient
+ML engine with unusually good test discipline (241 tests including analytic gradient
 checks). As shipped it **did not compile** (171 errors); after the fixes below the
-entire workspace builds warning-free and all 200 tests pass.
+entire workspace builds warning-free and all tests pass (200 at review time; 217
+after the §4 high-value follow-ups; 241 after the §4 nice-to-have items landed).
 
 ---
 
@@ -122,11 +123,12 @@ callers anyway.
   item 9: `GenerativeSLM::train_transformer` now trains a real causal
   transformer end-to-end with Adam.
 - ~~**No KV cache.**~~ **Resolved** — see §4 item 8.
-- **Character-level inputs only.** No BPE/byte-level tokenizer. (The transformer
-  path now uses compact token-ID inputs, but the MLP path still uses one-hot
-  contexts where `input_dim = context_len × vocab_size`.)
-- **No quantisation.** Weights are f32 only. Int8 (or even f16) storage would cut
-  model size 4× — important for a project that advertises <180 KB binaries.
+- ~~**Character-level inputs only.** No BPE/byte-level tokenizer.~~ **Resolved** —
+  a byte-level BPE tokenizer module landed (§4 item 13) and the MLP path gained
+  a compact token-ID + embedding variant (§4 item 12). The legacy one-hot
+  `GenerativeSLM::train` remains for the existing WASM playground contract.
+- ~~**No quantisation.**~~ **Resolved** — int8 post-training quantisation in
+  FINF v5 (§4 item 11).
 - ~~**Optimisers: SGD+momentum only.**~~ **Resolved** — Adam added (§4 item 10).
   AdamW (decoupled weight decay) remains a possible refinement.
 - **No softmax-free logits path.** The inference `Sequential` bakes Softmax in as the
@@ -141,13 +143,13 @@ callers anyway.
 - **No SIMD.** `std::simd` or manual 4-wide unrolling would give 2–4× on matmul.
 - ~~**FINF parser can attempt huge allocations.**~~ **Resolved** — see §4
   item 7. (Dedicated fuzzing of the parser is still worthwhile.)
-- **Vocabulary alignment hack.** `build_csv_dataset` injects one all-zero training row
-  per vocab character to force class ordering. These are junk samples that bias the
-  model toward uniform predictions on empty contexts; a `class_names` override in the
-  dataset/metadata path would be cleaner.
+- ~~**Vocabulary alignment hack.**~~ **Resolved** — the padding rows are gone;
+  `CsvDataset::from_str_with_classes` registers the full sorted vocabulary
+  explicitly (§4 item 16).
 - **`ModelMetadata::from_json`** is a hand-rolled substring scanner — fine for its own
   output, brittle for anything else (no escape handling beyond `\"`, no nesting).
-- **No CI config** in the workspace for build+test on the WASM target.
+- ~~**No CI config** in the workspace.~~ **Resolved** — GitHub Actions workflow
+  runs native build+test plus a `wasm32-unknown-unknown` build (§4 item 15).
 - **No benchmarks** (`criterion` is excluded by the zero-dep rule, but a simple
   `std::time` bench binary would do).
 
@@ -207,7 +209,7 @@ callers anyway.
 | Check | Result |
 |---|---|
 | `cargo build --workspace` | ✅ 0 errors, 0 warnings (was: 171 errors) |
-| `cargo test --workspace` | ✅ 200 passed / 0 failed (was: did not compile; 2 stale failures after compile fix) |
+| `cargo test --workspace` | ✅ 217 passed / 0 failed (was: did not compile; 2 stale failures after compile fix) |
 | Gradient checks (analytic vs finite difference) | ✅ pass |
 | Causal mask & attention normalisation | ✅ pass |
 | FINF round-trip, all 5 layer types | ✅ pass |

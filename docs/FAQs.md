@@ -9,7 +9,7 @@ Clear, honest answers to common technical questions, constraints, and architectu
 Because Ferrum trains next-character prediction models using standard MLPs (Multi-Layer Perceptrons) in the core backpropagation trainer:
 - **Optimal Context Length**: $4 - 6$ characters.
 - **Why?**: The inputs are flat-concatenated. The input dimension of the first linear layer equals $N \times d$ (context length times embedding dimension). Increasing the context to 100+ characters with even a modest embedding dimension causes a parameter explosion in the first layer, slowing CPU training and causing model convergence to fail.
-- **For larger contexts**: Use our pre-built inference-only `TransformerBlock` and `Embedding` layers, which scale much better for sequence context lengths of $32 - 128$ tokens.
+- **For larger contexts**: Use the causal Transformer path (`GenerativeSLM::train_transformer`), which trains end-to-end with Adam and uses compact token-ID inputs (`input_dim = context_len`), scaling much better for sequence context lengths of $16 - 128$ tokens.
 
 ---
 

@@ -94,8 +94,8 @@ To run your custom model directly in the browser via WebAssembly:
             30,
             0.15, // temperature
             (nextChar) => {
-                // Stream character to console or DOM element
-                process.stdout.write(nextChar);
+                // Stream character to a DOM element
+                document.getElementById('output').textContent += nextChar;
             }
         );
     }

@@ -84,7 +84,11 @@ impl GenerativeSLM {
 
         vprintln!("[slm::train] Parsing CSV dataset...");
         let parse_start = std::time::Instant::now();
-        let ds = CsvDataset::from_str(&csv_data)?;
+        // Register the full sorted vocabulary explicitly so class indices
+        // cover every character (even ones never appearing as a target) in
+        // exact sorted order — no padding rows needed.
+        let class_names: Vec<String> = corpus_vocab(corpus).iter().map(|&ch| char_to_hex(ch)).collect();
+        let ds = CsvDataset::from_str_with_classes(&csv_data, &class_names)?;
         vprintln!("[slm::train] Parsed in {:.1}ms: rows={}, features={}, classes={}",
             parse_start.elapsed().as_secs_f64() * 1000.0, ds.len(), ds.num_features, ds.num_classes);
 
@@ -242,11 +246,108 @@ impl GenerativeSLM {
         Ok(Self { model, norm, meta })
     }
 
+    /// Train a compact token-ID + embedding MLP language model.
+    ///
+    /// The recommended simple path: like [`GenerativeSLM::train`] but the
+    /// flat one-hot input (`context_len × vocab_size` wide) is replaced by a
+    /// learned embedding table, so model size no longer scales with the
+    /// vocabulary squared. Inputs at inference are token IDs
+    /// (`input_dim = context_len`), the same contract as the transformer path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn train_embedded(
+        corpus: &str,
+        context_len: usize,
+        embed_dim: usize,
+        hidden_size: usize,
+        epochs: usize,
+        lr: f32,
+        momentum: f32,
+        batch_size: usize,
+        rng: &mut Rng,
+    ) -> Result<Self> {
+        Self::train_embedded_with_callback(
+            corpus, context_len, embed_dim, hidden_size, epochs, lr, momentum,
+            batch_size, rng, |_, _| {},
+        )
+    }
+
+    /// [`GenerativeSLM::train_embedded`] with an `(epoch, loss)` callback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn train_embedded_with_callback<F>(
+        corpus: &str,
+        context_len: usize,
+        embed_dim: usize,
+        hidden_size: usize,
+        epochs: usize,
+        lr: f32,
+        momentum: f32,
+        batch_size: usize,
+        rng: &mut Rng,
+        mut progress_callback: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(usize, f32),
+    {
+        let (vocab_vec, tokens) = tokenize_corpus(corpus, context_len)?;
+        let vocab_size = vocab_vec.len();
+        let n_windows = tokens.len() - context_len;
+        vprintln!("[slm::train_embedded] corpus={} chars, vocab={}, ctx={}, E={}, hidden={}, windows={}",
+            tokens.len(), vocab_size, context_len, embed_dim, hidden_size, n_windows);
+
+        // Sliding windows of token IDs — no CSV round-trip needed.
+        let mut x_data = Vec::with_capacity(n_windows * context_len);
+        let mut y = Vec::with_capacity(n_windows);
+        for i in 0..n_windows {
+            x_data.extend(tokens[i..i + context_len].iter().map(|&t| t as f32));
+            y.push(tokens[i + context_len]);
+        }
+        let x = Tensor::matrix(n_windows, context_len, x_data)?;
+
+        let mut net = Net::embedding_mlp(
+            vocab_size, context_len, embed_dim, hidden_size, vocab_size, rng,
+        );
+        let opt = Sgd::with_momentum(lr, momentum);
+        vprintln!("[slm::train_embedded] {} params, SGD lr={}, momentum={}",
+            net.num_params(), lr, momentum);
+
+        for ep in 1..=epochs {
+            let loss = train_epoch(&mut net, &x, &y, batch_size, &opt, rng)?;
+            vprintln!("[slm::train_embedded] epoch {}/{}: loss={:.6}", ep, epochs, loss);
+            progress_callback(ep, loss);
+        }
+
+        let model = net.to_inference_task(TaskType::Classification)?;
+        let class_names: Vec<String> = vocab_vec.iter().map(|&ch| char_to_hex(ch)).collect();
+        // task = TransformerSLM marks the token-ID input contract (the family
+        // flag `generate` keys on), independent of the internal architecture.
+        let meta = ModelMetadata {
+            dataset_name: "GenerativeSLM Embedded".into(),
+            task: TaskType::TransformerSLM,
+            feature_names: (0..context_len).map(|i| format!("c_{i}")).collect(),
+            feature_ranges: vec![[0.0, vocab_size as f32]; context_len],
+            class_names,
+            target_name: "next_char".into(),
+            target_range: [0.0, vocab_size as f32],
+            input_dim: context_len,
+            output_dim: vocab_size,
+        };
+        let norm = Normalizer { means: vec![], stds: vec![] };
+        Ok(Self { model, norm, meta })
+    }
+
     /// Serialize the trained Generative SLM model to self-contained FINF v4 bytes.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         vprintln!("[slm::GenerativeSLM::to_bytes] Serializing model...");
         let bytes = to_bytes(&self.model, &self.norm, &self.meta)?;
         vprintln!("[slm::GenerativeSLM::to_bytes] Serialized to {} bytes", bytes.len());
+        Ok(bytes)
+    }
+
+    /// Serialize to FINF v5 with int8-quantised weights (≈4× smaller files).
+    pub fn to_bytes_quantized(&self) -> Result<Vec<u8>> {
+        vprintln!("[slm::GenerativeSLM::to_bytes_quantized] Serializing quantized model...");
+        let bytes = crate::loader::to_bytes_quantized(&self.model, &self.norm, &self.meta)?;
+        vprintln!("[slm::GenerativeSLM::to_bytes_quantized] Serialized to {} bytes", bytes.len());
         Ok(bytes)
     }
 
@@ -352,6 +453,17 @@ pub fn hex_to_char(hex: &str) -> char {
     std::char::from_u32(code).unwrap_or(' ')
 }
 
+/// The sorted character vocabulary of a corpus (always includes ' ' and '\n',
+/// never '\r').
+pub fn corpus_vocab(corpus: &str) -> Vec<char> {
+    let mut vocab: HashSet<char> = corpus.chars().filter(|&c| c != '\r').collect();
+    vocab.insert(' ');
+    vocab.insert('\n');
+    let mut vocab_vec: Vec<char> = vocab.into_iter().collect();
+    vocab_vec.sort();
+    vocab_vec
+}
+
 /// Tokenize a corpus into (sorted vocabulary, token-ID stream) for
 /// transformer training. The vocabulary always includes ' ' and '\n'.
 pub fn tokenize_corpus(corpus: &str, context_len: usize) -> Result<(Vec<char>, Vec<usize>)> {
@@ -361,11 +473,7 @@ pub fn tokenize_corpus(corpus: &str, context_len: usize) -> Result<(Vec<char>, V
             "Corpus must be longer than the context window".into(),
         ));
     }
-    let mut vocab: HashSet<char> = chars.iter().copied().collect();
-    vocab.insert(' ');
-    vocab.insert('\n');
-    let mut vocab_vec: Vec<char> = vocab.into_iter().collect();
-    vocab_vec.sort();
+    let vocab_vec = corpus_vocab(corpus);
     let tokens: Vec<usize> = chars
         .iter()
         .map(|c| vocab_vec.binary_search(c).unwrap_or(0))
@@ -382,12 +490,7 @@ pub fn build_csv_dataset(corpus: &str, context_len: usize) -> Result<String> {
         return Err(InferError::DimMismatch("Corpus length shorter than context window".into()));
     }
     
-    let mut vocab: HashSet<char> = chars.iter().copied().collect();
-    vocab.insert(' ');
-    vocab.insert('\n');
-
-    let mut vocab_vec: Vec<char> = vocab.into_iter().collect();
-    vocab_vec.sort();
+    let vocab_vec = corpus_vocab(corpus);
     let v_size = vocab_vec.len();
 
     vprintln!("[slm::build_csv_dataset] chars={}, vocab_size={}, sliding_windows={}",
@@ -404,14 +507,9 @@ pub fn build_csv_dataset(corpus: &str, context_len: usize) -> Result<String> {
     }
     csv.push_str("label\n");
 
-    // Vocabulary alignment padding to force class_names to cover all characters in exact sorted order at the beginning
-    vprintln!("[slm::build_csv_dataset] Writing {} vocab alignment rows", vocab_vec.len());
-    for &ch in &vocab_vec {
-        for _ in 0..context_len * v_size {
-            csv.push_str("0.0,");
-        }
-        csv.push_str(&format!("{}\n", char_to_hex(ch)));
-    }
+    // Class coverage and ordering come from explicit registration
+    // (`CsvDataset::from_str_with_classes` with the sorted hex vocabulary) —
+    // no all-zero alignment rows are injected.
 
     // Sliding windows
     let window_count = chars.len().saturating_sub(context_len);
@@ -434,7 +532,7 @@ pub fn build_csv_dataset(corpus: &str, context_len: usize) -> Result<String> {
     }
 
     vprintln!("[slm::build_csv_dataset] CSV built: {} bytes, {} total rows",
-        csv.len(), vocab_vec.len() + window_count);
+        csv.len(), window_count);
 
     Ok(csv)
 }

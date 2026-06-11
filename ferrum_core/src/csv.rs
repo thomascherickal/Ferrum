@@ -257,8 +257,26 @@ impl CsvDataset {
 
     /// Like `from_str` but lets the caller override task detection.
     pub fn from_str_with_task(text: &str, force_task: Option<TaskType>) -> Result<Self> {
-        vprintln!("[csv::CsvDataset::from_str_with_task] Parsing CSV ({} bytes), force_task={:?}",
-            text.len(), force_task);
+        Self::parse(text, force_task, None)
+    }
+
+    /// Parse a classification CSV with an explicitly registered class list.
+    ///
+    /// Labels are mapped to indices by their position in `classes` instead of
+    /// order-of-first-appearance, and `num_classes`/`class_names` cover the
+    /// full registered set even if some classes never appear as targets.
+    /// A label not present in `classes` is a `Format` error.
+    pub fn from_str_with_classes(text: &str, classes: &[String]) -> Result<Self> {
+        Self::parse(text, Some(TaskType::Classification), Some(classes))
+    }
+
+    fn parse(
+        text: &str,
+        force_task: Option<TaskType>,
+        preset_classes: Option<&[String]>,
+    ) -> Result<Self> {
+        vprintln!("[csv::CsvDataset::parse] Parsing CSV ({} bytes), force_task={:?}, preset_classes={}",
+            text.len(), force_task, preset_classes.map(|c| c.len()).unwrap_or(0));
         let mut lines = text.lines().peekable();
         while lines.peek().map(|l| l.trim().is_empty()) == Some(true) {
             lines.next();
@@ -367,7 +385,7 @@ impl CsvDataset {
 
         // Build rows
         let mut class_index: std::collections::HashMap<String, usize> = Default::default();
-        let mut class_names: Vec<String> = Vec::new();
+        let mut class_names: Vec<String> = preset_classes.map(<[String]>::to_vec).unwrap_or_default();
         let mut rows: Vec<CsvRow> = Vec::new();
         let mut tgt_min = f32::MAX;
         let mut tgt_max = f32::MIN;
@@ -387,11 +405,23 @@ impl CsvDataset {
                     (0, v)
                 }
                 TaskType::Classification => {
-                    let idx = *class_index.entry(label_str.clone()).or_insert_with(|| {
-                        let i = class_names.len();
-                        class_names.push(label_str);
-                        i
-                    });
+                    let idx = match preset_classes {
+                        // Explicit registration: index by position in the
+                        // registered list; unknown labels are an error.
+                        Some(classes) => classes
+                            .iter()
+                            .position(|c| c == &label_str)
+                            .ok_or_else(|| {
+                                InferError::Format(format!(
+                                    "unregistered class label {label_str:?}"
+                                ))
+                            })?,
+                        None => *class_index.entry(label_str.clone()).or_insert_with(|| {
+                            let i = class_names.len();
+                            class_names.push(label_str);
+                            i
+                        }),
+                    };
                     (idx, idx as f32)
                 }
                 // SLM datasets are not loaded through CsvDataset
@@ -790,6 +820,30 @@ x1,x2,price
         assert_eq!(norm.means.len(), 3);
         let back = norm.denormalise_target(norm.normalise_target(300000.0));
         assert!((back - 300000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn explicit_class_registration_orders_and_covers() {
+        // 'Z' never appears as a target but must still be a class; indices
+        // follow the registered order, not order-of-first-appearance.
+        let classes: Vec<String> = ["A", "B", "Z"].iter().map(|s| s.to_string()).collect();
+        let csv = "f,label\n1.0,B\n2.0,A\n3.0,B\n";
+        let ds = CsvDataset::from_str_with_classes(csv, &classes).unwrap();
+        assert_eq!(ds.num_classes, 3);
+        assert_eq!(ds.class_names, classes);
+        assert_eq!(ds.rows[0].label, 1); // B
+        assert_eq!(ds.rows[1].label, 0); // A
+        assert_eq!(ds.task, TaskType::Classification);
+    }
+
+    #[test]
+    fn unregistered_class_label_errors() {
+        let classes: Vec<String> = ["A", "B"].iter().map(|s| s.to_string()).collect();
+        let csv = "f,label\n1.0,A\n2.0,QQQ\n";
+        assert!(matches!(
+            CsvDataset::from_str_with_classes(csv, &classes),
+            Err(InferError::Format(_))
+        ));
     }
 
     #[test]

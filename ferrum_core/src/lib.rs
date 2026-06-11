@@ -43,6 +43,8 @@
 //! let logits = model.forward(&context).unwrap();
 //! ```
 
+#![forbid(unsafe_code)]
+
 #[macro_use]
 pub mod verbose;
 
@@ -58,6 +60,7 @@ pub mod optim;
 pub mod rng;
 pub mod slm;
 pub mod tensor;
+pub mod tokenizer;
 pub mod train;
 pub mod train_transformer;
 
@@ -66,8 +69,10 @@ pub use csv::{
     fit_normalizer_with_target, train_val_split, CsvDataset, ModelMetadata, Normalizer, TaskType,
 };
 pub use error::{InferError, Result};
-pub use layer::{ActivationLayer, Embedding, KvCache, Layer, LayerNorm, Linear, TransformerBlock};
-pub use loader::{from_bytes, load, save, to_bytes};
+pub use layer::{
+    ActivationLayer, Embedding, Flatten, KvCache, Layer, LayerNorm, Linear, TransformerBlock,
+};
+pub use loader::{from_bytes, load, save, save_quantized, to_bytes, to_bytes_quantized};
 pub use loss::{mse, softmax_cross_entropy};
 pub use model::Sequential;
 pub use ops::argmax_rows;
@@ -75,6 +80,7 @@ pub use optim::{Adam, Sgd};
 pub use rng::Rng;
 pub use slm::GenerativeSLM;
 pub use tensor::Tensor;
-pub use train::{accuracy, train_epoch, Net};
+pub use tokenizer::ByteBpeTokenizer;
+pub use train::{accuracy, train_epoch, EmbedT, Net};
 pub use train_transformer::{train_transformer_epoch, TransformerNet};
 pub use verbose::{set_verbose, is_verbose};

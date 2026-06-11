@@ -1,8 +1,8 @@
-//! FINF binary format v4: weights + normalizer + ModelMetadata JSON.
+//! FINF binary format v4/v5: weights + normalizer + ModelMetadata JSON.
 //!
 //! Layout (all integers little-endian):
 //!   4 bytes  b"FINF"
-//!   u32      version = 4
+//!   u32      version = 4 or 5
 //!   u32      norm_len;    [bytes] normalizer string  (empty string for SLM)
 //!   u32      meta_len;    [bytes] ModelMetadata JSON
 //!   u32      num_layers
@@ -14,19 +14,35 @@
 //!   2 = Embedding
 //!   3 = LayerNorm
 //!   4 = TransformerBlock
+//!   5 = Flatten (v5 only, no payload)
+//!
+//! v5 is a tag-compatible extension of v4: each weight vector is prefixed by a
+//! one-byte encoding marker — 0 = raw f32, 1 = int8 symmetric quantisation
+//! (f32 scale followed by one i8 per value, value = i8 × scale). `to_bytes`
+//! writes v4 whenever the model is expressible in it; `to_bytes_quantized`
+//! writes v5 with large weight tensors stored int8 (≈4× smaller files).
 use crate::activation::Activation;
 use crate::csv::{ModelMetadata, Normalizer};
 use crate::error::{InferError, Result};
-use crate::layer::{ActivationLayer, Embedding, LayerNorm, Linear, TransformerBlock};
+use crate::layer::{ActivationLayer, Embedding, Flatten, LayerNorm, Linear, TransformerBlock};
 use crate::model::Sequential;
 
 const MAGIC: &[u8; 4] = b"FINF";
 const VERSION: u32 = 4;
+const VERSION_QUANT: u32 = 5;
 const TAG_LINEAR: u8 = 0;
 const TAG_ACTIVATION: u8 = 1;
 const TAG_EMBEDDING: u8 = 2;
 const TAG_LAYERNORM: u8 = 3;
 const TAG_TRANSFORMER_BLOCK: u8 = 4;
+const TAG_FLATTEN: u8 = 5;
+
+/// v5 weight-vector encoding markers.
+const ENC_F32: u8 = 0;
+const ENC_INT8: u8 = 1;
+/// Vectors shorter than this stay f32 even in quantized files: biases and
+/// LayerNorm parameters are small (no size win) and accuracy-sensitive.
+const QUANT_MIN_LEN: usize = 64;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Reader helper
@@ -35,10 +51,12 @@ const TAG_TRANSFORMER_BLOCK: u8 = 4;
 struct Reader<'a> {
     bytes: &'a [u8],
     pos: usize,
+    /// FINF v5: weight vectors carry a per-vector encoding marker.
+    v5: bool,
 }
 impl<'a> Reader<'a> {
     fn new(b: &'a [u8]) -> Self {
-        Self { bytes: b, pos: 0 }
+        Self { bytes: b, pos: 0, v5: false }
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         let end = self.pos + n;
@@ -80,6 +98,25 @@ impl<'a> Reader<'a> {
         std::str::from_utf8(self.take(n)?)
             .map_err(|_| InferError::Format("invalid UTF-8 in blob".into()))
     }
+    /// Read one weight vector of `n` values. In v4 this is raw f32; in v5 a
+    /// one-byte marker selects raw f32 or int8 symmetric (scale + i8 × n).
+    fn weights(&mut self, n: usize) -> Result<Vec<f32>> {
+        if !self.v5 {
+            return self.f32_vec(n);
+        }
+        match self.u8()? {
+            ENC_F32 => self.f32_vec(n),
+            ENC_INT8 => {
+                let scale = f32::from_le_bytes({
+                    let b = self.take(4)?;
+                    [b[0], b[1], b[2], b[3]]
+                });
+                let raw = self.take(n)?;
+                Ok(raw.iter().map(|&b| (b as i8) as f32 * scale).collect())
+            }
+            m => Err(InferError::Format(format!("bad weight encoding marker {m}"))),
+        }
+    }
 }
 
 /// Multiply two dimension fields read from an untrusted file, rejecting
@@ -108,16 +145,74 @@ fn push_str(out: &mut Vec<u8>, s: &str) {
     push_u32(out, s.len() as u32);
     out.extend_from_slice(s.as_bytes());
 }
+/// Write one weight vector. v4: raw f32. v5: marker byte, then either raw f32
+/// or int8 symmetric (f32 scale + i8 per value). Small or non-finite vectors
+/// stay f32 even when quantisation is requested.
+fn push_weights(out: &mut Vec<u8>, data: &[f32], v5: bool, quantize: bool) {
+    if !v5 {
+        push_f32s(out, data);
+        return;
+    }
+    let finite = data.iter().all(|v| v.is_finite());
+    if quantize && data.len() >= QUANT_MIN_LEN && finite {
+        let max_abs = data.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let scale = max_abs / 127.0;
+        out.push(ENC_INT8);
+        out.extend_from_slice(&scale.to_le_bytes());
+        if scale == 0.0 {
+            out.extend(std::iter::repeat(0u8).take(data.len()));
+        } else {
+            for &v in data {
+                out.push((v / scale).round().clamp(-127.0, 127.0) as i8 as u8);
+            }
+        }
+    } else {
+        out.push(ENC_F32);
+        push_f32s(out, data);
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Serialization (to_bytes)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Serialize with full f32 weights. Writes FINF v4 unless the model contains
+/// a layer only expressible in v5 (`Flatten`), in which case v5 is written.
 pub fn to_bytes(model: &Sequential, norm: &Normalizer, meta: &ModelMetadata) -> Result<Vec<u8>> {
-    vprintln!("[loader::to_bytes] Serializing FINF v{} model ({} layers)", VERSION, model.len());
+    let needs_v5 = model
+        .layers()
+        .iter()
+        .any(|l| l.as_any().downcast_ref::<Flatten>().is_some());
+    let version = if needs_v5 { VERSION_QUANT } else { VERSION };
+    to_bytes_impl(model, norm, meta, version, false)
+}
+
+/// Serialize as FINF v5 with int8 post-training quantisation: every weight
+/// vector of ≥ 64 values is stored as one i8 per value plus an f32 scale
+/// (≈4× smaller). Biases and LayerNorm parameters stay f32. The loader
+/// dequantises transparently on read.
+pub fn to_bytes_quantized(
+    model: &Sequential,
+    norm: &Normalizer,
+    meta: &ModelMetadata,
+) -> Result<Vec<u8>> {
+    to_bytes_impl(model, norm, meta, VERSION_QUANT, true)
+}
+
+fn to_bytes_impl(
+    model: &Sequential,
+    norm: &Normalizer,
+    meta: &ModelMetadata,
+    version: u32,
+    quantize: bool,
+) -> Result<Vec<u8>> {
+    let v5 = version == VERSION_QUANT;
+    let push_f32s = |out: &mut Vec<u8>, data: &[f32]| push_weights(out, data, v5, quantize);
+    vprintln!("[loader::to_bytes] Serializing FINF v{} model ({} layers, quantize={})",
+        version, model.len(), quantize);
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
-    push_u32(&mut out, VERSION);
+    push_u32(&mut out, version);
 
     // Normalizer (can be empty string for SLM tasks)
     push_str(&mut out, &norm.encode());
@@ -140,6 +235,9 @@ pub fn to_bytes(model: &Sequential, norm: &Normalizer, meta: &ModelMetadata) -> 
         } else if let Some(act) = any.downcast_ref::<ActivationLayer>() {
             out.push(TAG_ACTIVATION);
             out.push(act.kind.tag());
+
+        } else if any.downcast_ref::<Flatten>().is_some() {
+            out.push(TAG_FLATTEN);
 
         } else if let Some(emb) = any.downcast_ref::<Embedding>() {
             out.push(TAG_EMBEDDING);
@@ -202,11 +300,12 @@ pub fn from_bytes(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata
     }
     let ver = r.u32()?;
     vprintln!("[loader::from_bytes] FINF version: {}", ver);
-    if ver != VERSION {
+    if ver != VERSION && ver != VERSION_QUANT {
         return Err(InferError::Format(format!(
-            "unsupported FINF v{ver} (need v{VERSION})"
+            "unsupported FINF v{ver} (need v{VERSION} or v{VERSION_QUANT})"
         )));
     }
+    r.v5 = ver == VERSION_QUANT;
 
     let norm_len = r.usize()?;
     let norm_str = r.utf8(norm_len)?;
@@ -231,8 +330,8 @@ pub fn from_bytes(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata
                 vprintln!("[loader::from_bytes]   layer[{}]: Linear({}→{})", layer_i, in_f, out_f);
                 model.push(Box::new(Linear::new(
                     in_f, out_f,
-                    r.f32_vec(mul_dims(in_f, out_f)?)?,
-                    r.f32_vec(out_f)?,
+                    r.weights(mul_dims(in_f, out_f)?)?,
+                    r.weights(out_f)?,
                 )?));
             }
             TAG_ACTIVATION => {
@@ -249,8 +348,8 @@ pub fn from_bytes(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata
                 vprintln!("[loader::from_bytes]   layer[{}]: Embedding(vocab={}, seq={}, dim={})", layer_i, vocab_size, max_seq_len, embedding_dim);
                 model.push(Box::new(Embedding::new(
                     vocab_size, max_seq_len, embedding_dim,
-                    r.f32_vec(mul_dims(vocab_size, embedding_dim)?)?,
-                    r.f32_vec(mul_dims(max_seq_len, embedding_dim)?)?,
+                    r.weights(mul_dims(vocab_size, embedding_dim)?)?,
+                    r.weights(mul_dims(max_seq_len, embedding_dim)?)?,
                 )?));
             }
             TAG_LAYERNORM => {
@@ -258,8 +357,8 @@ pub fn from_bytes(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata
                 vprintln!("[loader::from_bytes]   layer[{}]: LayerNorm(dim={})", layer_i, dim);
                 model.push(Box::new(LayerNorm::new(
                     dim,
-                    r.f32_vec(dim)?,
-                    r.f32_vec(dim)?,
+                    r.weights(dim)?,
+                    r.weights(dim)?,
                 )?));
             }
             TAG_TRANSFORMER_BLOCK => {
@@ -275,15 +374,19 @@ pub fn from_bytes(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata
                 let ch = mul_dims(c, h)?;
                 model.push(Box::new(TransformerBlock::new(
                     context_len, num_heads, embedding_dim,
-                    r.f32_vec(c)?,  r.f32_vec(c)?,    // ln1 gamma, beta
-                    r.f32_vec(cc)?, r.f32_vec(c)?,    // q weight, bias
-                    r.f32_vec(cc)?, r.f32_vec(c)?,    // k weight, bias
-                    r.f32_vec(cc)?, r.f32_vec(c)?,    // v weight, bias
-                    r.f32_vec(cc)?, r.f32_vec(c)?,    // out weight, bias
-                    r.f32_vec(c)?,  r.f32_vec(c)?,    // ln2 gamma, beta
-                    r.f32_vec(ch)?, r.f32_vec(h)?,    // ffn1 weight, bias
-                    r.f32_vec(ch)?, r.f32_vec(c)?,    // ffn2 weight, bias
+                    r.weights(c)?,  r.weights(c)?,    // ln1 gamma, beta
+                    r.weights(cc)?, r.weights(c)?,    // q weight, bias
+                    r.weights(cc)?, r.weights(c)?,    // k weight, bias
+                    r.weights(cc)?, r.weights(c)?,    // v weight, bias
+                    r.weights(cc)?, r.weights(c)?,    // out weight, bias
+                    r.weights(c)?,  r.weights(c)?,    // ln2 gamma, beta
+                    r.weights(ch)?, r.weights(h)?,    // ffn1 weight, bias
+                    r.weights(ch)?, r.weights(c)?,    // ffn2 weight, bias
                 )?));
+            }
+            TAG_FLATTEN => {
+                vprintln!("[loader::from_bytes]   layer[{}]: Flatten", layer_i);
+                model.push(Box::new(Flatten::new()));
             }
             t => return Err(InferError::Format(format!("bad layer tag {t}"))),
         }
@@ -300,6 +403,20 @@ pub fn save(model: &Sequential, norm: &Normalizer, meta: &ModelMetadata, path: &
     vprintln!("[loader::save] Done");
     Ok(())
 }
+/// Like [`save`] but writes FINF v5 with int8-quantised weights (≈4× smaller).
+pub fn save_quantized(
+    model: &Sequential,
+    norm: &Normalizer,
+    meta: &ModelMetadata,
+    path: &str,
+) -> Result<()> {
+    vprintln!("[loader::save_quantized] Saving quantized model to: {}", path);
+    let bytes = to_bytes_quantized(model, norm, meta)?;
+    vprintln!("[loader::save_quantized] Writing {} bytes to disk", bytes.len());
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
 pub fn load(path: &str) -> Result<(Sequential, Normalizer, ModelMetadata)> {
     vprintln!("[loader::load] Loading model from: {}", path);
     let bytes = std::fs::read(path)?;
@@ -419,6 +536,103 @@ mod tests {
         // Forward should still work
         let x = Tensor::matrix(1, 4, vec![0.0, 1.0, 2.0, 3.0]).unwrap();
         assert!(m2.forward(&x).is_ok());
+    }
+
+    #[test]
+    fn quantized_roundtrip_is_smaller_and_close() {
+        let (model, norm, meta) = make_bundle();
+        let raw = Tensor::row(vec![5.1f32, 3.5, 1.4, 0.2]).unwrap();
+        let before = model.forward(&norm.transform(&raw).unwrap()).unwrap();
+
+        let full = to_bytes(&model, &norm, &meta).unwrap();
+        let quant = to_bytes_quantized(&model, &norm, &meta).unwrap();
+        // make_bundle's largest tensor is 32 values (< QUANT_MIN_LEN), so use
+        // a bigger Linear to actually exercise the int8 path.
+        let big = Linear::new(
+            64, 64,
+            (0..64 * 64).map(|i| (i as f32 * 0.37).sin() * 0.1).collect(),
+            vec![0.0; 64],
+        ).unwrap();
+        let big_model = Sequential::new().with(Box::new(big));
+        let big_norm = Normalizer { means: vec![], stds: vec![] };
+        let big_full = to_bytes(&big_model, &big_norm, &meta).unwrap();
+        let big_quant = to_bytes_quantized(&big_model, &big_norm, &meta).unwrap();
+        assert!(
+            (big_quant.len() as f32) < (big_full.len() as f32) * 0.35,
+            "quantized {} not ≈4× smaller than {}", big_quant.len(), big_full.len()
+        );
+
+        // Small model: everything stays f32 (marker overhead only) and the
+        // outputs must match the v4 file closely.
+        assert!(quant.len() <= full.len() + model.len() * 8);
+        let (m2, n2, _) = from_bytes(&quant).unwrap();
+        let after = m2.forward(&n2.transform(&raw).unwrap()).unwrap();
+        for (a, b) in before.data.iter().zip(&after.data) {
+            assert!((a - b).abs() < 1e-6);
+        }
+
+        // Big model: int8 error is bounded by scale/2 per weight.
+        let x = Tensor::row(vec![0.1f32; 64]).unwrap();
+        let y_full = big_model.forward(&x).unwrap();
+        let (m3, _, _) = from_bytes(&big_quant).unwrap();
+        let y_quant = m3.forward(&x).unwrap();
+        for (a, b) in y_full.data.iter().zip(&y_quant.data) {
+            assert!((a - b).abs() < 0.05, "quantized output drifted: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn quantized_transformer_roundtrips() {
+        // All five v4 layer types through the v5 quantized writer/reader.
+        let (model, norm, meta) = make_embedding_bundle();
+        let bytes = to_bytes_quantized(&model, &norm, &meta).unwrap();
+        assert_eq!(&bytes[4..8], &5u32.to_le_bytes());
+        let (m2, _, m2meta) = from_bytes(&bytes).unwrap();
+        assert_eq!(m2meta.task, TaskType::TransformerSLM);
+        let x = Tensor::matrix(1, 4, vec![0.0, 1.0, 2.0, 3.0]).unwrap();
+        assert!(m2.forward(&x).is_ok());
+    }
+
+    #[test]
+    fn flatten_roundtrips_as_v5() {
+        let lin = Linear::new(
+            8, 3,
+            (0..24).map(|i| i as f32 * 0.01).collect(),
+            vec![0.0; 3],
+        ).unwrap();
+        let model = Sequential::new()
+            .with(Box::new(Flatten::new()))
+            .with(Box::new(lin));
+        let norm = Normalizer { means: vec![], stds: vec![] };
+        let (_, _, meta) = make_bundle();
+
+        let bytes = to_bytes(&model, &norm, &meta).unwrap();
+        // Flatten is not expressible in v4, so to_bytes must upgrade to v5.
+        assert_eq!(&bytes[4..8], &5u32.to_le_bytes());
+
+        let (m2, _, _) = from_bytes(&bytes).unwrap();
+        assert_eq!(m2.len(), 2);
+        assert_eq!(m2.layers()[0].name(), "Flatten");
+        let x = Tensor::matrix(2, 4, vec![0.1; 8]).unwrap(); // [2,4] → [1,8]
+        let before = model.forward(&x).unwrap();
+        let after = m2.forward(&x).unwrap();
+        assert_eq!(before.shape, vec![1, 3]);
+        for (a, b) in before.data.iter().zip(&after.data) {
+            assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn bad_weight_marker_errors() {
+        let (model, norm, meta) = make_embedding_bundle();
+        let mut bytes = to_bytes_quantized(&model, &norm, &meta).unwrap();
+        // First weight marker sits right after the first layer's tag + dims:
+        // header(4+4) + norm str(4+0) + meta(4+len) + num_layers(4) + tag(1) + 3 dims(12).
+        let meta_len = meta.to_json().len();
+        let marker_pos = 8 + 4 + (4 + meta_len) + 4 + 1 + 12;
+        assert!(bytes[marker_pos] == ENC_F32 || bytes[marker_pos] == ENC_INT8);
+        bytes[marker_pos] = 7; // invalid marker
+        assert!(matches!(from_bytes(&bytes), Err(InferError::Format(_))));
     }
 
     #[test]

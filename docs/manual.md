@@ -69,6 +69,29 @@ Updates weights $w$ utilizing gradients $g$ and velocity $v$:
 $$v_{t+1} = \beta \cdot v_t + \eta \cdot g$$
 $$w_{t+1} = w_t - v_{t+1}$$
 
+Used by the MLP training path (`train.rs`).
+
+### Adam Optimizer (`optim::Adam`)
+Bias-corrected adaptive moments, used by the transformer trainer:
+$$m_{t+1} = \beta_1 m_t + (1 - \beta_1) g, \quad v_{t+1} = \beta_2 v_t + (1 - \beta_2) g^2$$
+$$\hat{m} = \frac{m_{t+1}}{1 - \beta_1^t}, \quad \hat{v} = \frac{v_{t+1}}{1 - \beta_2^t}, \quad w_{t+1} = w_t - \eta \frac{\hat{m}}{\sqrt{\hat{v}} + \epsilon}$$
+
+### Transformer Training (`train_transformer.rs`)
+`TransformerNet` implements full backpropagation through token + positional
+embeddings, LayerNorm, causal multi-head attention (softmax backward through
+the mask), and the FFN, with next-token loss at every position. The training
+loop is `forward` → `softmax_cross_entropy` → `backward` → `step(&Adam)`, and
+`to_inference()` exports a FINF-serialisable `Sequential`. The high-level
+entry point is `GenerativeSLM::train_transformer`. Gradients are verified by
+finite-difference checks across all parameter groups in the test suite.
+
+### KV-Cached Generation (`layer::KvCache`)
+`TransformerBlock::forward_with_cache` and `Embedding::embed_one` enable
+O(T)-per-token incremental generation instead of re-running the full context
+(O(T²)) every step. The WASM bindings expose this as `prime(context)` /
+`predict_next_cached(token_id)` / `cached_len()`. The cached path produces
+distributions identical to the full forward pass.
+
 ---
 
 ## 4. The FINF v4 Serialization Format
@@ -85,9 +108,14 @@ Offsets (bytes):
 [16+N .. 16+N+M] Model Metadata: JSON string
 [16+N+M .. 20+N+M] Number of Layers: u32 (L)
 [20+N+M .. ] Layer weights: byte streams prefaced by u8 tag mapping:
-              1 -> Linear
-              2 -> Activation Layer
+              0 -> Linear
+              1 -> Activation Layer
+              2 -> Embedding
               3 -> LayerNorm
-              4 -> Embedding
-              5 -> TransformerBlock
+              4 -> TransformerBlock
 ```
+
+The reader is a forward-only, bounds-checked cursor: byte lengths are verified
+against the remaining buffer before allocating, and dimension products use
+checked multiplication, so corrupt or truncated files yield a `Format` error
+instead of a panic or a huge allocation.

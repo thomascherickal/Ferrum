@@ -1,7 +1,7 @@
-//! Trainable network: DenseT, ReluT, Net, backprop, and the bridge to inference.
+//! Trainable network: EmbedT, DenseT, ReluT, Net, backprop, and the bridge to inference.
 use crate::activation::Activation;
 use crate::error::{InferError, Result};
-use crate::layer::{ActivationLayer, Linear};
+use crate::layer::{ActivationLayer, Embedding, Flatten, Linear};
 use crate::model::Sequential;
 use crate::ops;
 use crate::optim::Sgd;
@@ -107,6 +107,102 @@ impl DenseT {
 }
 
 // ---------------------------------------------------------------------------
+// Trainable embedding (token-ID lookup, flattened)
+// ---------------------------------------------------------------------------
+
+/// Trainable token-embedding layer for the embedded-MLP language-model path.
+///
+/// Forward maps a batch of token IDs `[B, T]` to flattened embeddings
+/// `[B, T·E]` by table lookup — position is encoded by the output slot, so no
+/// positional table is needed. Backward scatter-adds the upstream gradient
+/// into the embedding table rows.
+pub struct EmbedT {
+    pub table: Tensor, // [vocab_size, embed_dim]
+    grad: Tensor,
+    vel: Tensor,
+    input: Option<Tensor>,
+    vocab_size: usize,
+    embed_dim: usize,
+}
+
+impl EmbedT {
+    pub fn new_random(vocab_size: usize, embed_dim: usize, rng: &mut Rng) -> Self {
+        let scale = (1.0 / embed_dim as f32).sqrt();
+        vprintln!("[train::EmbedT::new_random] vocab={}, dim={}, scale={:.6}", vocab_size, embed_dim, scale);
+        let w: Vec<f32> = (0..vocab_size * embed_dim)
+            .map(|_| rng.next_normal() * scale)
+            .collect();
+        Self {
+            table: Tensor::matrix(vocab_size, embed_dim, w).unwrap(),
+            grad: Tensor::zeros(vec![vocab_size, embed_dim]),
+            vel: Tensor::zeros(vec![vocab_size, embed_dim]),
+            input: None,
+            vocab_size,
+            embed_dim,
+        }
+    }
+
+    fn forward(&mut self, x: &Tensor) -> Result<Tensor> {
+        let (batch, seq_len) = x.matrix_dims()?;
+        vprintln!("[train::EmbedT::forward] input=[{},{}], vocab={}, dim={}",
+            batch, seq_len, self.vocab_size, self.embed_dim);
+        self.input = Some(x.clone());
+        let e = self.embed_dim;
+        let mut out = vec![0.0f32; batch * seq_len * e];
+        for b in 0..batch {
+            for t in 0..seq_len {
+                let tok = x.data[b * seq_len + t].round() as usize;
+                if tok >= self.vocab_size {
+                    return Err(InferError::DimMismatch(format!(
+                        "token id {tok} out of bounds for vocab_size {}",
+                        self.vocab_size
+                    )));
+                }
+                let src = tok * e;
+                let dst = (b * seq_len + t) * e;
+                out[dst..dst + e].copy_from_slice(&self.table.data[src..src + e]);
+            }
+        }
+        Tensor::matrix(batch, seq_len * e, out)
+    }
+
+    /// dTable[token] += dy slot; token IDs receive no gradient (returns zeros).
+    fn backward(&mut self, dy: &Tensor) -> Result<Tensor> {
+        let x = self
+            .input
+            .as_ref()
+            .ok_or_else(|| InferError::Format("backward before forward".into()))?;
+        let (batch, seq_len) = x.matrix_dims()?;
+        let e = self.embed_dim;
+        let (dy_rows, dy_cols) = dy.matrix_dims()?;
+        if dy_rows != batch || dy_cols != seq_len * e {
+            return Err(InferError::DimMismatch(format!(
+                "EmbedT backward: dy [{dy_rows},{dy_cols}] ≠ [{batch},{}]",
+                seq_len * e
+            )));
+        }
+        for v in &mut self.grad.data {
+            *v = 0.0;
+        }
+        for b in 0..batch {
+            for t in 0..seq_len {
+                let tok = x.data[b * seq_len + t].round() as usize;
+                let src = (b * seq_len + t) * e;
+                let dst = tok * e;
+                for d in 0..e {
+                    self.grad.data[dst + d] += dy.data[src + d];
+                }
+            }
+        }
+        Ok(Tensor::zeros(vec![batch, seq_len]))
+    }
+
+    fn step(&mut self, opt: &Sgd) -> Result<()> {
+        opt.step(&mut self.table, &self.grad, &mut self.vel)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Trainable ReLU
 // ---------------------------------------------------------------------------
 
@@ -148,6 +244,7 @@ impl ReluT {
 // ---------------------------------------------------------------------------
 
 enum TLayer {
+    Embed(Box<EmbedT>),
     Dense(Box<DenseT>),
     Relu(ReluT),
 }
@@ -155,18 +252,21 @@ enum TLayer {
 impl TLayer {
     fn forward(&mut self, x: &Tensor) -> Result<Tensor> {
         match self {
+            TLayer::Embed(e) => e.forward(x),
             TLayer::Dense(d) => d.forward(x),
             TLayer::Relu(r) => r.forward(x),
         }
     }
     fn backward(&mut self, dy: &Tensor) -> Result<Tensor> {
         match self {
+            TLayer::Embed(e) => e.backward(dy),
             TLayer::Dense(d) => d.backward(dy),
             TLayer::Relu(r) => r.backward(dy),
         }
     }
     fn step(&mut self, opt: &Sgd) -> Result<()> {
         match self {
+            TLayer::Embed(e) => e.step(opt),
             TLayer::Dense(d) => d.step(opt),
             TLayer::Relu(_) => Ok(()),
         }
@@ -204,6 +304,40 @@ impl Net {
         net
     }
 
+    /// Token-ID language-model MLP:
+    /// `[B, context_len] ids → embed (E per token) → hidden (ReLU) → output_dim (logits)`.
+    ///
+    /// Compared to a one-hot MLP this shrinks the first layer from
+    /// `context_len × vocab × hidden` to `vocab × E + context_len × E × hidden`
+    /// parameters — drastically smaller for any non-trivial vocabulary.
+    pub fn embedding_mlp(
+        vocab_size: usize,
+        context_len: usize,
+        embed_dim: usize,
+        hidden: usize,
+        output_dim: usize,
+        rng: &mut Rng,
+    ) -> Self {
+        vprintln!("[train::Net::embedding_mlp] vocab={} ctx={} E={} → hidden={} → out={}",
+            vocab_size, context_len, embed_dim, hidden, output_dim);
+        let flat = context_len * embed_dim;
+        let s1 = (2.0 / flat as f32).sqrt(); // Kaiming init for ReLU
+        let s2 = (1.0 / hidden as f32).sqrt();
+        let layers = vec![
+            TLayer::Embed(Box::new(EmbedT::new_random(vocab_size, embed_dim, rng))),
+            TLayer::Dense(Box::new(DenseT::new_random(flat, hidden, s1, rng))),
+            TLayer::Relu(ReluT::new()),
+            TLayer::Dense(Box::new(DenseT::new_random(hidden, output_dim, s2, rng))),
+        ];
+        let net = Self {
+            layers,
+            input_dim: context_len,
+            output_dim,
+        };
+        vprintln!("[train::Net::embedding_mlp] Total params: {}", net.num_params());
+        net
+    }
+
     pub fn forward(&mut self, x: &Tensor) -> Result<Tensor> {
         vprintln!("[train::Net::forward] input shape={:?}", x.shape);
         let mut cur = x.clone();
@@ -211,6 +345,7 @@ impl Net {
             cur = l.forward(&cur)?;
             if verbose::is_verbose() {
                 let name = match l {
+                    TLayer::Embed(_) => "Embed",
                     TLayer::Dense(_) => "Dense",
                     TLayer::Relu(_) => "ReLU",
                 };
@@ -242,6 +377,7 @@ impl Net {
         self.layers
             .iter()
             .map(|l| match l {
+                TLayer::Embed(e) => e.table.numel(),
                 TLayer::Dense(d) => d.weight.numel() + d.bias.numel(),
                 TLayer::Relu(_) => 0,
             })
@@ -266,6 +402,21 @@ impl Net {
         let mut m = Sequential::new();
         for l in &self.layers {
             match l {
+                TLayer::Embed(e) => {
+                    // Inference Embedding adds a positional table; training used
+                    // none (position is encoded by the flattened slot), so it
+                    // exports as all-zeros. Flatten restores the [1, T·E] shape
+                    // the next Linear expects.
+                    let context_len = self.input_dim;
+                    m.push(Box::new(Embedding::new(
+                        e.vocab_size,
+                        context_len,
+                        e.embed_dim,
+                        e.table.data.clone(),
+                        vec![0.0; context_len * e.embed_dim],
+                    )?));
+                    m.push(Box::new(Flatten::new()));
+                }
                 TLayer::Dense(d) => m.push(Box::new(d.to_linear()?)),
                 TLayer::Relu(_) => m.push(Box::new(ActivationLayer::new(Activation::ReLU))),
             }
@@ -505,6 +656,98 @@ mod tests {
         let m_slm = net.to_inference_task(crate::csv::TaskType::TransformerSLM).unwrap();
         assert_eq!(m_slm.len(), 4);
         assert_eq!(m_slm.layers()[3].name(), "Activation(Softmax)");
+    }
+
+    #[test]
+    fn embedding_mlp_trains_and_matches_inference() {
+        // Tiny next-token task over a 5-token vocabulary.
+        let mut rng = Rng::new(3);
+        let vocab = 5;
+        let ctx = 3;
+        let tokens: Vec<usize> = (0..40).map(|i| i % vocab).collect();
+        let n = tokens.len() - ctx;
+        let mut x_data = Vec::new();
+        let mut y = Vec::new();
+        for i in 0..n {
+            x_data.extend(tokens[i..i + ctx].iter().map(|&t| t as f32));
+            y.push(tokens[i + ctx]);
+        }
+        let x = Tensor::matrix(n, ctx, x_data).unwrap();
+
+        let mut net = Net::embedding_mlp(vocab, ctx, 4, 16, vocab, &mut rng);
+        let opt = Sgd::with_momentum(0.1, 0.9);
+        let (loss0, _) = softmax_cross_entropy(&net.forward(&x).unwrap(), &y).unwrap();
+        for _ in 0..200 {
+            let logits = net.forward(&x).unwrap();
+            let (_, dl) = softmax_cross_entropy(&logits, &y).unwrap();
+            net.backward(&dl).unwrap();
+            net.step(&opt).unwrap();
+        }
+        let (loss1, _) = softmax_cross_entropy(&net.forward(&x).unwrap(), &y).unwrap();
+        assert!(loss1 < loss0 * 0.5, "loss: {loss0:.4} → {loss1:.4}");
+
+        // The exported inference model (Embedding + Flatten + Linear…Softmax)
+        // must produce the softmax of the training network's logits.
+        let model = net.to_inference().unwrap();
+        let one = Tensor::matrix(1, ctx, vec![0.0, 1.0, 2.0]).unwrap();
+        let train_logits = net.forward(&one).unwrap();
+        let infer_probs = model.forward(&one).unwrap();
+        let max = train_logits.data.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+        let exps: Vec<f32> = train_logits.data.iter().map(|&v| (v - max).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        for (p, e) in infer_probs.data.iter().zip(&exps) {
+            assert!((p - e / sum).abs() < 1e-5, "inference/training mismatch");
+        }
+    }
+
+    /// Finite-difference gradient check for the embedding table.
+    #[test]
+    fn embedding_gradient_check() {
+        let mut rng = Rng::new(9);
+        let mut net = Net::embedding_mlp(4, 2, 3, 6, 4, &mut rng);
+        let x = Tensor::matrix(2, 2, vec![0.0, 2.0, 3.0, 1.0]).unwrap();
+        let targets = [1usize, 3];
+
+        let logits = net.forward(&x).unwrap();
+        let (_, dl) = softmax_cross_entropy(&logits, &targets).unwrap();
+        net.backward(&dl).unwrap();
+
+        let analytic = match &net.layers[0] {
+            TLayer::Embed(e) => e.grad.clone(),
+            _ => unreachable!(),
+        };
+
+        let eps = 1e-3f32;
+        for &k in &[0usize, 3, 6, 7, 9, 11] {
+            let orig = match &net.layers[0] {
+                TLayer::Embed(e) => e.table.data[k],
+                _ => unreachable!(),
+            };
+            if let TLayer::Embed(e) = &mut net.layers[0] {
+                e.table.data[k] = orig + eps;
+            }
+            let lp = softmax_cross_entropy(&net.forward(&x).unwrap(), &targets).unwrap().0;
+            if let TLayer::Embed(e) = &mut net.layers[0] {
+                e.table.data[k] = orig - eps;
+            }
+            let lm = softmax_cross_entropy(&net.forward(&x).unwrap(), &targets).unwrap().0;
+            if let TLayer::Embed(e) = &mut net.layers[0] {
+                e.table.data[k] = orig;
+            }
+            let numeric = (lp - lm) / (2.0 * eps);
+            assert!(
+                (numeric - analytic.data[k]).abs() < 1e-2,
+                "table[{k}]: analytic={} numeric={numeric}",
+                analytic.data[k]
+            );
+        }
+    }
+
+    #[test]
+    fn embed_token_out_of_bounds_errors() {
+        let mut e = EmbedT::new_random(4, 3, &mut Rng::new(1));
+        let x = Tensor::matrix(1, 2, vec![0.0, 9.0]).unwrap();
+        assert!(matches!(e.forward(&x), Err(InferError::DimMismatch(_))));
     }
 
     #[test]

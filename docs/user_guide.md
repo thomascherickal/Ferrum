@@ -24,10 +24,12 @@ This design ensures that the entire code stack is:
 1. **Feedforward MLP (Multi-Layer Perceptron)**:
    - High training efficiency and fast convergence on tabular and next-character sequence predicting tasks.
    - Core of our standard training pipeline (DenseT layers, ReLU, Backpropagation).
-2. **Causal Transformer Block (Inference Only)**:
+2. **Causal Transformer (Trainable + Inference)**:
    - Contains token + positional `Embedding`, `LayerNorm`, and `TransformerBlock` layers.
    - Implements **Decoder-Only Causal Multi-Head Self-Attention** with future-attention masking (`-1e9` for keys at indices larger than query indices).
-   - Allows loading and executing small language models directly in the browser via WebAssembly, with full access to live attention weights for visualizations.
+   - Trains **end-to-end** with the Adam optimizer via `GenerativeSLM::train_transformer` (or the lower-level `TransformerNet`), with full backpropagation through embeddings, attention, LayerNorm, and the FFN — verified by finite-difference gradient checks.
+   - Allows loading and executing small language models directly in the browser via WebAssembly, with KV-cached O(T)-per-token generation and full access to live attention weights for visualizations.
+   - Uses compact token-ID inputs (`input_dim = context_len`), so models stay small as the vocabulary grows.
 
 ---
 
