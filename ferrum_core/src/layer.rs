@@ -219,6 +219,28 @@ impl Embedding {
     pub fn embedding_dim(&self) -> usize {
         self.embedding_dim
     }
+
+    /// Embed a single token at a given sequence position → [1, embedding_dim].
+    /// Used by the incremental (KV-cached) generation path.
+    pub fn embed_one(&self, token: usize, pos: usize) -> Result<Tensor> {
+        if token >= self.vocab_size {
+            return Err(InferError::DimMismatch(format!(
+                "Token index {} out of bounds for vocab_size {}", token, self.vocab_size
+            )));
+        }
+        if pos >= self.max_seq_len {
+            return Err(InferError::DimMismatch(format!(
+                "Position {} exceeds max_seq_len {}", pos, self.max_seq_len
+            )));
+        }
+        let d = self.embedding_dim;
+        let tok_base = token * d;
+        let pos_base = pos * d;
+        let data: Vec<f32> = (0..d)
+            .map(|i| self.token_weight.data[tok_base + i] + self.pos_weight.data[pos_base + i])
+            .collect();
+        Tensor::matrix(1, d, data)
+    }
 }
 
 impl Layer for Embedding {
@@ -267,6 +289,52 @@ impl Layer for Embedding {
     }
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// KV Cache (incremental generation)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Per-block key/value cache for token-at-a-time generation. Holding the K/V
+/// rows of already-processed positions turns each new-token forward pass from
+/// O(T²) into O(T).
+pub struct KvCache {
+    k: Vec<f32>, // [len, dim] row-major
+    v: Vec<f32>,
+    len: usize,
+    capacity: usize,
+    dim: usize,
+}
+
+impl KvCache {
+    /// `capacity` should be the block's `context_len`; `dim` its embedding dim.
+    pub fn new(capacity: usize, dim: usize) -> Self {
+        Self {
+            k: Vec::with_capacity(capacity * dim),
+            v: Vec::with_capacity(capacity * dim),
+            len: 0,
+            capacity,
+            dim,
+        }
+    }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    pub fn is_full(&self) -> bool {
+        self.len >= self.capacity
+    }
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+    /// Drop all cached positions (start a fresh sequence).
+    pub fn clear(&mut self) {
+        self.k.clear();
+        self.v.clear();
+        self.len = 0;
     }
 }
 
@@ -355,6 +423,90 @@ impl TransformerBlock {
     }
     pub fn hidden_dim(&self) -> usize {
         self.ffn1.out_features()
+    }
+
+    /// Incremental forward pass for one new token using a KV cache.
+    ///
+    /// `x` is the embedding of the newest position, shape [1, embedding_dim].
+    /// The new K/V rows are appended to `cache` and the query attends over the
+    /// whole cached prefix (causality holds automatically — only past
+    /// positions are cached). Returns the block output for this position,
+    /// shape [1, embedding_dim]. Produces the same values as a full
+    /// `forward` over the sequence, but in O(T) per token instead of O(T²).
+    ///
+    /// Errors if the cache is full (`context_len` positions reached) — call
+    /// `cache.clear()` and re-prime with a fresh context to continue.
+    pub fn forward_with_cache(&self, x: &Tensor, cache: &mut KvCache) -> Result<Tensor> {
+        let (rows, c) = x.matrix_dims()?;
+        if rows != 1 || c != self.embedding_dim {
+            return Err(InferError::DimMismatch(format!(
+                "forward_with_cache expects [1,{}], got {:?}", self.embedding_dim, x.shape
+            )));
+        }
+        if cache.dim != c {
+            return Err(InferError::DimMismatch(format!(
+                "KvCache dim {} ≠ block embedding_dim {}", cache.dim, c
+            )));
+        }
+        if cache.is_full() {
+            return Err(InferError::DimMismatch(format!(
+                "KvCache full ({} positions): clear and re-prime to continue",
+                cache.capacity
+            )));
+        }
+
+        let norm1 = self.ln1.forward(x)?;
+        let q = self.q_proj.forward(&norm1)?;
+        let k = self.k_proj.forward(&norm1)?;
+        let v = self.v_proj.forward(&norm1)?;
+        cache.k.extend_from_slice(&k.data);
+        cache.v.extend_from_slice(&v.data);
+        cache.len += 1;
+
+        let l = cache.len; // positions visible to the query (incl. itself)
+        let heads = self.num_heads;
+        let head_dim = c / heads;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let mut attn_out = vec![0.0f32; c];
+        let mut scores = vec![0.0f32; l];
+        for h in 0..heads {
+            let hs = h * head_dim;
+            // scores[j] = scale · q_h · k_h(j)
+            for (j, s) in scores.iter_mut().enumerate() {
+                let kb = j * c + hs;
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    dot += q.data[hs + d] * cache.k[kb + d];
+                }
+                *s = dot * scale;
+            }
+            // softmax over the cached prefix
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for s in scores.iter_mut() {
+                *s = (*s - max).exp();
+                sum += *s;
+            }
+            // out_h = Σ_j p_j · v_h(j)
+            for (j, &s) in scores.iter().enumerate() {
+                let p = s / sum;
+                let vb = j * c + hs;
+                for d in 0..head_dim {
+                    attn_out[hs + d] += p * cache.v[vb + d];
+                }
+            }
+        }
+
+        let projected = self.out_proj.forward(&Tensor::matrix(1, c, attn_out)?)?;
+        let x_attn: Vec<f32> = (0..c).map(|i| x.data[i] + projected.data[i]).collect();
+        let x_attn = Tensor::matrix(1, c, x_attn)?;
+
+        let norm2 = self.ln2.forward(&x_attn)?;
+        let hidden = self.ffn1.forward(&norm2)?.map(|v| v.max(0.0));
+        let ff2 = self.ffn2.forward(&hidden)?;
+        let out: Vec<f32> = (0..c).map(|i| x_attn.data[i] + ff2.data[i]).collect();
+        Tensor::matrix(1, c, out)
     }
 }
 
@@ -548,7 +700,7 @@ impl Layer for TransformerBlock {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-fn matmul_transpose_b_helper(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+pub(crate) fn matmul_transpose_b_helper(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; m * n];
     for i in 0..m {
         let a_row = i * k;
@@ -565,7 +717,7 @@ fn matmul_transpose_b_helper(a: &[f32], b: &[f32], m: usize, n: usize, k: usize)
     out
 }
 
-fn matmul_naive_helper(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+pub(crate) fn matmul_naive_helper(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; m * n];
     for i in 0..m {
         let a_row = i * k;
@@ -923,6 +1075,98 @@ mod tests {
         let block = minimal_block(4, 2, 8, 32);
         let name = block.name();
         assert!(name.contains("heads=2") && name.contains("dim=8"));
+    }
+
+    #[test]
+    fn kv_cache_matches_full_forward() {
+        // Token-at-a-time generation through the cache must reproduce the
+        // full-sequence forward pass row for row.
+        use crate::rng::Rng;
+        let (t, heads, dim, hidden) = (6, 2, 8, 16);
+        let mut rng = Rng::new(11);
+        let mut randn = |n: usize| -> Vec<f32> {
+            (0..n).map(|_| rng.next_normal() * 0.2).collect()
+        };
+        let block = TransformerBlock::new(
+            t, heads, dim,
+            vec![1.0; dim], vec![0.0; dim],
+            randn(dim * dim), randn(dim),
+            randn(dim * dim), randn(dim),
+            randn(dim * dim), randn(dim),
+            randn(dim * dim), randn(dim),
+            vec![1.0; dim], vec![0.0; dim],
+            randn(dim * hidden), randn(hidden),
+            randn(hidden * dim), randn(dim),
+        ).unwrap();
+
+        let x_data = randn(t * dim);
+        let x = Tensor::matrix(t, dim, x_data.clone()).unwrap();
+        let full = block.forward(&x).unwrap();
+
+        let mut cache = KvCache::new(t, dim);
+        for r in 0..t {
+            let row = Tensor::matrix(1, dim, x_data[r * dim..(r + 1) * dim].to_vec()).unwrap();
+            let inc = block.forward_with_cache(&row, &mut cache).unwrap();
+            for d in 0..dim {
+                let a = full.data[r * dim + d];
+                let b = inc.data[d];
+                assert!((a - b).abs() < 1e-4, "row {r} dim {d}: full={a} cached={b}");
+            }
+        }
+        assert!(cache.is_full());
+    }
+
+    #[test]
+    fn kv_cache_overflow_errors() {
+        let block = minimal_block(2, 1, 4, 8);
+        let mut cache = KvCache::new(2, 4);
+        let row = Tensor::matrix(1, 4, vec![0.1; 4]).unwrap();
+        block.forward_with_cache(&row, &mut cache).unwrap();
+        block.forward_with_cache(&row, &mut cache).unwrap();
+        assert!(block.forward_with_cache(&row, &mut cache).is_err());
+        cache.clear();
+        assert!(block.forward_with_cache(&row, &mut cache).is_ok());
+    }
+
+    #[test]
+    fn embed_one_matches_batch_forward() {
+        let emb = Embedding::new(
+            3, 4, 2,
+            vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0],
+            vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+        ).unwrap();
+        let x = Tensor::matrix(1, 3, vec![0.0, 2.0, 1.0]).unwrap();
+        let batch = emb.forward(&x).unwrap();
+        for pos in 0..3 {
+            let tok = x.data[pos] as usize;
+            let one = emb.embed_one(tok, pos).unwrap();
+            for d in 0..2 {
+                assert!((one.data[d] - batch.data[pos * 2 + d]).abs() < 1e-6);
+            }
+        }
+        assert!(emb.embed_one(9, 0).is_err());  // token OOB
+        assert!(emb.embed_one(0, 9).is_err());  // position OOB
+    }
+
+    #[test]
+    fn transformer_block_invalid_heads_rejected() {
+        // 3 heads do not divide dim=8; 0 heads is invalid; 0 context invalid.
+        let c = 8usize;
+        let mk = |ctx: usize, heads: usize| TransformerBlock::new(
+            ctx, heads, c,
+            vec![1.0; c], vec![0.0; c],
+            vec![0.0; c*c], vec![0.0; c],
+            vec![0.0; c*c], vec![0.0; c],
+            vec![0.0; c*c], vec![0.0; c],
+            vec![0.0; c*c], vec![0.0; c],
+            vec![1.0; c], vec![0.0; c],
+            vec![0.0; c*c], vec![0.0; c],
+            vec![0.0; c*c], vec![0.0; c],
+        );
+        assert!(mk(4, 3).is_err());
+        assert!(mk(4, 0).is_err());
+        assert!(mk(0, 2).is_err());
+        assert!(mk(4, 2).is_ok());
     }
 
     #[test]

@@ -118,20 +118,17 @@ callers anyway.
 
 ### Architecture / capability gaps
 
-- **`GenerativeSLM` does not use the transformer.** The headline "SLM" trains a
-  one-hidden-layer MLP over a flattened one-hot context. The `Embedding` +
-  `TransformerBlock` layers exist, are tested, serialize, and run in WASM — but
-  **there is no training path for them** (no backprop through attention/LayerNorm/
-  embeddings). Transformer models can only be hand-initialised or imported.
-- **No KV cache.** Generation re-runs the full context every step: O(T²) per token,
-  O(T³) per sequence. For edge inference this is the single highest-value optimisation.
-- **Character-level one-hot inputs only.** `input_dim = context_len × vocab_size`
-  explodes quickly (context 32 × vocab 80 = 2,560 inputs). No BPE/byte-level
-  tokenizer, no token-ID input path for the MLP SLM.
+- ~~**`GenerativeSLM` does not use the transformer.**~~ **Resolved** — see §4
+  item 9: `GenerativeSLM::train_transformer` now trains a real causal
+  transformer end-to-end with Adam.
+- ~~**No KV cache.**~~ **Resolved** — see §4 item 8.
+- **Character-level inputs only.** No BPE/byte-level tokenizer. (The transformer
+  path now uses compact token-ID inputs, but the MLP path still uses one-hot
+  contexts where `input_dim = context_len × vocab_size`.)
 - **No quantisation.** Weights are f32 only. Int8 (or even f16) storage would cut
   model size 4× — important for a project that advertises <180 KB binaries.
-- **Optimisers:** SGD+momentum only. Adam/AdamW is near-essential for transformer
-  training if that path is added.
+- ~~**Optimisers: SGD+momentum only.**~~ **Resolved** — Adam added (§4 item 10).
+  AdamW (decoupled weight decay) remains a possible refinement.
 - **No softmax-free logits path.** The inference `Sequential` bakes Softmax in as the
   last layer, and `GenerativeSLM::generate` then applies temperature to the *probabilities*
   (treating them as logits). This works but double-normalises; a logits-out model with
@@ -142,10 +139,8 @@ callers anyway.
 - **No `rayon`-style or even chunked parallelism** (deliberate, but worth a feature
   flag for non-WASM targets).
 - **No SIMD.** `std::simd` or manual 4-wide unrolling would give 2–4× on matmul.
-- **No fuzzing of the FINF parser.** The reader is bounds-checked, but
-  `f32_vec(c*c)` with attacker-controlled `c` can attempt huge allocations
-  (`vocab_size`, `embedding_dim` etc. are unvalidated u32s). A size sanity check
-  against remaining buffer length would close this.
+- ~~**FINF parser can attempt huge allocations.**~~ **Resolved** — see §4
+  item 7. (Dedicated fuzzing of the parser is still worthwhile.)
 - **Vocabulary alignment hack.** `build_csv_dataset` injects one all-zero training row
   per vocab character to force class ordering. These are junk samples that bias the
   model toward uniform predictions on empty contexts; a `class_names` override in the
@@ -169,14 +164,30 @@ callers anyway.
 5. `train_cli` positional-arg parsing. **Done.**
 6. Update stale SLM tests to the one-hot contract. **Done.**
 
-### High value, not yet done
+### High value — ✅ implemented (2026-06-11, follow-up to the original review)
 
-7. **Bounds-check FINF dimension fields** against remaining byte length before
-   allocating (`take`-based pre-check), to prevent OOM on corrupt/malicious files.
-8. **KV cache for `TransformerSLMModel.predict_next`** — biggest inference win.
-9. **Backprop for Embedding/LayerNorm/TransformerBlock**, so the advertised
-   transformer SLM can actually be *trained* with Ferrum.
-10. **Adam optimiser** (needed by #9 in practice).
+7. **Bounds-checked FINF parsing** — `Reader::f32_vec` now verifies the byte
+   length against the remaining buffer *before* allocating, and all dimension
+   products (`in×out`, `vocab×dim`, `c×c`, `c×h`) use checked multiplication,
+   so corrupt or malicious files with huge dimension fields fail fast with a
+   `Format` error instead of attempting multi-terabyte allocations
+   (overflow-safe on 32-bit/wasm targets too). Covered by new tests.
+8. **KV cache** — `layer::KvCache` plus `TransformerBlock::forward_with_cache`
+   and `Embedding::embed_one` give O(T)-per-token incremental generation;
+   `TransformerSLMModel` exposes it to JavaScript as `prime(context)` /
+   `predict_next_cached(token_id)` / `cached_len()`. A test proves the cached
+   path matches the full forward pass row-for-row.
+9. **Trainable transformer** — new `train_transformer` module implements full
+   backprop through token+positional embeddings, LayerNorm, causal multi-head
+   attention (softmax backward through the mask), and the FFN. `TransformerNet`
+   trains with next-token loss at every position and exports via
+   `to_inference()` to a FINF-serialisable `Sequential`. The high-level API is
+   `GenerativeSLM::train_transformer(corpus, …)`, and `generate()` now handles
+   both model families. Verified by finite-difference gradient checks across
+   all 18 parameter groups, a loss-halving training test, and an end-to-end
+   train→generate→serialize→reload integration test.
+10. **Adam optimiser** — `optim::Adam` with bias correction, used by the
+    transformer trainer (SGD+momentum remains for the MLP path).
 
 ### Nice to have
 

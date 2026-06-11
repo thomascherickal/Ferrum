@@ -5,7 +5,7 @@
 //!   `TransformerSLMModel`— character-level SLM with attention map access
 
 use ferrum_core::{argmax_rows, from_bytes, TaskType};
-use ferrum_core::layer::TransformerBlock;
+use ferrum_core::layer::{Embedding, KvCache, TransformerBlock};
 use wasm_bindgen::prelude::*;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -101,6 +101,10 @@ pub struct TransformerSLMModel {
     context_len: usize,
     num_heads: usize,
     num_blocks: usize,
+    /// One KV cache per TransformerBlock, in layer order.
+    caches: Vec<KvCache>,
+    /// Sequence position of the next token fed to the cached path.
+    cache_pos: usize,
 }
 
 #[wasm_bindgen]
@@ -118,20 +122,26 @@ impl TransformerSLMModel {
         let vocab_size = meta.output_dim;
         let context_len = meta.input_dim;
 
-        // Count transformer blocks and extract num_heads from first found block
+        // Count transformer blocks, extract num_heads, and build one KV cache
+        // per block for the incremental generation path.
         let mut num_blocks = 0usize;
         let mut num_heads = 4usize; // default
+        let mut caches = Vec::new();
         for layer in model.layers() {
             if let Some(tb) = layer.as_any().downcast_ref::<TransformerBlock>() {
                 if num_blocks == 0 {
                     num_heads = tb.num_heads();
                 }
                 num_blocks += 1;
+                caches.push(KvCache::new(tb.context_len(), tb.embedding_dim()));
             }
         }
 
         let meta_json = meta.to_json();
-        Ok(Self { model, meta_json, vocab_size, context_len, num_heads, num_blocks })
+        Ok(Self {
+            model, meta_json, vocab_size, context_len, num_heads, num_blocks,
+            caches, cache_pos: 0,
+        })
     }
 
     /// Return model metadata JSON (vocab, context length, architecture details).
@@ -184,6 +194,71 @@ impl TransformerSLMModel {
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         let last_row_start = (rows - 1) * cols;
         Ok(out.data[last_row_start..].to_vec())
+    }
+
+    /// Reset the KV caches and prime them with a context of token IDs.
+    ///
+    /// After priming, call `predict_next_cached` to extend the sequence one
+    /// token at a time at O(T) per token instead of re-running the full
+    /// O(T²) context. Returns the next-token probabilities after the last
+    /// context token (same as `predict_next` on the full context).
+    pub fn prime(&mut self, context: &[f32]) -> Result<Vec<f32>, JsValue> {
+        if context.is_empty() || context.len() > self.context_len {
+            return Err(JsValue::from_str(&format!(
+                "Context must have 1..={} tokens, got {}",
+                self.context_len,
+                context.len()
+            )));
+        }
+        for c in &mut self.caches {
+            c.clear();
+        }
+        self.cache_pos = 0;
+        let mut probs = Vec::new();
+        for &tok in context {
+            probs = self.feed_token(tok.round() as usize)?;
+        }
+        Ok(probs)
+    }
+
+    /// Feed one token through the KV-cached path and return the next-token
+    /// probabilities. Requires a prior `prime()`. Errors when the cache is
+    /// full (`context_len` positions) — re-`prime` with a fresh window then.
+    pub fn predict_next_cached(&mut self, token_id: usize) -> Result<Vec<f32>, JsValue> {
+        if self.cache_pos == 0 {
+            return Err(JsValue::from_str("Call prime(context) before predict_next_cached"));
+        }
+        self.feed_token(token_id)
+    }
+
+    /// Number of positions currently held in the KV caches.
+    pub fn cached_len(&self) -> usize {
+        self.cache_pos
+    }
+
+    fn feed_token(&mut self, token: usize) -> Result<Vec<f32>, JsValue> {
+        let js = |e: ferrum_core::InferError| JsValue::from_str(&e.to_string());
+        let mut x: Option<ferrum_core::Tensor> = None;
+        let mut block_idx = 0usize;
+        for layer in self.model.layers() {
+            let any = layer.as_any();
+            if let Some(emb) = any.downcast_ref::<Embedding>() {
+                x = Some(emb.embed_one(token, self.cache_pos).map_err(js)?);
+            } else if let Some(tb) = any.downcast_ref::<TransformerBlock>() {
+                let cur = x.ok_or_else(|| JsValue::from_str("model has no Embedding before TransformerBlock"))?;
+                x = Some(
+                    tb.forward_with_cache(&cur, &mut self.caches[block_idx])
+                        .map_err(js)?,
+                );
+                block_idx += 1;
+            } else {
+                let cur = x.ok_or_else(|| JsValue::from_str("model must start with an Embedding layer"))?;
+                x = Some(layer.forward(&cur).map_err(js)?);
+            }
+        }
+        self.cache_pos += 1;
+        x.map(|t| t.data)
+            .ok_or_else(|| JsValue::from_str("empty model"))
     }
 
     /// Return the self-attention weights from the LAST Transformer block's last forward pass.

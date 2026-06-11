@@ -62,17 +62,31 @@ impl<'a> Reader<'a> {
     fn usize(&mut self) -> Result<usize> {
         Ok(self.u32()? as usize)
     }
-    fn f32(&mut self) -> Result<f32> {
-        let b = self.take(4)?;
-        Ok(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-    }
+    /// Read `n` f32 values. The byte length is bounds-checked against the
+    /// remaining buffer BEFORE any allocation, so corrupt or malicious files
+    /// with huge dimension fields fail fast instead of attempting a giant
+    /// allocation.
     fn f32_vec(&mut self, n: usize) -> Result<Vec<f32>> {
-        (0..n).map(|_| self.f32()).collect()
+        let byte_len = n
+            .checked_mul(4)
+            .ok_or_else(|| InferError::Format(format!("f32 vec length {n} overflows")))?;
+        let raw = self.take(byte_len)?;
+        Ok(raw
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect())
     }
     fn utf8(&mut self, n: usize) -> Result<&'a str> {
         std::str::from_utf8(self.take(n)?)
             .map_err(|_| InferError::Format("invalid UTF-8 in blob".into()))
     }
+}
+
+/// Multiply two dimension fields read from an untrusted file, rejecting
+/// overflow (relevant on 32-bit/wasm targets where usize is 32 bits).
+fn mul_dims(a: usize, b: usize) -> Result<usize> {
+    a.checked_mul(b)
+        .ok_or_else(|| InferError::Format(format!("dimension product {a}×{b} overflows")))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -217,7 +231,7 @@ pub fn from_bytes(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata
                 vprintln!("[loader::from_bytes]   layer[{}]: Linear({}→{})", layer_i, in_f, out_f);
                 model.push(Box::new(Linear::new(
                     in_f, out_f,
-                    r.f32_vec(in_f * out_f)?,
+                    r.f32_vec(mul_dims(in_f, out_f)?)?,
                     r.f32_vec(out_f)?,
                 )?));
             }
@@ -235,8 +249,8 @@ pub fn from_bytes(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata
                 vprintln!("[loader::from_bytes]   layer[{}]: Embedding(vocab={}, seq={}, dim={})", layer_i, vocab_size, max_seq_len, embedding_dim);
                 model.push(Box::new(Embedding::new(
                     vocab_size, max_seq_len, embedding_dim,
-                    r.f32_vec(vocab_size * embedding_dim)?,
-                    r.f32_vec(max_seq_len * embedding_dim)?,
+                    r.f32_vec(mul_dims(vocab_size, embedding_dim)?)?,
+                    r.f32_vec(mul_dims(max_seq_len, embedding_dim)?)?,
                 )?));
             }
             TAG_LAYERNORM => {
@@ -257,16 +271,18 @@ pub fn from_bytes(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata
                     layer_i, context_len, num_heads, embedding_dim, hidden_dim);
                 let c = embedding_dim;
                 let h = hidden_dim;
+                let cc = mul_dims(c, c)?;
+                let ch = mul_dims(c, h)?;
                 model.push(Box::new(TransformerBlock::new(
                     context_len, num_heads, embedding_dim,
                     r.f32_vec(c)?,  r.f32_vec(c)?,    // ln1 gamma, beta
-                    r.f32_vec(c*c)?, r.f32_vec(c)?,    // q weight, bias
-                    r.f32_vec(c*c)?, r.f32_vec(c)?,    // k weight, bias
-                    r.f32_vec(c*c)?, r.f32_vec(c)?,    // v weight, bias
-                    r.f32_vec(c*c)?, r.f32_vec(c)?,    // out weight, bias
+                    r.f32_vec(cc)?, r.f32_vec(c)?,    // q weight, bias
+                    r.f32_vec(cc)?, r.f32_vec(c)?,    // k weight, bias
+                    r.f32_vec(cc)?, r.f32_vec(c)?,    // v weight, bias
+                    r.f32_vec(cc)?, r.f32_vec(c)?,    // out weight, bias
                     r.f32_vec(c)?,  r.f32_vec(c)?,    // ln2 gamma, beta
-                    r.f32_vec(c*h)?, r.f32_vec(h)?,    // ffn1 weight, bias
-                    r.f32_vec(h*c)?, r.f32_vec(c)?,    // ffn2 weight, bias
+                    r.f32_vec(ch)?, r.f32_vec(h)?,    // ffn1 weight, bias
+                    r.f32_vec(ch)?, r.f32_vec(c)?,    // ffn2 weight, bias
                 )?));
             }
             t => return Err(InferError::Format(format!("bad layer tag {t}"))),
@@ -457,6 +473,39 @@ mod tests {
             output_dim: 0,
         };
         assert!(matches!(to_bytes(&model, &norm, &meta), Err(InferError::Format(_))));
+    }
+
+    #[test]
+    fn huge_dims_error_fast_without_alloc() {
+        // A Linear layer claiming u32::MAX × u32::MAX weights must be rejected
+        // by the bounds check, not by an allocation attempt.
+        let (_, _, meta) = make_bundle();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        push_u32(&mut bytes, VERSION);
+        push_str(&mut bytes, "");
+        push_str(&mut bytes, &meta.to_json());
+        push_u32(&mut bytes, 1);
+        bytes.push(TAG_LINEAR);
+        push_u32(&mut bytes, u32::MAX);
+        push_u32(&mut bytes, u32::MAX);
+        assert!(matches!(from_bytes(&bytes), Err(InferError::Format(_))));
+    }
+
+    #[test]
+    fn oversized_embedding_dims_error() {
+        let (_, _, meta) = make_bundle();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        push_u32(&mut bytes, VERSION);
+        push_str(&mut bytes, "");
+        push_str(&mut bytes, &meta.to_json());
+        push_u32(&mut bytes, 1);
+        bytes.push(TAG_EMBEDDING);
+        push_u32(&mut bytes, 1_000_000); // vocab
+        push_u32(&mut bytes, 1_000_000); // max_seq_len
+        push_u32(&mut bytes, 1_000_000); // embedding_dim — 4 TB of weights claimed
+        assert!(matches!(from_bytes(&bytes), Err(InferError::Format(_))));
     }
 
     #[test]

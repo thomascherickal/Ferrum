@@ -1,7 +1,7 @@
 //! Unit and integration tests for the GenerativeSLM edge library module.
 use ferrum_core::{
     slm::{GenerativeSLM, char_to_hex, hex_to_char, build_csv_dataset},
-    Rng,
+    Rng, TaskType,
 };
 
 #[test]
@@ -49,6 +49,55 @@ fn test_build_csv_dataset_short_corpus_errors() {
     let context_len = 3; // Context larger than corpus
     let result = build_csv_dataset(corpus, context_len);
     assert!(result.is_err());
+}
+
+#[test]
+fn test_transformer_slm_training_and_generation_roundtrip() {
+    let corpus = "abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc";
+    let context_len = 4;
+    let mut rng = Rng::new(7);
+
+    // Train a real causal transformer end-to-end with Adam.
+    let mut losses: Vec<f32> = Vec::new();
+    let slm = GenerativeSLM::train_transformer_with_callback(
+        corpus,
+        context_len,
+        8,     // embed_dim
+        2,     // num_heads
+        1,     // num_blocks
+        16,    // hidden_dim
+        40,    // epochs
+        0.01,  // lr (Adam)
+        8,     // batch_size
+        &mut rng,
+        |_, loss| losses.push(loss),
+    ).unwrap();
+
+    // Loss must drop substantially on this trivially periodic corpus.
+    assert!(losses.last().unwrap() < &(losses[0] * 0.5),
+        "loss did not halve: {} → {}", losses[0], losses.last().unwrap());
+
+    // Metadata reflects the token-ID input contract.
+    assert_eq!(slm.meta.task, TaskType::TransformerSLM);
+    assert_eq!(slm.meta.input_dim, context_len);
+    assert_eq!(slm.meta.output_dim, slm.meta.class_names.len());
+
+    // Greedy-ish generation continues the abc pattern.
+    let generated = slm.generate("abca", 12, 0.1, &mut rng).unwrap();
+    assert!(generated.starts_with("abca"));
+    assert!(generated.chars().count() == 4 + 12);
+    // The trained model should keep cycling a→b→c.
+    assert!(generated.contains("bcabc"), "unexpected generation: {generated:?}");
+
+    // Serialization roundtrip preserves behaviour.
+    let bytes = slm.to_bytes().unwrap();
+    let reloaded = GenerativeSLM::from_bytes(&bytes).unwrap();
+    assert_eq!(reloaded.meta.task, TaskType::TransformerSLM);
+    let mut rng2 = Rng::new(123);
+    let mut rng3 = Rng::new(123);
+    let a = slm.generate("abca", 8, 0.1, &mut rng2).unwrap();
+    let b = reloaded.generate("abca", 8, 0.1, &mut rng3).unwrap();
+    assert_eq!(a, b, "reloaded model generates differently");
 }
 
 #[test]

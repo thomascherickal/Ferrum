@@ -2,8 +2,9 @@
 use crate::error::{InferError, Result};
 use crate::csv::{CsvDataset, ModelMetadata, Normalizer, TaskType};
 use crate::rng::Rng;
-use crate::optim::Sgd;
+use crate::optim::{Adam, Sgd};
 use crate::train::{Net, train_epoch};
+use crate::train_transformer::{train_transformer_epoch, TransformerNet};
 use crate::model::Sequential;
 use crate::loader::{to_bytes, from_bytes};
 use crate::tensor::Tensor;
@@ -163,6 +164,84 @@ impl GenerativeSLM {
         Ok(Self { model, norm, meta })
     }
 
+    /// Train a true decoder-only causal Transformer SLM on a raw text corpus.
+    ///
+    /// Unlike [`GenerativeSLM::train`] (a flat one-hot MLP), this trains
+    /// token + positional embeddings, `num_blocks` causal multi-head attention
+    /// blocks, and an LM head end-to-end with Adam, using next-token loss at
+    /// every position. The exported model serializes to FINF v4 and runs in
+    /// WASM via `TransformerSLMModel` (including KV-cached generation).
+    #[allow(clippy::too_many_arguments)]
+    pub fn train_transformer(
+        corpus: &str,
+        context_len: usize,
+        embed_dim: usize,
+        num_heads: usize,
+        num_blocks: usize,
+        hidden_dim: usize,
+        epochs: usize,
+        lr: f32,
+        batch_size: usize,
+        rng: &mut Rng,
+    ) -> Result<Self> {
+        Self::train_transformer_with_callback(
+            corpus, context_len, embed_dim, num_heads, num_blocks, hidden_dim,
+            epochs, lr, batch_size, rng, |_, _| {},
+        )
+    }
+
+    /// [`GenerativeSLM::train_transformer`] with an `(epoch, loss)` callback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn train_transformer_with_callback<F>(
+        corpus: &str,
+        context_len: usize,
+        embed_dim: usize,
+        num_heads: usize,
+        num_blocks: usize,
+        hidden_dim: usize,
+        epochs: usize,
+        lr: f32,
+        batch_size: usize,
+        rng: &mut Rng,
+        mut progress_callback: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(usize, f32),
+    {
+        let (vocab_vec, tokens) = tokenize_corpus(corpus, context_len)?;
+        let vocab_size = vocab_vec.len();
+        vprintln!("[slm::train_transformer] corpus={} chars, vocab={}, ctx={}, dim={}, heads={}, blocks={}, hidden={}",
+            tokens.len(), vocab_size, context_len, embed_dim, num_heads, num_blocks, hidden_dim);
+
+        let mut net = TransformerNet::new(
+            vocab_size, context_len, embed_dim, num_heads, hidden_dim, num_blocks, rng,
+        )?;
+        vprintln!("[slm::train_transformer] {} params, Adam lr={}", net.num_params(), lr);
+
+        let adam = Adam::new(lr);
+        for ep in 1..=epochs {
+            let loss = train_transformer_epoch(&mut net, &tokens, batch_size, &adam, rng)?;
+            vprintln!("[slm::train_transformer] epoch {}/{}: loss={:.6}", ep, epochs, loss);
+            progress_callback(ep, loss);
+        }
+
+        let model = net.to_inference()?;
+        let class_names: Vec<String> = vocab_vec.iter().map(|&ch| char_to_hex(ch)).collect();
+        let meta = ModelMetadata {
+            dataset_name: "GenerativeSLM Transformer".into(),
+            task: TaskType::TransformerSLM,
+            feature_names: (0..context_len).map(|i| format!("c_{i}")).collect(),
+            feature_ranges: vec![[0.0, vocab_size as f32]; context_len],
+            class_names,
+            target_name: "next_char".into(),
+            target_range: [0.0, vocab_size as f32],
+            input_dim: context_len,
+            output_dim: vocab_size,
+        };
+        let norm = Normalizer { means: vec![], stds: vec![] };
+        Ok(Self { model, norm, meta })
+    }
+
     /// Serialize the trained Generative SLM model to self-contained FINF v4 bytes.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         vprintln!("[slm::GenerativeSLM::to_bytes] Serializing model...");
@@ -188,9 +267,13 @@ impl GenerativeSLM {
         let mut generated = seed.to_string();
         let vocab_size = self.meta.output_dim;
         let input_dim = self.meta.input_dim;
-        let context_len = input_dim / vocab_size;
+        // Transformer models take context_len token IDs; the MLP takes a
+        // flattened one-hot context of context_len × vocab_size values.
+        let is_transformer = self.meta.task == TaskType::TransformerSLM;
+        let context_len = if is_transformer { input_dim } else { input_dim / vocab_size };
 
-        vprintln!("[slm::generate] vocab_size={}, input_dim={}, context_len={}", vocab_size, input_dim, context_len);
+        vprintln!("[slm::generate] vocab_size={}, input_dim={}, context_len={}, transformer={}",
+            vocab_size, input_dim, context_len, is_transformer);
 
         for step in 0..num_chars {
             let current_len = generated.chars().count();
@@ -203,38 +286,45 @@ impl GenerativeSLM {
             vprintln!("[slm::generate] Step {}: context=\"{}\"",
                 step, context_chars.iter().collect::<String>());
 
-            // Convert to flat one-hot representation using class_names (vocabulary)
-            let mut input_data = Vec::with_capacity(input_dim);
-            for &ch in &context_chars {
+            let char_idx = |ch: char| -> usize {
                 let hex = char_to_hex(ch);
-                let idx = self.meta
-                    .class_names
+                self.meta.class_names.iter().position(|s| s == &hex).unwrap_or(0)
+            };
+
+            let next_dist: Vec<f32> = if is_transformer {
+                // Token-ID input → [T, vocab] probabilities; keep the last row.
+                let ids: Vec<f32> = context_chars.iter().map(|&ch| char_idx(ch) as f32).collect();
+                let input = Tensor::matrix(1, context_len, ids)?;
+                let out = self.model.forward(&input)?;
+                let (rows, cols) = out.matrix_dims()?;
+                // The model ends in Softmax; convert probabilities back to
+                // log-space so temperature scaling behaves correctly.
+                out.data[(rows - 1) * cols..]
                     .iter()
-                    .position(|s| s == &hex)
-                    .unwrap_or(0);
-                for j in 0..vocab_size {
-                    if j == idx {
-                        input_data.push(1.0f32);
-                    } else {
-                        input_data.push(0.0f32);
+                    .map(|&p| p.max(1e-12).ln())
+                    .collect()
+            } else {
+                // One-hot context for the MLP path.
+                let mut input_data = Vec::with_capacity(input_dim);
+                for &ch in &context_chars {
+                    let idx = char_idx(ch);
+                    for j in 0..vocab_size {
+                        input_data.push(if j == idx { 1.0 } else { 0.0 });
                     }
                 }
-            }
-
-            let input_tensor = Tensor::row(input_data)?;
-            let transformed_input = self.norm.transform(&input_tensor)?;
-            
-            // Forward pass
-            let logits = self.model.forward(&transformed_input)?;
+                let input_tensor = Tensor::row(input_data)?;
+                let transformed_input = self.norm.transform(&input_tensor)?;
+                self.model.forward(&transformed_input)?.data
+            };
 
             if verbose::is_verbose() {
-                let (lmin, lmax, lmean) = verbose::stats(&logits.data);
+                let (lmin, lmax, lmean) = verbose::stats(&next_dist);
                 vprintln!("[slm::generate] Step {}: logits stats: min={:.4}, max={:.4}, mean={:.4}",
                     step, lmin, lmax, lmean);
             }
-            
+
             // Sample with temperature
-            let next_idx = sample_from_logits(&logits.data, temp, rng);
+            let next_idx = sample_from_logits(&next_dist, temp, rng);
 
             // Decode prediction
             let predicted_hex = &self.meta.class_names[next_idx];
@@ -260,6 +350,27 @@ pub fn char_to_hex(ch: char) -> String {
 pub fn hex_to_char(hex: &str) -> char {
     let code = u32::from_str_radix(hex, 16).unwrap_or(32); // Fallback to space on parse error
     std::char::from_u32(code).unwrap_or(' ')
+}
+
+/// Tokenize a corpus into (sorted vocabulary, token-ID stream) for
+/// transformer training. The vocabulary always includes ' ' and '\n'.
+pub fn tokenize_corpus(corpus: &str, context_len: usize) -> Result<(Vec<char>, Vec<usize>)> {
+    let chars: Vec<char> = corpus.chars().filter(|&c| c != '\r').collect();
+    if chars.len() < context_len + 1 {
+        return Err(InferError::DimMismatch(
+            "Corpus must be longer than the context window".into(),
+        ));
+    }
+    let mut vocab: HashSet<char> = chars.iter().copied().collect();
+    vocab.insert(' ');
+    vocab.insert('\n');
+    let mut vocab_vec: Vec<char> = vocab.into_iter().collect();
+    vocab_vec.sort();
+    let tokens: Vec<usize> = chars
+        .iter()
+        .map(|c| vocab_vec.binary_search(c).unwrap_or(0))
+        .collect();
+    Ok((vocab_vec, tokens))
 }
 
 /// Builds a clean hex-encoded sliding window CSV dataset for causal character sequence training with one-hot encoded inputs.

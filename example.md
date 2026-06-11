@@ -2,13 +2,13 @@
 
 This walkthrough builds a small language model two ways:
 
-- **Path A — the 10-minute SLM**: `GenerativeSLM`, a character-level causal model
-  trained with one function call. Best for autocomplete-style models on small,
+- **Path A — the 10-minute SLM**: `GenerativeSLM::train`, a character-level causal
+  MLP trained with one function call. Best for autocomplete-style models on small,
   domain-specific corpora (commands, poetry templates, slogans, logs).
-- **Path B — a real Transformer**: hand-assemble `Embedding` + `TransformerBlock` +
-  LM head, serialize it to FINF, and run it natively or in the browser with attention
-  visualisation. (Ferrum currently trains MLPs only, so Path B covers building,
-  initialising, saving, and running the transformer.)
+- **Path B — a real Transformer**: `GenerativeSLM::train_transformer` trains a
+  decoder-only causal transformer (embeddings, multi-head attention, FFN) end-to-end
+  with Adam, then serializes it to FINF and runs it natively or in the browser with
+  KV-cached generation and attention visualisation.
 
 Everything below uses only `ferrum_core` — no external crates.
 
@@ -134,10 +134,49 @@ small enough for instant load in a browser.
 
 ---
 
-## Path B — Assemble a Causal Transformer
+## Path B — Train a Causal Transformer
 
-Ferrum's layer zoo includes everything a decoder-only transformer needs, all of which
-serialize to FINF and run in WASM.
+### The one-call API
+
+```rust
+use ferrum_core::{GenerativeSLM, Rng};
+
+let corpus = std::fs::read_to_string("corpus.txt")?;
+let mut rng = Rng::new(42);
+
+let slm = GenerativeSLM::train_transformer_with_callback(
+    &corpus,
+    16,    // context_len  — tokens per window
+    32,    // embed_dim    — must be divisible by num_heads
+    4,     // num_heads
+    2,     // num_blocks   — transformer depth
+    64,    // hidden_dim   — FFN inner width (2–4 × embed_dim)
+    100,   // epochs
+    0.003, // learning rate (Adam)
+    16,    // batch_size
+    &mut rng,
+    |ep, loss| { if ep % 10 == 0 { println!("epoch {ep:4}  loss {loss:.4}"); } },
+)?;
+
+let text = slm.generate("once upon a time", 200, 0.8, &mut rng)?;
+std::fs::write("transformer.bin", slm.to_bytes()?)?;   // FINF v4, WASM-ready
+```
+
+This trains token + positional embeddings, every attention/FFN/LayerNorm parameter,
+and the LM head end-to-end with next-token loss at all positions — verified by
+finite-difference gradient checks in the test suite. Unlike Path A, inputs are
+compact token IDs (`input_dim = context_len`), so models stay small as the
+vocabulary grows.
+
+For lower-level control (custom training loops, your own data pipeline), use
+`ferrum_core::TransformerNet` directly: `forward` → `softmax_cross_entropy` →
+`backward` → `step(&Adam)`, then `to_inference()` to export.
+
+### Hand-assembling instead (optional)
+
+If you want to port weights from elsewhere or experiment with custom
+architectures, you can also build the same model layer by layer — everything
+below serializes to FINF and runs in WASM.
 
 ### 1. Build the model
 
@@ -237,11 +276,8 @@ let norm = Normalizer { means: vec![], stds: vec![] };  // identity for SLMs
 save(&model, &norm, &meta, "transformer.bin")?;
 ```
 
-> **Current limitation:** Ferrum's backprop covers Dense/ReLU only, so this
-> transformer cannot be *trained* inside Ferrum yet — initialise it randomly for
-> experimentation, or port weights from elsewhere by filling the weight vectors
-> above. Trainability of transformer blocks is the top item on the roadmap
-> (see evaluation.md §4).
+> **Tip:** for training from scratch, prefer `GenerativeSLM::train_transformer`
+> (above) — hand-assembly is for weight porting and architecture experiments.
 
 ### 4. Run it in the browser
 
@@ -267,6 +303,27 @@ const H     = slm.entropy(probs);                     // uncertainty meter
 const top5  = slm.top_k_indices(probs, 5);            // ranked candidates
 const attn  = slm.get_last_attention_weights();       // heads × T × T heatmap
 ```
+
+### Fast generation with the KV cache
+
+`predict_next` re-runs the whole context every call (O(T²) per token). For
+interactive streaming, prime the per-block KV caches once and feed one token
+at a time at O(T):
+
+```js
+let probs = slm.prime(seedIds);              // seedIds: 1..contextLen token ids
+const out = [...seedIds];
+while (out.length < slm.context_len()) {     // cache holds contextLen positions
+  const next = slm.sample_from_probs(probs, 0.8, Math.random());
+  out.push(next);
+  probs = slm.predict_next_cached(next);
+}
+// Window full? Re-prime with the most recent tokens and keep going:
+// probs = slm.prime(new Float32Array(out.slice(-slm.context_len() + 1)));
+```
+
+Both paths produce identical distributions — the cached path is verified
+against the full forward pass in the test suite.
 
 ---
 

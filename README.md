@@ -27,8 +27,9 @@ ferrum/
 │       │                  #   Embedding (token+positional), TransformerBlock (causal MHA)
 │       ├── model.rs       # Sequential — ordered pipeline of layers
 │       ├── loss.rs        # Fused softmax cross-entropy + MSE, both with gradients
-│       ├── optim.rs       # SGD with optional momentum
+│       ├── optim.rs       # SGD with momentum + Adam (bias-corrected)
 │       ├── train.rs       # Trainable MLP (DenseT/ReluT/Net), backprop, train_epoch
+│       ├── train_transformer.rs # Trainable causal Transformer (full backprop + Adam)
 │       ├── csv.rs         # CSV parser, Normalizer, task auto-detection, ModelMetadata
 │       ├── slm.rs         # GenerativeSLM — character-level causal language model
 │       ├── loader.rs      # FINF v4 binary save/load (all 5 layer types)
@@ -70,7 +71,7 @@ train      ──► Net (trainable MLP), train_epoch, accuracy
 
 ```bash
 cargo build --workspace
-cargo test  --workspace      # 200+ tests, all passing
+cargo test  --workspace      # 217 tests, all passing
 ```
 
 ### Train a tabular model from any CSV
@@ -95,6 +96,17 @@ let slm = GenerativeSLM::train(&corpus, 8, 64, 200, 0.05, 0.9, 16, &mut rng)?;
 let text = slm.generate("once upo", 100, 0.8, &mut rng)?;   // seed, n_chars, temperature
 std::fs::write("model.bin", slm.to_bytes()?)?;              // self-contained binary
 let reloaded = GenerativeSLM::from_bytes(&std::fs::read("model.bin")?)?;
+```
+
+Or train a **real decoder-only causal Transformer** (embeddings + multi-head
+attention + FFN, trained end-to-end with Adam):
+
+```rust
+// corpus, context_len, embed_dim, num_heads, num_blocks, hidden_dim,
+// epochs, lr, batch_size, rng
+let slm = GenerativeSLM::train_transformer(&corpus, 16, 32, 4, 2, 64,
+                                           100, 0.003, 16, &mut rng)?;
+let text = slm.generate("once upon a time", 200, 0.8, &mut rng)?;
 ```
 
 See **[example.md](example.md)** for a complete walkthrough, including hand-building a

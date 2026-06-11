@@ -53,6 +53,64 @@ impl Sgd {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Adam
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Adam optimizer (Kingma & Ba, 2015) with bias correction. Stateless like
+/// `Sgd` — each parameter owns its first/second moment buffers and passes the
+/// shared 1-based timestep `t` to every `step` call.
+#[derive(Clone, Copy, Debug)]
+pub struct Adam {
+    pub lr: f32,
+    pub beta1: f32,
+    pub beta2: f32,
+    pub eps: f32,
+}
+
+impl Adam {
+    /// Standard defaults: β1=0.9, β2=0.999, ε=1e-8.
+    pub fn new(lr: f32) -> Self {
+        vprintln!("[optim::Adam::new] lr={}", lr);
+        Self { lr, beta1: 0.9, beta2: 0.999, eps: 1e-8 }
+    }
+
+    /// m ← β1·m + (1−β1)·g;  v ← β2·v + (1−β2)·g²;
+    /// param ← param − lr·m̂/(√v̂ + ε)  with bias-corrected m̂, v̂.
+    pub fn step(
+        &self,
+        t: u64,
+        param: &mut Tensor,
+        grad: &Tensor,
+        m: &mut Tensor,
+        v: &mut Tensor,
+    ) -> Result<()> {
+        if param.shape != grad.shape || param.shape != m.shape || param.shape != v.shape {
+            return Err(InferError::DimMismatch(format!(
+                "adam step: param {:?}, grad {:?}, m {:?}, v {:?} shapes differ",
+                param.shape, grad.shape, m.shape, v.shape
+            )));
+        }
+        if t == 0 {
+            return Err(InferError::DimMismatch("adam timestep must be ≥ 1".into()));
+        }
+        let bc1 = 1.0 - self.beta1.powi(t.min(i32::MAX as u64) as i32);
+        let bc2 = 1.0 - self.beta2.powi(t.min(i32::MAX as u64) as i32);
+        for i in 0..param.data.len() {
+            let g = grad.data[i];
+            m.data[i] = self.beta1 * m.data[i] + (1.0 - self.beta1) * g;
+            v.data[i] = self.beta2 * v.data[i] + (1.0 - self.beta2) * g * g;
+            let m_hat = m.data[i] / bc1;
+            let v_hat = v.data[i] / bc2;
+            param.data[i] -= self.lr * m_hat / (v_hat.sqrt() + self.eps);
+        }
+        if verbose::is_verbose() {
+            verbose::check_nan_inf(&param.data, "Adam::step param");
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +154,51 @@ mod tests {
         let mut v = Tensor::zeros(vec![1]);
         opt.step(&mut p, &g, &mut v).unwrap();
         assert_eq!(p.data[0], 5.0);
+    }
+
+    #[test]
+    fn adam_first_step_moves_by_lr() {
+        // With bias correction, the very first Adam step is ≈ lr (for eps≈0).
+        let opt = Adam::new(0.1);
+        let mut p = Tensor::vector(vec![1.0]);
+        let g = Tensor::vector(vec![3.0]);
+        let mut m = Tensor::zeros(vec![1]);
+        let mut v = Tensor::zeros(vec![1]);
+        opt.step(1, &mut p, &g, &mut m, &mut v).unwrap();
+        assert!((p.data[0] - 0.9).abs() < 1e-4, "got {}", p.data[0]);
+    }
+
+    #[test]
+    fn adam_minimises_quadratic() {
+        // Minimise f(x) = (x - 3)², gradient 2(x - 3).
+        let opt = Adam::new(0.1);
+        let mut p = Tensor::vector(vec![0.0]);
+        let mut m = Tensor::zeros(vec![1]);
+        let mut v = Tensor::zeros(vec![1]);
+        for t in 1..=500u64 {
+            let g = Tensor::vector(vec![2.0 * (p.data[0] - 3.0)]);
+            opt.step(t, &mut p, &g, &mut m, &mut v).unwrap();
+        }
+        assert!((p.data[0] - 3.0).abs() < 0.01, "converged to {}", p.data[0]);
+    }
+
+    #[test]
+    fn adam_shape_mismatch_errors() {
+        let opt = Adam::new(0.1);
+        let mut p = Tensor::vector(vec![1.0, 2.0]);
+        let g = Tensor::vector(vec![1.0]);
+        let mut m = Tensor::zeros(vec![2]);
+        let mut v = Tensor::zeros(vec![2]);
+        assert!(opt.step(1, &mut p, &g, &mut m, &mut v).is_err());
+    }
+
+    #[test]
+    fn adam_zero_timestep_errors() {
+        let opt = Adam::new(0.1);
+        let mut p = Tensor::vector(vec![1.0]);
+        let g = Tensor::vector(vec![1.0]);
+        let mut m = Tensor::zeros(vec![1]);
+        let mut v = Tensor::zeros(vec![1]);
+        assert!(opt.step(0, &mut p, &g, &mut m, &mut v).is_err());
     }
 }
