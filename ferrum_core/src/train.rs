@@ -282,6 +282,10 @@ pub struct Net {
     layers: Vec<TLayer>,
     input_dim: usize,
     output_dim: usize,
+    /// Quantization Aware Training: when enabled, `train_epoch` runs
+    /// forward/backward against int8-snapped weights while SGD updates
+    /// full-precision master weights (straight-through estimator).
+    qat: bool,
 }
 
 impl Net {
@@ -299,6 +303,7 @@ impl Net {
             layers,
             input_dim,
             output_dim,
+            qat: false,
         };
         vprintln!("[train::Net::mlp] Total params: {}", net.num_params());
         net
@@ -333,9 +338,58 @@ impl Net {
             layers,
             input_dim: context_len,
             output_dim,
+            qat: false,
         };
         vprintln!("[train::Net::embedding_mlp] Total params: {}", net.num_params());
         net
+    }
+
+    /// Enable or disable int8 Quantization Aware Training (see the `qat`
+    /// field docs). Off by default; `GenerativeSLM` turns it on.
+    pub fn set_qat(&mut self, enabled: bool) {
+        self.qat = enabled;
+    }
+    pub fn qat_enabled(&self) -> bool {
+        self.qat
+    }
+
+    /// Every parameter tensor, in a fixed order (used by the QAT snapshot /
+    /// fake-quantize / restore cycle).
+    fn param_tensors_mut(&mut self) -> Vec<&mut Tensor> {
+        let mut v = Vec::new();
+        for l in &mut self.layers {
+            match l {
+                TLayer::Embed(e) => v.push(&mut e.table),
+                TLayer::Dense(d) => {
+                    v.push(&mut d.weight);
+                    v.push(&mut d.bias);
+                }
+                TLayer::Relu(_) => {}
+            }
+        }
+        v
+    }
+
+    /// Copy of every parameter tensor's data (the fp32 master weights).
+    pub(crate) fn snapshot_weights(&mut self) -> Vec<Vec<f32>> {
+        self.param_tensors_mut()
+            .iter()
+            .map(|t| t.data.clone())
+            .collect()
+    }
+
+    /// Snap every (large-enough) parameter tensor onto the int8 grid in place.
+    pub(crate) fn fake_quantize_weights(&mut self) {
+        for t in self.param_tensors_mut() {
+            crate::quant::fake_quantize_int8(&mut t.data);
+        }
+    }
+
+    /// Restore master weights captured by [`Net::snapshot_weights`].
+    pub(crate) fn restore_weights(&mut self, snapshot: &[Vec<f32>]) {
+        for (t, s) in self.param_tensors_mut().into_iter().zip(snapshot) {
+            t.data.copy_from_slice(s);
+        }
     }
 
     pub fn forward(&mut self, x: &Tensor) -> Result<Tensor> {
@@ -437,6 +491,11 @@ impl Net {
 // ---------------------------------------------------------------------------
 
 /// Run one epoch of minibatch SGD. Returns mean train loss over the epoch.
+///
+/// If the net has QAT enabled ([`Net::set_qat`]), each step runs forward and
+/// backward against int8-snapped weights, then applies the SGD update to the
+/// full-precision master weights (straight-through estimator), so the trained
+/// model is robust to int8 export.
 pub fn train_epoch(
     net: &mut Net,
     x: &Tensor,
@@ -475,6 +534,16 @@ pub fn train_epoch(
 
         vprintln!("[train::train_epoch]   step {}/{}: batch shape=[{},{}]", step+1, steps, batch_size, cols);
 
+        // QAT: gradients are computed at the int8-snapped weights, but the
+        // optimizer updates the fp32 masters (straight-through estimator).
+        let masters = if net.qat_enabled() {
+            let snapshot = net.snapshot_weights();
+            net.fake_quantize_weights();
+            Some(snapshot)
+        } else {
+            None
+        };
+
         // Forward
         let logits = net.forward(&xb)?;
         if verbose::is_verbose() {
@@ -498,7 +567,10 @@ pub fn train_epoch(
         // Backward
         net.backward(&dlogits)?;
 
-        // Step
+        // Step (against restored fp32 masters when QAT is on)
+        if let Some(snapshot) = &masters {
+            net.restore_weights(snapshot);
+        }
         net.step(opt)?;
 
         total_loss += loss;
@@ -635,6 +707,42 @@ mod tests {
         }
         let (loss1, _) = softmax_cross_entropy(&net.forward(&x).unwrap(), &y).unwrap();
         assert!(loss1 < loss0 * 0.5, "loss: {loss0:.4} → {loss1:.4}");
+    }
+
+    #[test]
+    fn qat_train_epoch_reduces_loss() {
+        // Same shape as the iris-like test, but through train_epoch with QAT
+        // enabled: gradients flow at int8-snapped weights, SGD updates masters.
+        let mut rng = Rng::new(42);
+        let x_data: Vec<f32> = (0..30 * 4).map(|_| rng.next_normal()).collect();
+        let x = Tensor::matrix(30, 4, x_data).unwrap();
+        let y: Vec<usize> = (0..30).map(|i| i % 3).collect();
+
+        let mut net = Net::mlp(4, 32, 3, &mut rng);
+        net.set_qat(true);
+        assert!(net.qat_enabled());
+        let opt = Sgd::with_momentum(0.1, 0.9);
+        let first = train_epoch(&mut net, &x, &y, 10, &opt, &mut rng).unwrap();
+        let mut last = first;
+        for _ in 0..60 {
+            last = train_epoch(&mut net, &x, &y, 10, &opt, &mut rng).unwrap();
+        }
+        assert!(last < first * 0.5, "QAT loss: {first:.4} → {last:.4}");
+    }
+
+    #[test]
+    fn qat_snapshot_quantize_restore_cycle() {
+        let mut rng = Rng::new(5);
+        let mut net = Net::embedding_mlp(20, 4, 8, 32, 20, &mut rng);
+        let masters = net.snapshot_weights();
+        net.fake_quantize_weights();
+        let quantized = net.snapshot_weights();
+        assert!(
+            masters.iter().zip(&quantized).any(|(m, q)| m != q),
+            "fake quantization changed no weights"
+        );
+        net.restore_weights(&masters);
+        assert_eq!(net.snapshot_weights(), masters);
     }
 
     #[test]

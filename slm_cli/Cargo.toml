@@ -1,6 +1,6 @@
 [package]
 name    = "slm_cli"
-description = "Command-line trainer and generator for ferrum_core Small Language Models (transformer / embedded / one-hot MLP)."
+description = "Command-line trainer and generator for ferrum_core causal transformer Small Language Models (int8 QAT, on-disk weight caching)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

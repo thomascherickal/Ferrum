@@ -1,205 +1,156 @@
-# Ferrum — Edge SLM Inference & Training Engine
+# Ferrum
 
-Ferrum is a **zero-dependency, pure-Rust** workspace for building, training, and running
-small machine-learning models — feedforward MLPs and decoder-only causal Transformers —
-on CPU-only, edge, and WebAssembly targets.
+**Zero-dependency, pure-Rust engine for building, training, and running causal
+Transformers, Small Language Models (SLMs), and classical MLPs — entirely on the
+CPU, with no GPU and no external crates.**
 
-- **No GPU.** Single-threaded CPU kernels, cache-friendly loop ordering.
-- **No external crates** in the core engine (`ferrum_core` uses `std` only).
-- **Deterministic.** Seeded xorshift64* PRNG; the same seed reproduces the same model.
-- **Self-contained models.** One FINF v4 binary holds weights + normalizer + metadata.
-- **Browser-ready.** `tabular_wasm` exposes the engine to JavaScript via `wasm-bindgen`.
+Ferrum is `std`-only and `#![forbid(unsafe_code)]`. The whole stack — tensors,
+hand-written backprop, a byte-level BPE tokenizer, int8 quantization-aware
+training, and a self-contained model file format — compiles to native binaries
+and to WebAssembly, so the same trained model runs on a server, a laptop, a
+Raspberry Pi, or in a browser tab.
 
----
-
-## Workspace Layout
-
-```text
-ferrum/
-├── Cargo.toml             # Workspace: ferrum_core, tabular_wasm, train_cli, tests
-│
-├── ferrum_core/           # The engine (pure Rust, std only)
-│   └── src/
-│       ├── tensor.rs      # Flat row-major f32 tensor with shape checking
-│       ├── ops.rs         # matmul, add_bias, transpose, softmax_rows, argmax_rows…
-│       ├── activation.rs  # Identity / ReLU / Sigmoid / Tanh / Softmax (serialisable)
-│       ├── layer.rs       # Layer trait: Linear, ActivationLayer, LayerNorm,
-│       │                  #   Embedding (token+positional), TransformerBlock (causal MHA)
-│       ├── model.rs       # Sequential — ordered pipeline of layers
-│       ├── loss.rs        # Fused softmax cross-entropy + MSE, both with gradients
-│       ├── optim.rs       # SGD with momentum + Adam (bias-corrected)
-│       ├── train.rs       # Trainable MLP (DenseT/ReluT/Net), backprop, train_epoch
-│       ├── train_transformer.rs # Trainable causal Transformer (full backprop + Adam)
-│       ├── csv.rs         # CSV parser, Normalizer, task auto-detection, ModelMetadata
-│       ├── slm.rs         # GenerativeSLM — character-level causal language model
-│       ├── loader.rs      # FINF v4 binary save/load (all 5 layer types)
-│       ├── rng.rs         # Seeded xorshift64* PRNG
-│       └── verbose.rs     # Opt-in tracing (set_verbose) + vprintln! macro
-│
-├── tabular_wasm/          # WASM bindings: TabularModel + TransformerSLMModel
-├── train_cli/             # CLI: train any CSV (classification/regression) → FINF
-├── tests/                 # Integration test crate (200+ tests in the workspace)
-└── web/                   # Browser playgrounds consuming the WASM package
-```
+- **No dependencies.** `ferrum_core` has an empty `[dependencies]` table.
+- **No GPU.** Everything runs on the CPU; models are small by design.
+- **Self-contained models.** Weights, normalizer, metadata, and the tokenizer
+  travel together in one `.bin` file (the FINF format).
+- **Quantization-aware.** Train against int8-snapped weights and ship 4×-smaller
+  models that behave like the model you trained.
+- **Byte-level BPE.** A subword tokenizer is integrated end-to-end through
+  training, generation, and serialization — and it round-trips any UTF-8 text.
 
 ---
 
-## Architecture at a Glance
+## Workspace layout
 
-```text
-Tensor ──► ops (matmul, softmax, …)
-     │
-     └──► Layer trait
-            ├── Linear           (y = xW + b, W is [in, out] — no transpose at inference)
-            ├── ActivationLayer  (ReLU / Softmax / …)
-            ├── LayerNorm        (per-row normalisation, ε = 1e-5)
-            ├── Embedding        (token lookup + learned positional encoding)
-            └── TransformerBlock (pre-norm causal multi-head self-attention + FFN,
-                                  residual connections, attention maps exposed)
-
-Sequential ──► ordered pipeline of Layers
-loader     ──► FINF v4 binary format (save / load / to_bytes / from_bytes)
-slm        ──► GenerativeSLM: corpus → train → generate (char-level, temperature sampling)
-train      ──► Net (trainable MLP), train_epoch, accuracy
-```
+| Crate          | Kind                         | What it is                                                          |
+|----------------|------------------------------|---------------------------------------------------------------------|
+| `ferrum_core`  | library                      | The engine: tensors, layers, training, quantization, tokenizer, SLM, FINF I/O |
+| `slm_cli`      | binary (`train_transformer`) | Train and generate from causal-transformer SLMs                     |
+| `train_cli`    | binary (`train_cli`)         | Train tabular MLP classifiers/regressors from any CSV               |
+| `tabular_wasm` | cdylib + rlib                | `wasm-bindgen` bindings for running models in the browser           |
+| `tests`        | integration                  | Cross-crate integration and regression tests                        |
 
 ---
 
-## Quick Start
+## Quick start
 
-### Build & test
+### Train a Small Language Model (byte-level BPE)
 
 ```bash
-cargo build --workspace
-cargo test  --workspace      # 217 tests, all passing
+# Train a causal transformer SLM with a 512-token BPE vocabulary (the default).
+cargo run -p slm_cli -- train corpus.txt model.bin --epochs 200 --context 16
+
+# Continue a prompt.
+cargo run -p slm_cli -- generate model.bin "Once upon a time" --chars 300 --temp 0.7
+
+# Inspect a trained model.
+cargo run -p slm_cli -- info model.bin
 ```
 
-### Train a tabular model from any CSV
+`--vocab 0` selects the legacy character-level tokenizer; any value `>= 256`
+trains a byte-level BPE tokenizer of that size and stores its merge list inside
+the model file.
 
-```bash
-cargo run -p train_cli -- tests/fixtures/iris.data /tmp/iris.bin "Iris" 32 200
-# Auto-detects classification vs regression, trains, validates, exports FINF.
-# Add --verbose to trace every kernel call.
-```
-
-### Train and run a character-level SLM (library API)
+### Use the library directly
 
 ```rust
 use ferrum_core::{GenerativeSLM, Rng};
 
-let corpus = std::fs::read_to_string("corpus.txt")?;
-let mut rng = Rng::new(42);
+let corpus = std::fs::read_to_string("corpus.txt").unwrap();
+let mut rng = Rng::new(1337);
 
-// corpus, context_len, hidden_size, epochs, lr, momentum, batch_size, rng
-let slm = GenerativeSLM::train(&corpus, 8, 64, 200, 0.05, 0.9, 16, &mut rng)?;
+// Train a BPE transformer SLM: context 16, embed 32, 4 heads, 2 blocks,
+// FFN 64, 200 epochs, Adam lr 0.01, batch 16, BPE vocab 512.
+let slm = GenerativeSLM::train_transformer(
+    &corpus, 16, 32, 4, 2, 64, 200, 0.01, 16, 512, &mut rng,
+).unwrap();
 
-let text = slm.generate("once upo", 100, 0.8, &mut rng)?;   // seed, n_chars, temperature
-std::fs::write("model.bin", slm.to_bytes()?)?;              // self-contained binary
-let reloaded = GenerativeSLM::from_bytes(&std::fs::read("model.bin")?)?;
+slm.save("model.bin").unwrap();                // int8-quantized FINF v5
+let text = slm.generate("Once upon a time", 200, 0.7, &mut rng).unwrap();
+println!("{text}");
 ```
 
-Or train a **real decoder-only causal Transformer** (embeddings + multi-head
-attention + FFN, trained end-to-end with Adam):
-
-```rust
-// corpus, context_len, embed_dim, num_heads, num_blocks, hidden_dim,
-// epochs, lr, batch_size, rng
-let slm = GenerativeSLM::train_transformer(&corpus, 16, 32, 4, 2, 64,
-                                           100, 0.003, 16, &mut rng)?;
-let text = slm.generate("once upon a time", 200, 0.8, &mut rng)?;
-```
-
-See **[example.md](example.md)** for a complete walkthrough, including hand-building a
-true Transformer SLM with `Embedding` + `TransformerBlock`.
-
-### Run a pre-trained model (inference only)
-
-```rust
-use ferrum_core::{from_bytes, Tensor};
-
-let bytes = std::fs::read("model.bin")?;
-let (model, norm, meta) = from_bytes(&bytes)?;
-let input = norm.transform(&Tensor::row(vec![5.1, 3.5, 1.4, 0.2])?)?;
-let probs = model.forward(&input)?;          // softmax already applied
-```
-
-### WebAssembly
+### Train a tabular model
 
 ```bash
-rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli --version 0.2.122 --locked
-bash scripts/build_wasm.sh
-python3 -m http.server 8080 --directory web   # open http://localhost:8080
-```
-
-JavaScript side:
-
-```js
-const bytes = new Uint8Array(await (await fetch('model.bin')).arrayBuffer());
-const slm   = new TransformerSLMModel(bytes);
-const probs = slm.predict_next(new Float32Array([12, 5, 3, 7]));  // token IDs
-const attn  = slm.get_last_attention_weights();  // [heads × T × T] for visualisation
+cargo run -p train_cli -- iris.csv model.bin "Iris" 32 500
 ```
 
 ---
 
-## The FINF v4 Model Format
+## Architecture at a glance
 
-One little-endian binary blob, fully self-describing:
+```
+Tensor ──► ops (matmul, softmax, layernorm, …)
+     │
+     └──► Layer trait
+            ├── Linear            (y = xW + b)
+            ├── ActivationLayer   (ReLU / Softmax / …)
+            ├── LayerNorm         (per-row normalization)
+            ├── Embedding         (token + positional lookup)
+            ├── Flatten           (sequence → row)
+            └── TransformerBlock  (causal multi-head self-attention + FFN)
 
-| Field        | Size | Contents                                         |
-|--------------|------|--------------------------------------------------|
-| magic        | 4 B  | `"FINF"`                                         |
-| version      | u32  | `4`                                              |
-| norm_len     | u32  | length of normalizer string (empty for SLMs)     |
-| norm         | …    | `mean,std;mean,std;…` per feature                |
-| meta_len     | u32  | length of metadata JSON                          |
-| meta         | …    | dataset name, task, feature/class names, dims    |
-| num_layers   | u32  |                                                  |
-| layers       | …    | per layer: `u8` tag + raw f32 weights            |
+Sequential ──► ordered pipeline of Layers   (+ KvCache for fast generation)
 
-Layer tags: `0` Linear, `1` Activation, `2` Embedding, `3` LayerNorm, `4` TransformerBlock.
+tokenizer  ──► ByteBpeTokenizer  (byte-level BPE; char-level fallback)
+quant      ──► int8 fake-quantization for QAT and serialization
+train      ──► Net (MLP), train_epoch, Adam / Sgd
+train_transformer ──► TransformerNet, train_transformer_epoch
+slm        ──► GenerativeSLM: train / train_embedded / train_transformer / generate
+loader     ──► FINF v4 (f32) / v5 (int8) self-contained model files
+```
 
-The embedded metadata means a browser UI can build itself from the model file alone — no
-separate config request.
+See [docs/manual.md](docs/manual.md) for the full reference.
 
 ---
 
-## Verbose Diagnostics
+## The three SLM training paths
 
-Every module is instrumented. Enable tracing once at startup:
+Ferrum offers three ways to train a generative model from raw text. All three
+are quantization-aware and all three share the same generation and file format.
 
-```rust
-ferrum_core::set_verbose(true);
-```
+| Method                          | Architecture                         | Tokenizer            | Best for                                  |
+|---------------------------------|--------------------------------------|----------------------|-------------------------------------------|
+| `GenerativeSLM::train`          | flat one-hot MLP                     | character-level      | the simplest possible baseline            |
+| `GenerativeSLM::train_embedded` | embedding + MLP                      | char or **BPE**      | small, fast models that beat one-hot size |
+| `GenerativeSLM::train_transformer` | causal multi-head Transformer     | char or **BPE**      | the highest quality on real text          |
 
-You get per-call shape logs, min/max/mean activation stats, dead-ReLU percentages,
-NaN/Inf detection, per-epoch loss/ETA, and attention-weight statistics. Overhead when
-off is a single atomic load per call site.
-
----
-
-## Testing
-
-```bash
-cargo test --workspace
-```
-
-The suite covers tensor/shape validation, every kernel against hand-computed values,
-analytic-vs-finite-difference gradient checks for the full backprop path, causal-mask
-enforcement, attention rows summing to 1, FINF round-trips for all layer types,
-corrupt/truncated-file handling, and an end-to-end train→generate→serialize→reload SLM
-pipeline.
+The `vocab_size` argument selects the tokenizer for the embedded and transformer
+paths: `0` is character-level, any value `>= 256` trains a byte-level BPE
+tokenizer of that size.
 
 ---
 
 ## Documentation
 
-- **[evaluation.md](evaluation.md)** — engineering evaluation: strengths, fixed defects, gaps, roadmap.
-- **[example.md](example.md)** — build your own SLM with Ferrum, step by step.
-- **[INSTALLATION.md](INSTALLATION.md)** / **[DEPLOYMENT.md](DEPLOYMENT.md)** — setup and hosting.
-- `docs/` — user guide, manual, FAQs.
+| Document                          | Contents                                            |
+|-----------------------------------|-----------------------------------------------------|
+| [installation.md](installation.md)| Build, install, and toolchain requirements          |
+| [howtouse.md](howtouse.md)        | CLI and library usage guide                          |
+| [example.md](example.md)          | End-to-end worked examples                           |
+| [usecases.md](usecases.md)        | Ten scenarios where Ferrum is a good fit            |
+| [evaluation.md](evaluation.md)    | How to measure quality, size, and speed             |
+| [deployment.md](deployment.md)    | Shipping models to edge, embedded, and WASM targets |
+| [docs/manual.md](docs/manual.md)  | Complete API and format reference                   |
+| [docs/user_guide.md](docs/user_guide.md) | Task-oriented walkthroughs                   |
+| [docs/how_to_use.md](docs/how_to_use.md) | Browser/WASM playground tutorial             |
+| [docs/FAQs.md](docs/FAQs.md)      | Frequently asked questions                          |
+| [status.md](status.md)            | Project status and roadmap                          |
+
+---
+
+## Building and testing
+
+```bash
+cargo build --workspace            # build everything
+cargo test  --workspace            # run all unit + integration tests
+cargo doc   -p ferrum_core --open  # browse the API docs
+```
+
+---
 
 ## License
 
-MIT OR Apache-2.0
+Licensed under either of **MIT** or **Apache-2.0** at your option.

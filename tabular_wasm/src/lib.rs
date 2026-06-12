@@ -320,8 +320,6 @@ mod tests {
         from_bytes, to_bytes, Embedding, LayerNorm, Linear, ModelMetadata, Net, Normalizer,
         Rng, TaskType, Tensor, TransformerBlock,
     };
-    use ferrum_core::activation::{Activation};
-    use ferrum_core::layer::ActivationLayer;
     use ferrum_core::model::Sequential;
 
     fn clf_bytes() -> Vec<u8> {
@@ -339,6 +337,7 @@ mod tests {
             target_range: [0.0, 2.0],
             input_dim: 4,
             output_dim: 3,
+            tokenizer_state: String::new(),
         };
         to_bytes(&model, &norm, &meta).unwrap()
     }
@@ -394,6 +393,7 @@ mod tests {
             target_range: [0.0, vocab_size as f32],
             input_dim: context_len,
             output_dim: vocab_size,
+            tokenizer_state: String::new(),
         };
         to_bytes(&model, &norm, &meta).unwrap()
     }

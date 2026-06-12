@@ -1,78 +1,100 @@
-# 🚀 Ferrum Workspace Deployment Guide
+# Deployment Guide
 
-This guide details how to deploy the interactive, WebAssembly-powered **Edge Generative AI Playgrounds** on static hosting services.
-
-Because the playgounds run 100% locally inside the client's browser (compiled to static WASM and JS files), they can be hosted for **free** on any static host with zero backend server overhead.
+A Ferrum model is a single self-contained `.bin` file (the FINF format): it
+carries its weights, normalizer, metadata, and — for BPE models — the tokenizer
+merge list. There is nothing else to ship. This guide covers the common targets.
 
 ---
 
-## 1. Decoupled Playgrounds Architecture
+## What you deploy
 
-Each playground is fully decoupled and lives in the repository that holds its code:
-- `/brand_alchemist/web/`
-- `/ambient_poet/web/`
-- `/shell_oracle/web/`
+| Artifact            | Produced by                          | Contains                                  |
+|---------------------|--------------------------------------|-------------------------------------------|
+| `model.bin`         | `slm_cli` / `train_cli` / `save()`   | Weights + normalizer + metadata + tokenizer |
+| A host binary       | `cargo build --release`              | Your app linked against `ferrum_core`     |
+| A WASM bundle       | `wasm-pack build` on `tabular_wasm`  | Browser-runnable model + bindings         |
 
-To compile the core WebAssembly engine (`tabular_wasm`) and automatically build, copy, and distribute all JS/WASM assets and trained `.bin` model files to each decoupled repository's `/web` folder, run:
+Because `ferrum_core` is `std`-only with zero dependencies, the host binary has
+nothing to vet or update at runtime.
+
+---
+
+## 1. Native CPU deployment (server, desktop, edge box)
+
+Build a release binary and copy it plus the model file to the target:
 
 ```bash
-# Compile and auto-distribute to all use-case repos
-bash scripts/build_wasm.sh
+cargo build --release -p slm_cli
+scp target/release/train_transformer model.bin user@host:/opt/ferrum/
+```
+
+On the target, generation needs only the two files:
+
+```bash
+/opt/ferrum/train_transformer generate /opt/ferrum/model.bin "prompt" --chars 200
+```
+
+To embed inference in your own service, depend on `ferrum_core` and call
+`GenerativeSLM::load` / `generate` directly — no model server required.
+
+---
+
+## 2. Embedded and resource-constrained targets
+
+Int8-quantized models are typically tens of kilobytes. For the smallest
+footprint:
+
+- Train with `save()` (int8 v5) rather than full-precision `to_bytes()`.
+- Prefer the `train_embedded` path with a modest BPE vocabulary.
+- Build with the workspace `release` profile (LTO, one codegen unit).
+
+The engine is single-threaded and allocation-light, with no driver or GPU
+dependency, which makes timing predictable on constrained hardware.
+
+---
+
+## 3. WebAssembly (in-browser inference)
+
+Build the `tabular_wasm` crate to `wasm32`:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install wasm-pack
+cd tabular_wasm
+wasm-pack build --release --target web
+```
+
+This produces a `pkg/` directory with the `.wasm` module and JS glue. Serve the
+`.wasm`, the JS bindings, and your `model.bin` from any **static** host — GitHub
+Pages, Netlify, S3, or a plain web server. No backend is needed: the model loads
+and runs entirely in the browser, and its embedded metadata lets the page build
+its own UI.
+
+A minimal load looks like:
+
+```js
+import init, { /* exported bindings */ } from "./pkg/tabular_wasm.js";
+await init();
+const bytes = new Uint8Array(await (await fetch("model.bin")).arrayBuffer());
+// …construct the model from bytes and run inference…
 ```
 
 ---
 
-## 2. Option A: GitHub Pages Deployment (Recommended)
+## 4. Air-gapped deployment
 
-You can publish the playground directly from your GitHub repository using GitHub Pages:
-
-### Manual Setup
-1. Commit the `web/` folder containing the compiled JS, WASM, and `.bin` dataset files to your master/main branch.
-2. Go to your repository settings on GitHub -> **Pages**.
-3. Under **Build and deployment**, select **Deploy from a branch**.
-4. Choose the `master` (or `main`) branch and select the `/ (root)` folder, then click **Save**. (GitHub Pages only offers `/ (root)` or `/docs` as publishing folders, so the playground is served under the `web/` sub-path.)
-
-Your playgrounds will be live in minutes at:
-`https://<your-username>.github.io/Ferrum/web/`
+Train on a connected machine, then transfer the single `model.bin` and the
+static host binary to the isolated environment by physical media. Nothing is
+fetched at runtime, so there are no network prerequisites and no dependency
+updates to manage in the field.
 
 ---
 
-## 3. Option B: Cloudflare Pages Deployment
+## 5. Versioning and compatibility
 
-Cloudflare Pages offers global CDN distribution and fast build pipelines:
-
-1. Log into the Cloudflare Dashboard and select **Workers & Pages**.
-2. Click **Create Application** -> **Pages** -> **Connect to Git**.
-3. Select your repository.
-4. Set the following build settings:
-   - **Framework preset**: None
-   - **Build command**: (Leave empty, or run `bash scripts/build_wasm.sh` if a Rust environment is present)
-   - **Build output directory**: `web`
-5. Click **Save and Deploy**.
-
----
-
-## 4. Option C: Self-Hosted Static Server
-
-Because the directory consists of purely static HTML, CSS, Javascript, WASM, and binary model assets, you can host it using Nginx, Apache, or simple node servers:
-
-### Nginx Configuration Example
-```nginx
-server {
-    listen 80;
-    server_name yourdomain.com;
-    root /var/www/ferrum/web;
-    index index.html;
-
-    # Correct mime-type headers for WASM binaries
-    location ~* \.wasm$ {
-        add_header Content-Type application/wasm;
-    }
-
-    # Cache configurations for static binary assets
-    location ~* \.(bin|wasm)$ {
-        expires 1y;
-        add_header Cache-Control "public, no-transform";
-    }
-}
-```
+- FINF **v4** holds full-precision f32 weights; **v5** adds per-tensor int8
+  quantization. The loader reads both transparently.
+- Models written before the tokenizer field still load: they default to
+  character-level tokenization (empty tokenizer state).
+- Pin a model to your app by shipping them together; the model file fully
+  determines the architecture, vocabulary, and tokenizer.

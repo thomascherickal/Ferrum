@@ -1,53 +1,104 @@
-# 🧬 Ferrum Developer User Guide
+# Ferrum Developer User Guide
 
-This guide is designed to help developers understand the core design, constraints, and architecture of **Ferrum** as a zero-dependency Edge AI library. 
-
----
-
-## 1. Zero-Dependency & Clean-Room Philosophy
-
-Ferrum is built strictly with Rust’s standard library (`std`). It uses:
-- **No external BLAS/LAPACK** for matrix operations.
-- **No PyTorch/ndarray bindings**.
-- **No OS-level bindings** in the core layer (allowing compilation to target environments like WebAssembly `wasm32-unknown-unknown` where libc, threads, or filesystem elements are absent).
-
-This design ensures that the entire code stack is:
-- **Fully Auditable**: Every mathematical kernel is hand-crafted and contained within a few files.
-- **Ultra-Lightweight**: Binary models load instantly and consume minimal memory, unlike massive neural network runtimes.
-- **Off-Grid Capable**: Perfect for systems where internet connections, API keys, or bulky LLM weights are unavailable or unacceptable.
+Task-oriented walkthroughs for common goals. Assumes you have built the
+workspace (see [installation.md](../installation.md)).
 
 ---
 
-## 2. Hand-Crafted MLP vs. Causal Transformer
+## Choosing a training path
 
-`ferrum_core` supports two distinct ML architectural formats:
-1. **Feedforward MLP (Multi-Layer Perceptron)**:
-   - High training efficiency and fast convergence on tabular and next-character sequence predicting tasks.
-   - Core of our standard training pipeline (DenseT layers, ReLU, Backpropagation).
-2. **Causal Transformer (Trainable + Inference)**:
-   - Contains token + positional `Embedding`, `LayerNorm`, and `TransformerBlock` layers.
-   - Implements **Decoder-Only Causal Multi-Head Self-Attention** with future-attention masking (`-1e9` for keys at indices larger than query indices).
-   - Trains **end-to-end** with the Adam optimizer via `GenerativeSLM::train_transformer` (or the lower-level `TransformerNet`), with full backpropagation through embeddings, attention, LayerNorm, and the FFN — verified by finite-difference gradient checks.
-   - Allows loading and executing small language models directly in the browser via WebAssembly, with KV-cached O(T)-per-token generation and full access to live attention weights for visualizations.
-   - Uses compact token-ID inputs (`input_dim = context_len`), so models stay small as the vocabulary grows.
+| You want…                                  | Use                               |
+|--------------------------------------------|-----------------------------------|
+| The simplest transparent baseline          | `GenerativeSLM::train` (one-hot)  |
+| A small, fast model that beats one-hot size | `GenerativeSLM::train_embedded`   |
+| The best quality on real text              | `GenerativeSLM::train_transformer`|
+| Tabular classification/regression          | the `train_cli` binary            |
 
----
-
-## 3. The Hex-Encoded Vocabulary Strategy
-
-When building generative Small Language Models (SLMs) from custom text datasets, using traditional comma-separated token representations breaks CSV parser integrity (special characters like commas `,`, quotes `"`, or newlines `\n` clash with file structures).
-
-To solve this, Ferrum implements a **Hex-Encoded Vocabulary** strategy:
-1. **Hexadecimal Translation**: Every character in the generative training text corpus is converted to its unique hexadecimal string representation (e.g. `'a'` -> `"61"`, `' '` -> `"20"`, `'\n'` -> `"0a"`).
-2. **Safe CSV Generation**: The training target inputs and labels are stored purely as clean hexadecimal alphanumeric strings that never break CSV formats.
-3. **Baked-In Metadata**: The unique vocabulary strings are baked directly into the `class_names` metadata array of the FINF v4 model binary file.
-4. **Self-Containment**: When the model is reloaded, it parses the vocabulary indices directly from the metadata back to their character representations, rendering the resulting `.bin` file **100% self-contained**!
+For the embedded and transformer paths, set `vocab_size = 0` for character-level
+or `>= 256` for byte-level BPE.
 
 ---
 
-## 4. Key Performance Guidelines
+## Train a BPE SLM and generate
 
-To maintain responsive, crash-free execution, verify your generative setups align with these guidelines:
-- **Vocabulary Size**: Keep the character vocabulary small ($\le 80$ characters). Larger vocabularies bloat the linear projection dimensions.
-- **Context Window**: A sliding context window of $4 - 6$ characters is highly optimal. Larger contexts require wider linear inputs.
-- **Corpus Dimension**: Keep raw text corpora small ($\le 50$ KB) to ensure training converges cleanly on the CPU in under a minute.
+```rust
+use ferrum_core::{GenerativeSLM, Rng};
+
+let corpus = std::fs::read_to_string("corpus.txt").unwrap();
+let mut rng = Rng::new(1337);
+
+let slm = GenerativeSLM::train_transformer(
+    &corpus, 16, 32, 4, 2, 64, 200, 0.01, 16, 512, &mut rng,
+).unwrap();
+
+slm.save("model.bin").unwrap();
+println!("{}", slm.generate("Once upon a time", 200, 0.7, &mut rng).unwrap());
+```
+
+---
+
+## Watch training progress
+
+```rust
+let slm = GenerativeSLM::train_transformer_with_callback(
+    &corpus, 16, 32, 4, 2, 64, 200, 0.01, 16, 512, &mut rng,
+    |epoch, loss| if epoch % 10 == 0 { println!("epoch {epoch}: {loss:.4}") },
+).unwrap();
+```
+
+---
+
+## Cache a model on disk
+
+`load_or_train` trains and saves the first time, then loads on subsequent runs:
+
+```rust
+use ferrum_core::{GenerativeSLM, Rng, TransformerConfig};
+
+let cfg = TransformerConfig::default();      // BPE vocab 512
+let mut rng = Rng::new(1337);
+let (slm, was_loaded) =
+    GenerativeSLM::load_or_train("model.bin", &corpus, &cfg, &mut rng, |_, _| {}).unwrap();
+println!("loaded from disk: {was_loaded}");
+```
+
+---
+
+## Shrink a model with int8
+
+```rust
+let full  = slm.to_bytes().unwrap().len();
+let quant = slm.to_bytes_quantized().unwrap().len();
+println!("{full} → {quant} bytes");   // roughly 4× smaller
+```
+
+`save()` already writes the int8 file. Quantization-aware training keeps the int8
+model close to the f32 model.
+
+---
+
+## Work with the tokenizer directly
+
+```rust
+use ferrum_core::ByteBpeTokenizer;
+
+let tok = ByteBpeTokenizer::train(&corpus, 512).unwrap();
+let ids = tok.encode("some text");
+let text = tok.decode(&ids);
+let state = tok.encode_state();            // store this string
+let same = ByteBpeTokenizer::from_state(&state).unwrap();
+```
+
+---
+
+## Common pitfalls
+
+- **Corpus too short for the context window.** Both tokenizers require more than
+  `context_len` tokens. BPE compresses text, so a heavily repetitive corpus can
+  fall below the threshold even when it has many characters — use a longer or
+  more varied corpus, a smaller `context_len`, or a smaller `vocab_size`.
+- **`vocab_size` between 1 and 255.** Rejected: the 256-byte base vocabulary is
+  irreducible. Use `0` (character-level) or `>= 256` (BPE).
+- **`embed_dim` not divisible by `num_heads`.** Multi-head attention requires it.
+- **Seed shorter than the context window.** Fine for BPE (left-padded), but
+  character-level generation needs at least `context_len` characters of seed.

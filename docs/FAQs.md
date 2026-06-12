@@ -1,45 +1,77 @@
-# 🧬 Ferrum Edge AI FAQs
+# Ferrum FAQs
 
-Clear, honest answers to common technical questions, constraints, and architecture considerations when using the Ferrum library.
+Honest answers to common questions about scope, constraints, and design.
 
----
+### What is Ferrum?
 
-## 1. What are the context length constraints of this model?
+A zero-dependency, pure-Rust engine for building, training, and running small
+causal Transformers, Small Language Models, and classical MLPs on the CPU. It is
+`std`-only and `#![forbid(unsafe_code)]`, and it compiles to native binaries and
+to WebAssembly.
 
-Because Ferrum trains next-character prediction models using standard MLPs (Multi-Layer Perceptrons) in the core backpropagation trainer:
-- **Optimal Context Length**: $4 - 6$ characters.
-- **Why?**: The inputs are flat-concatenated. The input dimension of the first linear layer equals $N \times d$ (context length times embedding dimension). Increasing the context to 100+ characters with even a modest embedding dimension causes a parameter explosion in the first layer, slowing CPU training and causing model convergence to fail.
-- **For larger contexts**: Use the causal Transformer path (`GenerativeSLM::train_transformer`), which trains end-to-end with Adam and uses compact token-ID inputs (`input_dim = context_len`), scaling much better for sequence context lengths of $16 - 128$ tokens.
+### Does it need a GPU?
 
----
+No. Everything runs single-threaded on the CPU. Models are small by design.
 
-## 2. Can I run Gemma, Llama, or GPT-4 weights with this library?
+### What external dependencies does it have?
 
-**No.**
-- **Architectural Constraints**: Modern Large Language Models (LLMs) require billions of parameters, Rotary Positional Embeddings (RoPE), Multi-Query/Grouped-Query Attention (MQA/GQA), and custom KV-caches. Ferrum is optimized for ultra-lightweight, zero-dependency small models ($15,000 - 40,000$ parameters) running directly on the client's CPU thread.
-- **Compute Constraints**: A billion-parameter model requires gigabytes of memory bandwidth. Running a massive model on standard single-threaded CPU WebAssembly will freeze the browser tab and trigger out-of-memory errors instantly.
+The engine (`ferrum_core`) and both CLIs have **none**. Only `tabular_wasm`
+depends on `wasm-bindgen` for browser bindings.
 
----
+### What is the byte-level BPE tokenizer, and why does it matter?
 
-## 3. Why is my generated text repeating or degenerating into character soup?
+`ByteBpeTokenizer` learns subword merges over the 256 base byte values. Because
+the base vocabulary is the full byte range, any UTF-8 text — emoji, Cyrillic,
+CJK, control characters — round-trips with no unknown-token escape hatch. Subword
+tokens also let a fixed context window cover more text than character tokens.
 
-This is a physical limitation of small models and naive character-level sequence modeling. If your model gets stuck in repetitive loops:
-- **Adjust the Temperature**: A temperature value that is too low ($T < 0.05$) makes predictions completely deterministic, leading the model to get stuck in repeating cycles. Increase the temperature to $0.15 - 0.30$ to add random variance.
-- **Verify Loss Convergence**: Make sure you trained the model for enough epochs. If training loss remains high ($> 2.0$), the model has not converged and will output random character sequences.
+### How do I choose between character-level and BPE?
 
----
+Set `vocab_size` (the `--vocab` flag): `0` is character-level, any value `>= 256`
+trains a BPE tokenizer of that size. BPE usually wins on longer, varied,
+multilingual text; character-level is simplest and most transparent. Values
+between 1 and 255 are rejected because the byte base is irreducible.
 
-## 4. Does the WASM compiler support SIMD or multi-threading?
+### Is BPE compatible with quantization-aware training?
 
-Currently, the WebAssembly bindings compile to `wasm32-unknown-unknown` without WASM-SIMD autovectorization or threads:
-- **Single-Threaded**: This keeps execution completely robust and portable across all modern browsers (including legacy mobile browsers) without requiring HTTP headers for SharedArrayBuffer (Cross-Origin Opener Policy).
-- **Fast Execution**: Because the models are tiny ($~25$ KB), a single-threaded CPU WASM pass takes less than **2 milliseconds**, making SIMD acceleration unnecessary.
+Yes. Tokenization only changes the token stream and vocabulary size; QAT operates
+on the network weights and is unaffected. BPE models are trained int8-aware and
+saved as int8 FINF v5 exactly like character-level models.
 
----
+### Where does the tokenizer live after training?
 
-## 5. How do I add support for a completely new language or special symbols?
+Inside the model file. Its merge list is serialized into the FINF metadata
+(`tokenizer_state`), so a loaded model tokenizes and generates exactly as it did
+before saving. No separate vocabulary file is needed.
 
-The **Hex-Encoded Vocabulary** strategy handles all characters automatically:
-- Simply include your symbols, emojis, or Cyrillic/Asian characters directly in the text corpus.
-- The `GenerativeSLM` dataset builder translates every unique character to its matching hexadecimal string representation.
-- The model will learn and predict these symbols cleanly, and the WASM/JS engine will decode the hex back to standard Unicode characters.
+### Will my old models still load?
+
+Yes. Files written before the tokenizer field load unchanged and default to
+character-level tokenization.
+
+### How big are the models?
+
+Int8-quantized models are typically tens of kilobytes. QAT makes them roughly 4×
+smaller than full-precision while behaving almost identically.
+
+### Does `--chars` count characters or tokens for BPE models?
+
+Characters. Generation runs over subword tokens internally but the output is the
+seed plus exactly `--chars` new characters (unless cut short).
+
+### Why did training fail with "corpus must be longer than the context window"?
+
+The tokenized corpus had too few tokens. BPE compresses text, so a short or
+highly repetitive corpus can fall below `context_len + 1` tokens even with many
+characters. Use a longer/more varied corpus, a smaller `--context`, or a smaller
+`--vocab`.
+
+### Is it deterministic?
+
+Yes — training, BPE merge learning, and generation are all deterministic for a
+fixed seed and configuration.
+
+### What can it not do?
+
+It is not a drop-in replacement for large GPU-trained LLMs. It targets small,
+self-contained, CPU-friendly models for edge, embedded, browser, and offline use.

@@ -1,111 +1,106 @@
-# 🧬 How-To-Use Tutorial: Building Custom Edge SLMs
+# Tutorial: Building a Custom Edge SLM
 
-This tutorial walks you through training a custom Causal Small Language Model (SLM) on your own raw text dataset, exporting the model to a standalone `.bin` file, and integrating it into an interactive browser-side WASM playground.
-
----
-
-## Step 1: Prepare Your Custom Corpus
-
-Your corpus should be a raw text file containing the domain style you want the edge model to replicate (e.g. fantasy planet names, code snippets, chord progressions). Keep the corpus under **20 KB** for fast CPU training convergence.
-
-Create a parent folder structure and a raw text corpus:
-```rust
-// my_slm/src/main.rs
-const CORPUS: &str = "\
-valinor: deep green elven forests
-gondor: white stone towers
-rohan: grassy green fields
-mordor: red volcanic ash
-";
-```
+This tutorial trains a custom causal Small Language Model on your own text,
+exports it to a standalone `.bin` file, and shows how to run it natively or in
+the browser. It complements the concise reference in
+[../howtouse.md](../howtouse.md).
 
 ---
 
-## Step 2: Write Your Training script
+## Step 1 — Prepare a corpus
 
-Use the unified `GenerativeSLM` library module from `ferrum_core` to compile your dataset and train the neural network in just a few lines of code:
+Any UTF-8 text file works — documentation, logs, dialogue, code. The richer and
+longer the corpus, the better the model. Save it as `corpus.txt`.
 
-```rust
-use ferrum_core::{slm::GenerativeSLM, Rng};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut rng = Rng::new(42);
-    let context_len = 4; // Sliding character-level context
-    let hidden_size = 64;
-    let epochs = 300;
-
-    println!("Training custom Generative SLM...");
-    let slm = GenerativeSLM::train(
-        CORPUS,
-        context_len,
-        hidden_size,
-        epochs,
-        0.08, // learning rate
-        0.9,  // SGD momentum
-        16,   // minibatch size
-        &mut rng,
-    )?;
-
-    // Export to standalone binary format
-    let model_path = "fantasy_world.bin";
-    let bytes = slm.to_bytes()?;
-    std::fs::write(model_path, &bytes)?;
-    println!("Saved self-contained model to {model_path}!");
-    
-    Ok(())
-}
-```
-
-Compile and run your script:
 ```bash
-cargo run --release
+cat > corpus.txt <<'EOF'
+the quick brown fox jumps over the lazy dog while the calm river flows past
+green hills and quiet villages. travelers walk along the winding road, telling
+stories of distant lands and the slow turning of the seasons.
+EOF
 ```
 
 ---
 
-## Step 3: Integrate with the WASM Web Playground
+## Step 2 — Train with byte-level BPE
 
-To run your custom model directly in the browser via WebAssembly:
-
-1. **Host Directory Structure**: Create a dedicated subdirectory in your hosted web workspace:
-   ```bash
-   mkdir -p web/datasets/fantasy_world/
-   cp fantasy_world.bin web/datasets/fantasy_world/model.bin
-   ```
-
-2. **Load inside Javascript**: Import our universal WASM loader and start streaming predictions autoregressively:
-
-```html
-<!-- index.html -->
-<script type="module">
-    import { loadModel, generateAutoregressive } from '../shared/engine.js';
-
-    async function runGenerator() {
-        // Load WASM and fetch model.bin
-        const slm = await loadModel('../datasets/fantasy_world/model.bin');
-        
-        const seed = "vali";
-        console.log(`Seed prompt: [${seed}]`);
-
-        // Generate 30 characters autoregressively
-        await generateAutoregressive(
-            slm,
-            seed,
-            30,
-            0.15, // temperature
-            (nextChar) => {
-                // Stream character to a DOM element
-                document.getElementById('output').textContent += nextChar;
-            }
-        );
-    }
-    
-    runGenerator();
-</script>
+```bash
+cargo run -p slm_cli -- train corpus.txt model.bin \
+    --vocab 320 --context 12 --embed 32 --heads 4 --blocks 2 --epochs 200
 ```
 
-3. **Serve**: Start a local web server to check your web implementation:
-   ```bash
-   python3 -m http.server 8080 --directory web
-   # Open browser at http://localhost:8080
-   ```
+- `--vocab 320` trains a byte-level BPE tokenizer (256 byte tokens + up to 64
+  merges) and embeds it in the model. Use `--vocab 0` for character-level.
+- Training is int8 quantization-aware, so the saved file is small and faithful.
+- The model file is cached: re-running `train` loads it instead of retraining
+  unless you pass `--force`.
+
+---
+
+## Step 3 — Inspect the model
+
+```bash
+cargo run -p slm_cli -- info model.bin
+```
+
+```text
+Format    : FINF v5 (int8-quantized)
+Task      : TransformerSLM
+Input dim : 12
+Output dim: …
+Tokenizer : byte-level BPE (… tokens, … merges)
+Layers    : …
+```
+
+---
+
+## Step 4 — Generate text
+
+```bash
+cargo run -p slm_cli -- generate model.bin "the quick brown" --chars 200 --temp 0.7
+```
+
+Lower `--temp` makes generation greedier and more repetitive; higher values add
+variety. The output always begins with your seed and adds exactly `--chars`
+characters (unless generation is cut short).
+
+---
+
+## Step 5 — Run it from Rust
+
+```rust
+use ferrum_core::{GenerativeSLM, Rng};
+
+let slm = GenerativeSLM::load("model.bin").unwrap();
+let mut rng = Rng::new(7);
+println!("{}", slm.generate("the quick brown", 200, 0.7, &mut rng).unwrap());
+```
+
+The loaded model carries its own tokenizer, so no separate vocabulary file is
+needed.
+
+---
+
+## Step 6 — Run it in the browser (WASM)
+
+Build the `tabular_wasm` bindings and host the `.wasm`, JS glue, and `model.bin`
+on any static server:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install wasm-pack
+cd tabular_wasm
+wasm-pack build --release --target web
+```
+
+See [../deployment.md](../deployment.md) for hosting details. Because the model
+file embeds its own metadata and tokenizer, the page needs nothing else to run
+inference entirely client-side.
+
+---
+
+## Next steps
+
+- Compare BPE against character-level (`--vocab 0`) on the same corpus.
+- Try the smaller `train_embedded` path from the library for tighter models.
+- Measure size and quality with the [evaluation guide](../evaluation.md).

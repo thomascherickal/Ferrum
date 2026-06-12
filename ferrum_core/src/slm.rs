@@ -8,8 +8,53 @@ use crate::train_transformer::{train_transformer_epoch, TransformerNet};
 use crate::model::Sequential;
 use crate::loader::{to_bytes, from_bytes};
 use crate::tensor::Tensor;
+use crate::tokenizer::ByteBpeTokenizer;
 use crate::verbose;
 use std::collections::HashSet;
+
+/// Hyperparameters for training a causal transformer SLM.
+///
+/// Used by [`GenerativeSLM::train_transformer_config`] and
+/// [`GenerativeSLM::load_or_train`]. `Default` matches the CLI defaults.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TransformerConfig {
+    /// Context window in characters.
+    pub context_len: usize,
+    /// Embedding dimension (must be divisible by `num_heads`).
+    pub embed_dim: usize,
+    /// Attention heads per block.
+    pub num_heads: usize,
+    /// Number of transformer blocks.
+    pub num_blocks: usize,
+    /// FFN hidden width.
+    pub hidden_dim: usize,
+    /// Training epochs.
+    pub epochs: usize,
+    /// Adam learning rate.
+    pub lr: f32,
+    /// Minibatch size (sequences per step).
+    pub batch_size: usize,
+    /// Byte-level BPE target vocabulary size. `0` selects character-level
+    /// tokenization (legacy behaviour); any value `>= 256` trains a BPE
+    /// tokenizer of that size and stores it inside the model.
+    pub vocab_size: usize,
+}
+
+impl Default for TransformerConfig {
+    fn default() -> Self {
+        Self {
+            context_len: 16,
+            embed_dim: 32,
+            num_heads: 4,
+            num_blocks: 2,
+            hidden_dim: 64,
+            epochs: 100,
+            lr: 0.01,
+            batch_size: 16,
+            vocab_size: 512,
+        }
+    }
+}
 
 /// Unified Causal Small Language Model (SLM) for off-grid edge generative AI.
 pub struct GenerativeSLM {
@@ -103,8 +148,9 @@ impl GenerativeSLM {
         let x_train = norm.transform(&x_raw)?;
         vprintln!("[slm::train] Normalizer applied, x_train shape={:?}", x_train.shape);
 
-        vprintln!("[slm::train] Creating trainable MLP...");
+        vprintln!("[slm::train] Creating trainable MLP (QAT enabled)...");
         let mut net = Net::mlp(ds.num_features, hidden_size, ds.num_classes, rng);
+        net.set_qat(true);
         let opt = Sgd::with_momentum(lr, momentum);
         vprintln!("[slm::train] Network: {} params, optimizer: lr={}, momentum={}",
             net.num_params(), lr, momentum);
@@ -161,6 +207,8 @@ impl GenerativeSLM {
             target_range: ds.target_range,
             input_dim: ds.num_features,
             output_dim: ds.num_classes,
+            // One-hot MLP path is always character-level (no BPE tokenizer).
+            tokenizer_state: String::new(),
         };
         vprintln!("[slm::train] Metadata: input_dim={}, output_dim={}, vocab={}",
             meta.input_dim, meta.output_dim, meta.class_names.len());
@@ -175,6 +223,10 @@ impl GenerativeSLM {
     /// blocks, and an LM head end-to-end with Adam, using next-token loss at
     /// every position. The exported model serializes to FINF v4 and runs in
     /// WASM via `TransformerSLMModel` (including KV-cached generation).
+    ///
+    /// `vocab_size` selects the tokenizer: `0` is character-level (the corpus's
+    /// sorted character set), and any value `>= 256` trains a byte-level BPE
+    /// tokenizer of that size whose merge list is stored inside the model.
     #[allow(clippy::too_many_arguments)]
     pub fn train_transformer(
         corpus: &str,
@@ -186,11 +238,12 @@ impl GenerativeSLM {
         epochs: usize,
         lr: f32,
         batch_size: usize,
+        vocab_size: usize,
         rng: &mut Rng,
     ) -> Result<Self> {
         Self::train_transformer_with_callback(
             corpus, context_len, embed_dim, num_heads, num_blocks, hidden_dim,
-            epochs, lr, batch_size, rng, |_, _| {},
+            epochs, lr, batch_size, vocab_size, rng, |_, _| {},
         )
     }
 
@@ -206,41 +259,44 @@ impl GenerativeSLM {
         epochs: usize,
         lr: f32,
         batch_size: usize,
+        vocab_size: usize,
         rng: &mut Rng,
         mut progress_callback: F,
     ) -> Result<Self>
     where
         F: FnMut(usize, f32),
     {
-        let (vocab_vec, tokens) = tokenize_corpus(corpus, context_len)?;
-        let vocab_size = vocab_vec.len();
-        vprintln!("[slm::train_transformer] corpus={} chars, vocab={}, ctx={}, dim={}, heads={}, blocks={}, hidden={}",
-            tokens.len(), vocab_size, context_len, embed_dim, num_heads, num_blocks, hidden_dim);
+        let tc = tokenize_for_lm(corpus, context_len, vocab_size)?;
+        let model_vocab = tc.vocab_size;
+        vprintln!("[slm::train_transformer] corpus={} chars, vocab={}, bpe={}, ctx={}, dim={}, heads={}, blocks={}, hidden={}",
+            tc.tokens.len(), model_vocab, !tc.tokenizer_state.is_empty(),
+            context_len, embed_dim, num_heads, num_blocks, hidden_dim);
 
         let mut net = TransformerNet::new(
-            vocab_size, context_len, embed_dim, num_heads, hidden_dim, num_blocks, rng,
+            model_vocab, context_len, embed_dim, num_heads, hidden_dim, num_blocks, rng,
         )?;
-        vprintln!("[slm::train_transformer] {} params, Adam lr={}", net.num_params(), lr);
+        net.set_qat(true);
+        vprintln!("[slm::train_transformer] {} params, Adam lr={}, QAT=int8", net.num_params(), lr);
 
         let adam = Adam::new(lr);
         for ep in 1..=epochs {
-            let loss = train_transformer_epoch(&mut net, &tokens, batch_size, &adam, rng)?;
+            let loss = train_transformer_epoch(&mut net, &tc.tokens, batch_size, &adam, rng)?;
             vprintln!("[slm::train_transformer] epoch {}/{}: loss={:.6}", ep, epochs, loss);
             progress_callback(ep, loss);
         }
 
         let model = net.to_inference()?;
-        let class_names: Vec<String> = vocab_vec.iter().map(|&ch| char_to_hex(ch)).collect();
         let meta = ModelMetadata {
             dataset_name: "GenerativeSLM Transformer".into(),
             task: TaskType::TransformerSLM,
             feature_names: (0..context_len).map(|i| format!("c_{i}")).collect(),
-            feature_ranges: vec![[0.0, vocab_size as f32]; context_len],
-            class_names,
+            feature_ranges: vec![[0.0, model_vocab as f32]; context_len],
+            class_names: tc.class_names,
             target_name: "next_char".into(),
-            target_range: [0.0, vocab_size as f32],
+            target_range: [0.0, model_vocab as f32],
             input_dim: context_len,
-            output_dim: vocab_size,
+            output_dim: model_vocab,
+            tokenizer_state: tc.tokenizer_state,
         };
         let norm = Normalizer { means: vec![], stds: vec![] };
         Ok(Self { model, norm, meta })
@@ -253,6 +309,10 @@ impl GenerativeSLM {
     /// learned embedding table, so model size no longer scales with the
     /// vocabulary squared. Inputs at inference are token IDs
     /// (`input_dim = context_len`), the same contract as the transformer path.
+    ///
+    /// `vocab_size` selects the tokenizer exactly as in
+    /// [`GenerativeSLM::train_transformer`]: `0` is character-level, `>= 256`
+    /// trains and embeds a byte-level BPE tokenizer.
     #[allow(clippy::too_many_arguments)]
     pub fn train_embedded(
         corpus: &str,
@@ -263,11 +323,12 @@ impl GenerativeSLM {
         lr: f32,
         momentum: f32,
         batch_size: usize,
+        vocab_size: usize,
         rng: &mut Rng,
     ) -> Result<Self> {
         Self::train_embedded_with_callback(
             corpus, context_len, embed_dim, hidden_size, epochs, lr, momentum,
-            batch_size, rng, |_, _| {},
+            batch_size, vocab_size, rng, |_, _| {},
         )
     }
 
@@ -282,30 +343,33 @@ impl GenerativeSLM {
         lr: f32,
         momentum: f32,
         batch_size: usize,
+        vocab_size: usize,
         rng: &mut Rng,
         mut progress_callback: F,
     ) -> Result<Self>
     where
         F: FnMut(usize, f32),
     {
-        let (vocab_vec, tokens) = tokenize_corpus(corpus, context_len)?;
-        let vocab_size = vocab_vec.len();
-        let n_windows = tokens.len() - context_len;
-        vprintln!("[slm::train_embedded] corpus={} chars, vocab={}, ctx={}, E={}, hidden={}, windows={}",
-            tokens.len(), vocab_size, context_len, embed_dim, hidden_size, n_windows);
+        let tc = tokenize_for_lm(corpus, context_len, vocab_size)?;
+        let model_vocab = tc.vocab_size;
+        let n_windows = tc.tokens.len() - context_len;
+        vprintln!("[slm::train_embedded] corpus={} chars, vocab={}, bpe={}, ctx={}, E={}, hidden={}, windows={}",
+            tc.tokens.len(), model_vocab, !tc.tokenizer_state.is_empty(),
+            context_len, embed_dim, hidden_size, n_windows);
 
         // Sliding windows of token IDs — no CSV round-trip needed.
         let mut x_data = Vec::with_capacity(n_windows * context_len);
         let mut y = Vec::with_capacity(n_windows);
         for i in 0..n_windows {
-            x_data.extend(tokens[i..i + context_len].iter().map(|&t| t as f32));
-            y.push(tokens[i + context_len]);
+            x_data.extend(tc.tokens[i..i + context_len].iter().map(|&t| t as f32));
+            y.push(tc.tokens[i + context_len]);
         }
         let x = Tensor::matrix(n_windows, context_len, x_data)?;
 
         let mut net = Net::embedding_mlp(
-            vocab_size, context_len, embed_dim, hidden_size, vocab_size, rng,
+            model_vocab, context_len, embed_dim, hidden_size, model_vocab, rng,
         );
+        net.set_qat(true);
         let opt = Sgd::with_momentum(lr, momentum);
         vprintln!("[slm::train_embedded] {} params, SGD lr={}, momentum={}",
             net.num_params(), lr, momentum);
@@ -317,19 +381,19 @@ impl GenerativeSLM {
         }
 
         let model = net.to_inference_task(TaskType::Classification)?;
-        let class_names: Vec<String> = vocab_vec.iter().map(|&ch| char_to_hex(ch)).collect();
         // task = TransformerSLM marks the token-ID input contract (the family
         // flag `generate` keys on), independent of the internal architecture.
         let meta = ModelMetadata {
             dataset_name: "GenerativeSLM Embedded".into(),
             task: TaskType::TransformerSLM,
             feature_names: (0..context_len).map(|i| format!("c_{i}")).collect(),
-            feature_ranges: vec![[0.0, vocab_size as f32]; context_len],
-            class_names,
+            feature_ranges: vec![[0.0, model_vocab as f32]; context_len],
+            class_names: tc.class_names,
             target_name: "next_char".into(),
-            target_range: [0.0, vocab_size as f32],
+            target_range: [0.0, model_vocab as f32],
             input_dim: context_len,
-            output_dim: vocab_size,
+            output_dim: model_vocab,
+            tokenizer_state: tc.tokenizer_state,
         };
         let norm = Normalizer { means: vec![], stds: vec![] };
         Ok(Self { model, norm, meta })
@@ -351,6 +415,79 @@ impl GenerativeSLM {
         Ok(bytes)
     }
 
+    /// [`GenerativeSLM::train_transformer_with_callback`] driven by a
+    /// [`TransformerConfig`]. Training is int8 quantization-aware (QAT).
+    pub fn train_transformer_config<F>(
+        corpus: &str,
+        cfg: &TransformerConfig,
+        rng: &mut Rng,
+        progress_callback: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(usize, f32),
+    {
+        Self::train_transformer_with_callback(
+            corpus,
+            cfg.context_len,
+            cfg.embed_dim,
+            cfg.num_heads,
+            cfg.num_blocks,
+            cfg.hidden_dim,
+            cfg.epochs,
+            cfg.lr,
+            cfg.batch_size,
+            cfg.vocab_size,
+            rng,
+            progress_callback,
+        )
+    }
+
+    /// Save the trained model to `model_path` as int8-quantized FINF v5
+    /// (the default on-disk format — ≈4× smaller than f32). Parent
+    /// directories are created as needed.
+    pub fn save(&self, model_path: &str) -> Result<()> {
+        let bytes = self.to_bytes_quantized()?;
+        if let Some(parent) = std::path::Path::new(model_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        std::fs::write(model_path, &bytes)?;
+        vprintln!("[slm::GenerativeSLM::save] Wrote {} bytes → {}", bytes.len(), model_path);
+        Ok(())
+    }
+
+    /// Load a previously saved model (FINF v4 or v5) from `model_path`.
+    pub fn load(model_path: &str) -> Result<Self> {
+        let bytes = std::fs::read(model_path)?;
+        Self::from_bytes(&bytes)
+    }
+
+    /// Load the model from `model_path` if it exists; otherwise train a
+    /// transformer SLM on `corpus` with `cfg` (QAT, int8), save it to
+    /// `model_path`, and return it.
+    ///
+    /// The returned `bool` is `true` when the model was loaded from disk
+    /// (no training happened) and `false` when it was freshly trained.
+    pub fn load_or_train<F>(
+        model_path: &str,
+        corpus: &str,
+        cfg: &TransformerConfig,
+        rng: &mut Rng,
+        progress_callback: F,
+    ) -> Result<(Self, bool)>
+    where
+        F: FnMut(usize, f32),
+    {
+        if std::path::Path::new(model_path).exists() {
+            vprintln!("[slm::load_or_train] Found {} — loading instead of retraining", model_path);
+            return Ok((Self::load(model_path)?, true));
+        }
+        let slm = Self::train_transformer_config(corpus, cfg, rng, progress_callback)?;
+        slm.save(model_path)?;
+        Ok((slm, false))
+    }
+
     /// Load a trained Generative SLM model from self-contained FINF v4 bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         vprintln!("[slm::GenerativeSLM::from_bytes] Deserializing from {} bytes...", bytes.len());
@@ -361,9 +498,19 @@ impl GenerativeSLM {
     }
 
     /// Autoregressively generate next-character sequence completions from a seed text.
+    ///
+    /// For BPE models (`meta.tokenizer_state` non-empty) generation runs over
+    /// subword tokens but `num_chars` still counts **characters**: the output is
+    /// `seed` followed by exactly `num_chars` newly generated characters
+    /// (fewer only if generation is cut short). Character-level models keep the
+    /// original per-character behaviour.
     pub fn generate(&self, seed: &str, num_chars: usize, temp: f32, rng: &mut Rng) -> Result<String> {
         vprintln!("[slm::GenerativeSLM::generate] seed=\"{}\", num_chars={}, temp={:.2}",
             seed.chars().take(50).collect::<String>(), num_chars, temp);
+
+        if !self.meta.tokenizer_state.is_empty() {
+            return self.generate_bpe(seed, num_chars, temp, rng);
+        }
 
         let mut generated = seed.to_string();
         let vocab_size = self.meta.output_dim;
@@ -440,6 +587,58 @@ impl GenerativeSLM {
         vprintln!("[slm::generate] Generated {} total chars", generated.len());
         Ok(generated)
     }
+
+    /// BPE generation path. Rebuilds the stored [`ByteBpeTokenizer`], encodes
+    /// the seed to token IDs, samples one token at a time from the model
+    /// (always feeding the last `context_len` tokens, left-padded with token 0
+    /// when the prompt is shorter than the window), and decodes the whole token
+    /// stream back to text. Generation continues until at least `num_chars`
+    /// characters have been added past the seed, then the result is trimmed to
+    /// exactly that length so the character contract matches the char-level path.
+    fn generate_bpe(&self, seed: &str, num_chars: usize, temp: f32, rng: &mut Rng) -> Result<String> {
+        let tok = ByteBpeTokenizer::from_state(&self.meta.tokenizer_state)?;
+        let context_len = self.meta.input_dim;
+        let seed_chars = seed.chars().count();
+        let target_chars = seed_chars + num_chars;
+
+        let mut ids: Vec<usize> = tok.encode(seed);
+        vprintln!("[slm::generate_bpe] seed encoded to {} tokens, ctx={}, target_chars={}",
+            ids.len(), context_len, target_chars);
+
+        // Bound the loop: every step adds ≥1 byte, but guard against a model
+        // that keeps emitting zero-width or repeated control tokens.
+        let max_steps = num_chars * 8 + 64;
+        let mut steps = 0;
+        while tok.decode(&ids).chars().count() < target_chars && steps < max_steps {
+            // Last `context_len` tokens, left-padded with token 0 if too short.
+            let mut ctx: Vec<f32> = Vec::with_capacity(context_len);
+            if ids.len() < context_len {
+                ctx.resize(context_len - ids.len(), 0.0);
+                ctx.extend(ids.iter().map(|&t| t as f32));
+            } else {
+                ctx.extend(ids[ids.len() - context_len..].iter().map(|&t| t as f32));
+            }
+            let input = Tensor::matrix(1, context_len, ctx)?;
+            let out = self.model.forward(&input)?;
+            let (rows, cols) = out.matrix_dims()?;
+            // The model ends in Softmax; convert the last row's probabilities
+            // back to log-space so temperature scaling behaves correctly.
+            let logits: Vec<f32> = out.data[(rows - 1) * cols..]
+                .iter()
+                .map(|&p| p.max(1e-12).ln())
+                .collect();
+            let next = sample_from_logits(&logits, temp, rng);
+            ids.push(next);
+            steps += 1;
+        }
+
+        // Decode the full token stream, then keep seed + num_chars characters.
+        let full = tok.decode(&ids);
+        let trimmed: String = full.chars().take(target_chars).collect();
+        vprintln!("[slm::generate_bpe] generated {} tokens → {} chars (trimmed to {})",
+            ids.len(), full.chars().count(), trimmed.chars().count());
+        Ok(trimmed)
+    }
 }
 
 /// Translates a character into its exact lowercase hex-string representation.
@@ -462,6 +661,57 @@ pub fn corpus_vocab(corpus: &str) -> Vec<char> {
     let mut vocab_vec: Vec<char> = vocab.into_iter().collect();
     vocab_vec.sort();
     vocab_vec
+}
+
+/// Everything the token-ID language-model paths need to size a network and
+/// describe it in metadata, produced by [`tokenize_for_lm`].
+struct LmTokens {
+    /// Token-ID stream over the whole corpus.
+    tokens: Vec<usize>,
+    /// Number of distinct token IDs to embed and predict (the model's
+    /// embedding rows and LM-head width).
+    vocab_size: usize,
+    /// Per-class hex code-point names for character-level models; empty for BPE
+    /// (where decoding goes through the stored tokenizer instead).
+    class_names: Vec<String>,
+    /// Serialized BPE merge list; empty for character-level models.
+    tokenizer_state: String,
+}
+
+/// Tokenize `corpus` for the transformer / embedded language-model paths.
+///
+/// `vocab_size == 0` selects character-level tokenization (the sorted corpus
+/// vocabulary, identical to [`tokenize_corpus`]). `vocab_size >= 256` trains a
+/// byte-level [`ByteBpeTokenizer`] of that target size and encodes the corpus
+/// with it, so the same trainer, QAT, and FINF serialization work unchanged on
+/// subword tokens. Values in `1..256` are rejected (the 256-byte base
+/// vocabulary is irreducible).
+fn tokenize_for_lm(corpus: &str, context_len: usize, vocab_size: usize) -> Result<LmTokens> {
+    if vocab_size == 0 {
+        let (vocab_vec, tokens) = tokenize_corpus(corpus, context_len)?;
+        let class_names = vocab_vec.iter().map(|&ch| char_to_hex(ch)).collect();
+        return Ok(LmTokens {
+            vocab_size: vocab_vec.len(),
+            tokens,
+            class_names,
+            tokenizer_state: String::new(),
+        });
+    }
+    let tok = ByteBpeTokenizer::train(corpus, vocab_size)?;
+    let tokens = tok.encode(corpus);
+    if tokens.len() < context_len + 1 {
+        return Err(InferError::DimMismatch(
+            "BPE-tokenized corpus must be longer than the context window".into(),
+        ));
+    }
+    vprintln!("[slm::tokenize_for_lm] BPE: target vocab={}, actual vocab={}, {} tokens",
+        vocab_size, tok.vocab_size(), tokens.len());
+    Ok(LmTokens {
+        vocab_size: tok.vocab_size(),
+        tokens,
+        class_names: Vec::new(),
+        tokenizer_state: tok.encode_state(),
+    })
 }
 
 /// Tokenize a corpus into (sorted vocabulary, token-ID stream) for
