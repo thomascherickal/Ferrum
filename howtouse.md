@@ -204,8 +204,39 @@ orthogonal to it and changes only the token stream and vocabulary size.
 
 ---
 
-## 5. Determinism
+## 5. CPU parallelism
 
-Training and generation are deterministic for a fixed RNG seed. BPE training is
-also deterministic: ties between equally frequent pairs are broken by pair
-ordering, so the same corpus and `vocab_size` always yield the same merges.
+Training and inference are multi-threaded on the CPU — no GPU is used. The
+matrix-multiply kernels that dominate every Linear projection, feed-forward
+block, attention, and LM-head step are split across CPU cores, so all three SLM
+training paths and generation get faster on multi-core machines automatically.
+
+- **Dynamic detection.** The worker count comes from
+  `std::thread::available_parallelism()` (the machine's reported parallelism),
+  resolved once and cached. No configuration is required.
+- **Override.** Set the `FERRUM_NUM_THREADS` environment variable to a positive
+  integer to pin the thread count (e.g. `FERRUM_NUM_THREADS=1` forces serial
+  execution, useful for benchmarking or reproducibility audits).
+- **Zero dependencies.** Parallelism is built only on `std` (`thread::scope`),
+  so the no-external-crates guarantee still holds.
+- **Deterministic.** The row-split never changes per-element arithmetic, so
+  results are bit-for-bit identical regardless of the thread count. Small
+  workloads run serially (thread-spawn cost would dominate), and the `wasm32`
+  target — which has no threads — always runs serially.
+
+```bash
+FERRUM_NUM_THREADS=4 train_transformer train corpus.txt model.bin --epochs 200
+```
+
+You can query the detected count from the library:
+
+```rust
+println!("using {} CPU threads", ferrum_core::num_threads());
+```
+
+## 6. Determinism
+
+Training and generation are deterministic for a fixed RNG seed, **independent of
+the thread count**. BPE training is also deterministic: ties between equally
+frequent pairs are broken by pair ordering, so the same corpus and `vocab_size`
+always yield the same merges.

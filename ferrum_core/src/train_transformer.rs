@@ -148,18 +148,23 @@ fn ln_bwd(
 
 /// out [m,n] = aᵀ·b where a is [k,m] and b is [k,n].
 fn matmul_transpose_a_helper(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    // out[i,j] = Σ_r a[r,i] · b[r,j]. Output rows (i) are independent, so split
+    // them across threads; the sum over r keeps its original order per element.
     let mut out = vec![0.0f32; m * n];
-    for r in 0..k {
-        let a_row = r * m;
-        let b_row = r * n;
-        for i in 0..m {
-            let a_ri = a[a_row + i];
-            let o_row = i * n;
-            for j in 0..n {
-                out[o_row + j] += a_ri * b[b_row + j];
+    crate::parallel::for_row_blocks(m, n, m * n * k, &mut out, |row0, block| {
+        let rows = block.len() / n;
+        for li in 0..rows {
+            let i = row0 + li;
+            let o_row = li * n;
+            for r in 0..k {
+                let a_ri = a[r * m + i];
+                let b_row = r * n;
+                for j in 0..n {
+                    block[o_row + j] += a_ri * b[b_row + j];
+                }
             }
         }
-    }
+    });
     out
 }
 

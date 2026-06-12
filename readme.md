@@ -12,6 +12,10 @@ Raspberry Pi, or in a browser tab.
 
 - **No dependencies.** `ferrum_core` has an empty `[dependencies]` table.
 - **No GPU.** Everything runs on the CPU; models are small by design.
+- **Multi-threaded.** The matmul kernels behind every Linear, FFN, attention,
+  and LM-head step run in parallel across all CPU cores — detected dynamically
+  via `std::thread::available_parallelism()`, with zero external crates and
+  bit-for-bit deterministic results. Override with `FERRUM_NUM_THREADS`.
 - **Self-contained models.** Weights, normalizer, metadata, and the tokenizer
   travel together in one `.bin` file (the FINF format).
 - **Quantization-aware.** Train against int8-snapped weights and ship 4×-smaller

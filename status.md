@@ -21,6 +21,11 @@ SLMs, and MLPs. The workspace builds clean and the full test suite passes.
   softmax cross-entropy and MSE losses.
 - **Quantization** — symmetric per-tensor int8, fake-quantization for QAT, and
   int8 serialization (FINF v5).
+- **CPU parallelism** — the matmul kernels behind Linear, FFN, attention, and
+  the LM head split their rows across all CPU cores via `std::thread::scope`,
+  with the thread count detected dynamically (`available_parallelism`, override
+  `FERRUM_NUM_THREADS`). Zero external crates, no GPU, deterministic results,
+  serial on `wasm32`.
 - **Tokenizer** — `ByteBpeTokenizer`, a byte-level BPE tokenizer that
   round-trips any UTF-8 text, with a portable merge-list state.
 - **Generative SLM** — `GenerativeSLM` with three training paths (`train`,

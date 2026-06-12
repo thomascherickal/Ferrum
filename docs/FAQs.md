@@ -11,7 +11,18 @@ to WebAssembly.
 
 ### Does it need a GPU?
 
-No. Everything runs single-threaded on the CPU. Models are small by design.
+No — and it never uses one. Everything runs on the CPU, parallelized across all
+available cores.
+
+### How does it use multiple cores without extra dependencies?
+
+The matmul kernels (the dominant cost of every Linear, FFN, attention, and
+LM-head step) split their output rows across CPU threads using only
+`std::thread::scope`. The thread count is detected dynamically from
+`std::thread::available_parallelism()` and can be overridden with the
+`FERRUM_NUM_THREADS` environment variable. Small workloads and the `wasm32`
+target run serially. Results are bit-for-bit identical regardless of thread
+count, so training and inference stay deterministic.
 
 ### What external dependencies does it have?
 

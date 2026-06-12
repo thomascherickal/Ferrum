@@ -8,7 +8,7 @@
 //! ## Architecture at a glance
 //!
 //! ```text
-//! Tensor ──► ops (matmul, softmax, …)
+//! Tensor ──► ops (matmul, softmax, …)  ──► parallel (std-only CPU threads)
 //!      │
 //!      └──► Layer trait
 //!             ├── Linear          (y = xW + b)
@@ -62,6 +62,7 @@ pub mod loss;
 pub mod model;
 pub mod ops;
 pub mod optim;
+pub mod parallel;
 pub mod quant;
 pub mod rng;
 pub mod slm;
@@ -83,6 +84,7 @@ pub use loss::{mse, softmax_cross_entropy};
 pub use model::Sequential;
 pub use ops::argmax_rows;
 pub use optim::{Adam, Sgd};
+pub use parallel::num_threads;
 pub use quant::{fake_quantize_int8, QUANT_MIN_LEN};
 pub use rng::Rng;
 pub use slm::{GenerativeSLM, TransformerConfig};

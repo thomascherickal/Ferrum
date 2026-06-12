@@ -120,12 +120,22 @@ tests assert it for both character-level and BPE models.
 
 ## 6. Speed
 
-All work is single-threaded CPU. Time training and generation with the shell or
-`std::time::Instant`:
+All work is CPU-only (no GPU). The matmul kernels run in parallel across all
+cores, so training and inference speed up on multi-core machines. Time them with
+the shell or `std::time::Instant`:
 
 ```bash
 time train_transformer train corpus.txt model.bin --epochs 200
 time train_transformer generate model.bin "seed text" --chars 500
+```
+
+To measure the parallel speedup, pin the thread count with `FERRUM_NUM_THREADS`
+and compare — the results are identical, only the wall-clock time changes:
+
+```bash
+FERRUM_NUM_THREADS=1 time train_transformer train corpus.txt m1.bin --epochs 100
+time                  train_transformer train corpus.txt mN.bin --epochs 100
+# m1.bin and mN.bin are byte-for-byte identical.
 ```
 
 Generation cost scales with context length, embedding dimension, number of

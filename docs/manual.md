@@ -13,6 +13,18 @@ quantization, and the FINF model format. For task-oriented guides see
 `ops` module provides matmul, `softmax_rows`, `argmax_rows`, and the kernels the
 layers are built from.
 
+### CPU parallelism
+
+The matmul kernels (in `ops` and the attention helpers) split their output rows
+across CPU threads using the `parallel` module, which is built only on `std`
+(`thread::scope`). The worker count is detected once from
+`std::thread::available_parallelism()` and can be overridden with the
+`FERRUM_NUM_THREADS` environment variable; query it with
+`ferrum_core::num_threads()`. Workloads below an internal scalar-work threshold,
+and the `wasm32` target, run serially. The row split does not change per-element
+arithmetic, so output is bit-for-bit identical regardless of thread count — both
+training and inference stay deterministic. No GPU is ever used.
+
 ---
 
 ## 2. Layers
