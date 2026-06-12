@@ -1,12 +1,15 @@
 [package]
 name        = "ferrum_core"
-description = "Zero-dependency edge Transformer & MLP engine — CPU-only, no_std-compatible, WASM-ready. Hand-build causal Transformers with pure Rust."
+description = "Zero-dependency edge Transformer & MLP engine — CPU-only, std-only, WASM-ready. Hand-build, train, and run causal Transformers and Small Language Models in pure Rust."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 readme      = "README.md"
-keywords    = ["transformer", "edge-ai", "neural-network", "wasm", "no-std"]
-categories  = ["science", "no-std::no-alloc", "wasm", "embedded"]
+repository  = "https://github.com/thomascherickal/Ferrum"
+homepage    = "https://github.com/thomascherickal/Ferrum"
+documentation = "https://docs.rs/ferrum_core"
+keywords    = ["transformer", "edge-ai", "neural-network", "wasm", "machine-learning"]
+categories  = ["science", "algorithms", "wasm", "mathematics"]
 
 [dependencies]
 # intentionally empty — std only, zero external dependencies

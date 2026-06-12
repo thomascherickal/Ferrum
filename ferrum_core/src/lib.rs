@@ -1,8 +1,9 @@
 //! # ferrum_core — Edge Transformer & MLP Engine
 //!
-//! Zero-dependency, pure-Rust library for building and running **hand-crafted
-//! causal Transformer models** (and classical MLPs) on CPU-only, edge, and
-//! WebAssembly targets. No GPU required. No external crates.
+//! Zero-dependency, pure-Rust library for building, training, and running
+//! **hand-crafted causal Transformer models**, Small Language Models, and
+//! classical MLPs on CPU-only, edge, and WebAssembly targets. No GPU required.
+//! No external crates — `std` only.
 //!
 //! ## Architecture at a glance
 //!

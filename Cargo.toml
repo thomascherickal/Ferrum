@@ -1,5 +1,5 @@
 [workspace]
-members  = ["ferrum_core", "tabular_wasm", "train_cli", "tests"]
+members  = ["ferrum_core", "tabular_wasm", "train_cli", "slm_cli", "tests"]
 resolver = "2"
 
 [workspace.package]

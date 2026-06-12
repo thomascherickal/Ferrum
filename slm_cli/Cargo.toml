@@ -1,0 +1,13 @@
+[package]
+name    = "slm_cli"
+description = "Command-line trainer and generator for ferrum_core Small Language Models (transformer / embedded / one-hot MLP)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "train_transformer"
+path = "src/main.rs"
+
+[dependencies]
+ferrum_core = { path = "../ferrum_core" }
