@@ -136,6 +136,7 @@ tokenizer of that size.
 | [example.md](example.md)          | End-to-end worked examples                           |
 | [usecases.md](usecases.md)        | Ten scenarios where Ferrum is a good fit            |
 | [evaluation.md](evaluation.md)    | How to measure quality, size, and speed             |
+| [benchmarks.md](benchmarks.md)    | CPU parallelism benchmarks (training & generation)  |
 | [deployment.md](deployment.md)    | Shipping models to edge, embedded, and WASM targets |
 | [docs/manual.md](docs/manual.md)  | Complete API and format reference                   |
 | [docs/user_guide.md](docs/user_guide.md) | Task-oriented walkthroughs                   |
