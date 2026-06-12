@@ -3,6 +3,25 @@
 use crate::error::{InferError, Result};
 use crate::tensor::Tensor;
 use crate::verbose;
+use std::sync::Arc;
+
+/// Compute rows `r0..r1` of an `[m, n]` matmul `A·B` (A is `[m, k]`, B is
+/// `[k, n]`) into `out`, which holds those rows indexed locally (row `i` at
+/// `(i - r0) * n`). Shared by the serial and pooled paths so the arithmetic is
+/// written once.
+fn matmul_block(a: &[f32], b: &[f32], k: usize, n: usize, r0: usize, r1: usize, out: &mut [f32]) {
+    for i in r0..r1 {
+        let a_row = i * k;
+        let o_row = (i - r0) * n;
+        for p in 0..k {
+            let a_ip = a[a_row + p];
+            let b_row = p * n;
+            for j in 0..n {
+                out[o_row + j] += a_ip * b[b_row + j];
+            }
+        }
+    }
+}
 
 /// Matrix multiply: [m,k] × [k,n] → [m,n]. Uses i-k-j loop order for cache
 /// friendliness: the innermost loop walks contiguous memory in b and the output.
@@ -15,25 +34,22 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
         )));
     }
     vprintln!("[ops::matmul] [{},{}] × [{},{}] → [{},{}]", m, ka, kb, n, m, n);
-    let mut out = vec![0.0f32; m * n];
-    // Split the output rows across CPU threads (serial below the threshold and
-    // on wasm). Each output row depends only on `a`'s matching row and all of
-    // `b`, so the per-element i-k-j arithmetic is unchanged.
-    let (ad, bd) = (&a.data, &b.data);
-    crate::parallel::for_row_blocks(m, n, m * ka * n, &mut out, |row0, block| {
-        let rows = block.len() / n;
-        for li in 0..rows {
-            let a_row = (row0 + li) * ka;
-            let o_row = li * n;
-            for k in 0..ka {
-                let a_ik = ad[a_row + k];
-                let b_row = k * n;
-                for j in 0..n {
-                    block[o_row + j] += a_ik * bd[b_row + j];
-                }
-            }
-        }
-    });
+    // Split the output rows across the persistent CPU worker pool when the
+    // workload is large enough; otherwise compute serially with no Arc clone.
+    // Each output row depends only on `a`'s matching row and all of `b`, so the
+    // per-element arithmetic is identical regardless of the split.
+    let cost = m.saturating_mul(ka).saturating_mul(n);
+    let out = if crate::parallel::should_parallelize(m, cost) {
+        let a_arc = Arc::<[f32]>::from(a.data.as_slice());
+        let b_arc = Arc::<[f32]>::from(b.data.as_slice());
+        crate::parallel::run(m, n, move |r0, r1, block| {
+            matmul_block(&a_arc, &b_arc, ka, n, r0, r1, block);
+        })
+    } else {
+        let mut out = vec![0.0f32; m * n];
+        matmul_block(&a.data, &b.data, ka, n, 0, m, &mut out);
+        out
+    };
     if verbose::is_verbose() {
         verbose::check_nan_inf(&out, &format!("ops::matmul result [{m},{n}]"));
     }

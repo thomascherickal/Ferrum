@@ -17,9 +17,10 @@ a single self-contained file that also runs in WebAssembly.
   `train_transformer_epoch`, `Adam` and `Sgd`, cross-entropy and MSE losses.
 - **Quantization-aware training** — symmetric int8 fake-quantization with a
   straight-through estimator; ship int8 models that behave like what you trained.
-- **CPU parallelism** — matmul kernels split across all cores via
-  `std::thread::scope`, with dynamic thread detection (`FERRUM_NUM_THREADS`
-  override). No GPU, no external crates, deterministic results, serial on wasm.
+- **CPU parallelism** — matmul kernels split across a persistent worker pool
+  (threads spawned once and reused), with dynamic thread detection
+  (`FERRUM_NUM_THREADS` override). Built on `std` only, no `unsafe`, no GPU, no
+  external crates; deterministic results, serial on wasm.
 - **Byte-level BPE tokenizer** — `ByteBpeTokenizer` round-trips any UTF-8 text
   and serializes to a compact merge list.
 - **Generative SLM** — `GenerativeSLM` with three training paths and one
@@ -65,7 +66,7 @@ let restored = ByteBpeTokenizer::from_state(&tok.encode_state()).unwrap();
 | Module              | Responsibility                                            |
 |---------------------|-----------------------------------------------------------|
 | `tensor`, `ops`     | Tensor type and numeric kernels                           |
-| `parallel`          | std-only CPU thread pool for matmul (`num_threads`)       |
+| `parallel`          | std-only persistent CPU worker pool for matmul (`num_threads`) |
 | `layer`             | `Layer` trait and all layer implementations               |
 | `model`             | `Sequential` pipeline                                     |
 | `train`             | `Net`, `train_epoch`, accuracy                            |

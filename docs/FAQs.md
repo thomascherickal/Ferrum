@@ -17,12 +17,15 @@ available cores.
 ### How does it use multiple cores without extra dependencies?
 
 The matmul kernels (the dominant cost of every Linear, FFN, attention, and
-LM-head step) split their output rows across CPU threads using only
-`std::thread::scope`. The thread count is detected dynamically from
-`std::thread::available_parallelism()` and can be overridden with the
-`FERRUM_NUM_THREADS` environment variable. Small workloads and the `wasm32`
-target run serially. Results are bit-for-bit identical regardless of thread
-count, so training and inference stay deterministic.
+LM-head step) split their output rows across a **persistent pool** of worker
+threads — spawned once and reused for every matmul, so autoregressive generation
+does not pay per-call thread-creation cost. It is built only on `std` (threads,
+channels, and `Arc`) with no `unsafe`: kernels share their read-only inputs
+through `Arc` and each worker returns an owned output block. The thread count is
+detected dynamically from `std::thread::available_parallelism()` and can be
+overridden with `FERRUM_NUM_THREADS`. Small workloads and the `wasm32` target run
+serially. Results are bit-for-bit identical regardless of thread count, so
+training and inference stay deterministic.
 
 ### What external dependencies does it have?
 

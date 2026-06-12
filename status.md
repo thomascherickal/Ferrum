@@ -22,10 +22,12 @@ SLMs, and MLPs. The workspace builds clean and the full test suite passes.
 - **Quantization** — symmetric per-tensor int8, fake-quantization for QAT, and
   int8 serialization (FINF v5).
 - **CPU parallelism** — the matmul kernels behind Linear, FFN, attention, and
-  the LM head split their rows across all CPU cores via `std::thread::scope`,
-  with the thread count detected dynamically (`available_parallelism`, override
-  `FERRUM_NUM_THREADS`). Zero external crates, no GPU, deterministic results,
-  serial on `wasm32`.
+  the LM head split their rows across a **persistent worker pool** (threads
+  spawned once and reused, so generation pays no per-call thread-creation cost).
+  The thread count is detected dynamically (`available_parallelism`, override
+  `FERRUM_NUM_THREADS`). Built only on `std` (threads + channels + `Arc`) with no
+  `unsafe`, no external crates, no GPU; results are deterministic and `wasm32`
+  runs serially.
 - **Tokenizer** — `ByteBpeTokenizer`, a byte-level BPE tokenizer that
   round-trips any UTF-8 text, with a portable merge-list state.
 - **Generative SLM** — `GenerativeSLM` with three training paths (`train`,
