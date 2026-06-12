@@ -48,8 +48,10 @@ footprint:
 - Prefer the `train_embedded` path with a modest BPE vocabulary.
 - Build with the workspace `release` profile (LTO, one codegen unit).
 
-The engine is single-threaded and allocation-light, with no driver or GPU
-dependency, which makes timing predictable on constrained hardware.
+The engine is allocation-light with no driver or GPU dependency. By default it
+parallelizes matmul across all CPU cores; on single-core or timing-sensitive
+targets set `FERRUM_NUM_THREADS=1` to force fully serial, predictable execution.
+On `wasm32` it runs serially automatically.
 
 ---
 

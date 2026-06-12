@@ -733,34 +733,40 @@ impl Layer for TransformerBlock {
 
 pub(crate) fn matmul_transpose_b_helper(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; m * n];
-    for i in 0..m {
-        let a_row = i * k;
-        let o_row = i * n;
-        for j in 0..n {
-            let b_row = j * k;
-            let mut sum = 0.0f32;
-            for p in 0..k {
-                sum += a[a_row + p] * b[b_row + p];
+    crate::parallel::for_row_blocks(m, n, m * n * k, &mut out, |row0, block| {
+        let rows = block.len() / n;
+        for li in 0..rows {
+            let a_row = (row0 + li) * k;
+            let o_row = li * n;
+            for j in 0..n {
+                let b_row = j * k;
+                let mut sum = 0.0f32;
+                for p in 0..k {
+                    sum += a[a_row + p] * b[b_row + p];
+                }
+                block[o_row + j] = sum;
             }
-            out[o_row + j] = sum;
         }
-    }
+    });
     out
 }
 
 pub(crate) fn matmul_naive_helper(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; m * n];
-    for i in 0..m {
-        let a_row = i * k;
-        let o_row = i * n;
-        for p in 0..k {
-            let a_ip = a[a_row + p];
-            let b_row = p * n;
-            for j in 0..n {
-                out[o_row + j] += a_ip * b[b_row + j];
+    crate::parallel::for_row_blocks(m, n, m * n * k, &mut out, |row0, block| {
+        let rows = block.len() / n;
+        for li in 0..rows {
+            let a_row = (row0 + li) * k;
+            let o_row = li * n;
+            for p in 0..k {
+                let a_ip = a[a_row + p];
+                let b_row = p * n;
+                for j in 0..n {
+                    block[o_row + j] += a_ip * b[b_row + j];
+                }
             }
         }
-    }
+    });
     out
 }
 

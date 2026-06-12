@@ -16,17 +16,24 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     }
     vprintln!("[ops::matmul] [{},{}] × [{},{}] → [{},{}]", m, ka, kb, n, m, n);
     let mut out = vec![0.0f32; m * n];
-    for i in 0..m {
-        let a_row = i * ka;
-        let o_row = i * n;
-        for k in 0..ka {
-            let a_ik = a.data[a_row + k];
-            let b_row = k * n;
-            for j in 0..n {
-                out[o_row + j] += a_ik * b.data[b_row + j];
+    // Split the output rows across CPU threads (serial below the threshold and
+    // on wasm). Each output row depends only on `a`'s matching row and all of
+    // `b`, so the per-element i-k-j arithmetic is unchanged.
+    let (ad, bd) = (&a.data, &b.data);
+    crate::parallel::for_row_blocks(m, n, m * ka * n, &mut out, |row0, block| {
+        let rows = block.len() / n;
+        for li in 0..rows {
+            let a_row = (row0 + li) * ka;
+            let o_row = li * n;
+            for k in 0..ka {
+                let a_ik = ad[a_row + k];
+                let b_row = k * n;
+                for j in 0..n {
+                    block[o_row + j] += a_ik * bd[b_row + j];
+                }
             }
         }
-    }
+    });
     if verbose::is_verbose() {
         verbose::check_nan_inf(&out, &format!("ops::matmul result [{m},{n}]"));
     }
@@ -246,6 +253,32 @@ mod tests {
     fn argmax_rows_picks_max_per_row() {
         let m = Tensor::matrix(2, 3, vec![0.1, 0.7, 0.2, 0.9, 0.05, 0.05]).unwrap();
         assert_eq!(argmax_rows(&m).unwrap(), vec![1, 0]);
+    }
+
+    #[test]
+    fn matmul_large_matches_serial_reference() {
+        // A matmul big enough to cross the parallel threshold must equal a
+        // straightforward serial reference bit-for-bit, regardless of how many
+        // threads the row split used.
+        let (m, k, n) = (200usize, 80usize, 160usize);
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.1).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.1).collect();
+        let a = Tensor::matrix(m, k, a_data.clone()).unwrap();
+        let b = Tensor::matrix(k, n, b_data.clone()).unwrap();
+
+        let got = matmul(&a, &b).unwrap();
+        assert_eq!(got.shape, vec![m, n]);
+
+        let mut want = vec![0.0f32; m * n];
+        for i in 0..m {
+            for p in 0..k {
+                let a_ip = a_data[i * k + p];
+                for j in 0..n {
+                    want[i * n + j] += a_ip * b_data[p * n + j];
+                }
+            }
+        }
+        assert_eq!(got.data, want, "parallel matmul diverged from serial reference");
     }
 
     #[test]
