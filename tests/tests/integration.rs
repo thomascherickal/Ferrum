@@ -44,6 +44,7 @@ fn make_meta(ds: &CsvDataset) -> ModelMetadata {
         target_range: ds.target_range,
         input_dim: ds.num_features,
         output_dim: ds.num_classes,
+        tokenizer_state: String::new(),
     }
 }
 

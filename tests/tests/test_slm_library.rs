@@ -84,6 +84,7 @@ fn test_transformer_slm_training_and_generation_roundtrip() {
         40,    // epochs
         0.01,  // lr (Adam)
         8,     // batch_size
+        0,     // vocab_size (0 = character-level)
         &mut rng,
         |_, loss| losses.push(loss),
     ).unwrap();
@@ -131,6 +132,7 @@ fn test_embedded_slm_training_and_generation_roundtrip() {
         0.05,  // lr
         0.9,   // momentum
         8,     // batch_size
+        0,     // vocab_size (0 = character-level)
         &mut rng,
         |_, loss| losses.push(loss),
     ).unwrap();
@@ -172,13 +174,77 @@ fn test_embedded_slm_is_smaller_than_one_hot() {
     let corpus = "the quick brown fox jumps over the lazy dog 0123456789\n";
     let mut rng = Rng::new(2);
     let onehot = GenerativeSLM::train(corpus, 6, 64, 2, 0.05, 0.9, 8, &mut rng).unwrap();
-    let embedded = GenerativeSLM::train_embedded(corpus, 6, 16, 64, 2, 0.05, 0.9, 8, &mut rng).unwrap();
+    let embedded = GenerativeSLM::train_embedded(corpus, 6, 16, 64, 2, 0.05, 0.9, 8, 0, &mut rng).unwrap();
     let onehot_len = onehot.to_bytes().unwrap().len();
     let embedded_len = embedded.to_bytes().unwrap().len();
     assert!(
         (embedded_len as f32) < (onehot_len as f32) * 0.5,
         "embedded model not smaller: {embedded_len} vs {onehot_len} bytes"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Byte-level BPE tokenizer integration (embedded + transformer paths)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_embedded_bpe_training_stores_tokenizer_and_generates() {
+    let corpus = "the quick brown fox jumps over the lazy dog while the calm river \
+        flows past green hills and quiet villages. travelers walk along the winding road, \
+        telling stories of distant lands, bright stars, and the slow turning of the seasons. ";
+    let mut rng = Rng::new(71);
+    let slm = GenerativeSLM::train_embedded(
+        corpus, 8, 16, 32, 30, 0.05, 0.9, 8, 300, &mut rng,
+    ).unwrap();
+
+    // Token-ID contract unchanged; tokenizer state now carries the merges.
+    assert_eq!(slm.meta.task, TaskType::TransformerSLM);
+    assert_eq!(slm.meta.input_dim, 8);
+    assert!(!slm.meta.tokenizer_state.is_empty());
+    assert!(slm.meta.output_dim >= 256);
+
+    let out = slm.generate("the quick brown", 10, 0.5, &mut Rng::new(3)).unwrap();
+    assert!(out.starts_with("the quick brown"));
+
+    // FINF roundtrip preserves the tokenizer and behaviour.
+    let bytes = slm.to_bytes_quantized().unwrap();
+    let reloaded = GenerativeSLM::from_bytes(&bytes).unwrap();
+    assert_eq!(reloaded.meta.tokenizer_state, slm.meta.tokenizer_state);
+    let a = slm.generate("the quick brown", 8, 0.4, &mut Rng::new(5)).unwrap();
+    let b = reloaded.generate("the quick brown", 8, 0.4, &mut Rng::new(5)).unwrap();
+    assert_eq!(a, b);
+}
+
+#[test]
+fn test_bpe_handles_non_ascii_corpus() {
+    // The byte-level base vocabulary means non-ASCII text round-trips even
+    // though no merge ever spans a whole multi-byte character cleanly.
+    let corpus = "café au lait et résumé naïve façade. la fête commence à Genève où \
+        les enfants jouent près de la rivière. élégance, créativité, persévérance — \
+        des mots français avec des accents variés résonnent dans le café résumé. ";
+    let mut rng = Rng::new(91);
+    let slm = GenerativeSLM::train_transformer(
+        corpus, 6, 16, 2, 1, 32, 25, 0.01, 8, 300, &mut rng,
+    ).unwrap();
+    assert!(!slm.meta.tokenizer_state.is_empty());
+
+    // Decoding must always yield valid UTF-8 (String guarantees it) and keep
+    // the seed prefix intact.
+    let out = slm.generate("café résumé", 12, 0.6, &mut Rng::new(2)).unwrap();
+    assert!(out.starts_with("café résumé"), "non-ASCII seed lost: {out:?}");
+}
+
+#[test]
+fn test_char_level_path_still_default_when_vocab_zero() {
+    // Regression guard: vocab_size 0 keeps the legacy character-level tokenizer
+    // (hex class_names, empty tokenizer_state).
+    let corpus = "abcabcabcabcabcabcabcabcabcabcabcabc";
+    let mut rng = Rng::new(13);
+    let slm = GenerativeSLM::train_transformer(
+        corpus, 4, 8, 2, 1, 16, 20, 0.01, 8, 0, &mut rng,
+    ).unwrap();
+    assert!(slm.meta.tokenizer_state.is_empty());
+    assert_eq!(slm.meta.output_dim, slm.meta.class_names.len());
 }
 
 #[test]

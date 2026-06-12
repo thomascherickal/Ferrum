@@ -405,6 +405,10 @@ pub struct TransformerNet {
     head_w: Param, // [C, vocab]
     head_b: Param, // [vocab]
     step_t: u64,
+    /// Quantization Aware Training: when enabled, `train_transformer_epoch`
+    /// runs forward/backward against int8-snapped weights while Adam updates
+    /// full-precision master weights (straight-through estimator).
+    qat: bool,
 }
 
 impl TransformerNet {
@@ -445,6 +449,7 @@ impl TransformerNet {
             head_w: Param::randn(vec![embed_dim, vocab_size], scale, rng),
             head_b: Param::constant(vec![vocab_size], 0.0),
             step_t: 0,
+            qat: false,
         })
     }
 
@@ -453,6 +458,53 @@ impl TransformerNet {
     }
     pub fn context_len(&self) -> usize {
         self.context_len
+    }
+
+    /// Enable or disable int8 Quantization Aware Training (see the `qat`
+    /// field docs). Off by default; `GenerativeSLM` turns it on.
+    pub fn set_qat(&mut self, enabled: bool) {
+        self.qat = enabled;
+    }
+    pub fn qat_enabled(&self) -> bool {
+        self.qat
+    }
+
+    /// Every parameter tensor, in a fixed order (used by the QAT snapshot /
+    /// fake-quantize / restore cycle).
+    fn param_tensors_mut(&mut self) -> Vec<&mut Tensor> {
+        let mut v: Vec<&mut Tensor> = vec![&mut self.tok_emb.data, &mut self.pos_emb.data];
+        for b in &mut self.blocks {
+            for p in b.params_mut() {
+                v.push(&mut p.data);
+            }
+        }
+        v.push(&mut self.lnf_g.data);
+        v.push(&mut self.lnf_b.data);
+        v.push(&mut self.head_w.data);
+        v.push(&mut self.head_b.data);
+        v
+    }
+
+    /// Copy of every parameter tensor's data (the fp32 master weights).
+    pub(crate) fn snapshot_weights(&mut self) -> Vec<Vec<f32>> {
+        self.param_tensors_mut()
+            .iter()
+            .map(|t| t.data.clone())
+            .collect()
+    }
+
+    /// Snap every (large-enough) parameter tensor onto the int8 grid in place.
+    pub(crate) fn fake_quantize_weights(&mut self) {
+        for t in self.param_tensors_mut() {
+            crate::quant::fake_quantize_int8(&mut t.data);
+        }
+    }
+
+    /// Restore master weights captured by [`TransformerNet::snapshot_weights`].
+    pub(crate) fn restore_weights(&mut self, snapshot: &[Vec<f32>]) {
+        for (t, s) in self.param_tensors_mut().into_iter().zip(snapshot) {
+            t.data.copy_from_slice(s);
+        }
     }
 
     pub fn num_params(&self) -> usize {
@@ -710,6 +762,11 @@ impl TransformerNet {
 /// One epoch of minibatch Adam over a token stream. Each example is a window
 /// of `context_len` tokens with next-token targets at every position.
 /// Returns the mean train loss.
+///
+/// If the net has QAT enabled ([`TransformerNet::set_qat`]), each step runs
+/// forward and backward against int8-snapped weights, then applies the Adam
+/// update to the full-precision master weights (straight-through estimator),
+/// so the trained model is robust to int8 export.
 pub fn train_transformer_epoch(
     net: &mut TransformerNet,
     tokens: &[usize],
@@ -737,10 +794,22 @@ pub fn train_transformer_epoch(
             input.extend_from_slice(&tokens[start..start + t]);
             targets.extend_from_slice(&tokens[start + 1..start + t + 1]);
         }
+        // QAT: gradients are computed at the int8-snapped weights, but the
+        // optimizer updates the fp32 masters (straight-through estimator).
+        let masters = if net.qat_enabled() {
+            let snapshot = net.snapshot_weights();
+            net.fake_quantize_weights();
+            Some(snapshot)
+        } else {
+            None
+        };
         let (logits, cache) = net.forward(&input)?;
         let (loss, dlogits) = softmax_cross_entropy(&logits, &targets)?;
         net.zero_grad();
         net.backward(&dlogits, &cache)?;
+        if let Some(snapshot) = &masters {
+            net.restore_weights(snapshot);
+        }
         net.step(adam)?;
         total += loss;
     }
@@ -878,6 +947,91 @@ mod tests {
     }
 
     #[test]
+    fn qat_training_reduces_loss() {
+        let mut rng = Rng::new(7);
+        let mut net = TransformerNet::new(4, 4, 8, 2, 16, 1, &mut rng).unwrap();
+        net.set_qat(true);
+        assert!(net.qat_enabled());
+        let tokens: Vec<usize> = (0..200).map(|i| i % 4).collect();
+        let adam = Adam::new(0.01);
+        let first = train_transformer_epoch(&mut net, &tokens, 8, &adam, &mut rng).unwrap();
+        let mut last = first;
+        for _ in 0..30 {
+            last = train_transformer_epoch(&mut net, &tokens, 8, &adam, &mut rng).unwrap();
+        }
+        assert!(
+            last < first * 0.5,
+            "QAT loss did not halve: {first:.4} → {last:.4}"
+        );
+    }
+
+    #[test]
+    fn qat_snapshot_quantize_restore_cycle() {
+        let mut rng = Rng::new(11);
+        let mut net = TransformerNet::new(8, 4, 8, 2, 16, 1, &mut rng).unwrap();
+        let masters = net.snapshot_weights();
+        net.fake_quantize_weights();
+        // Large tensors (≥ QUANT_MIN_LEN) must now sit on the int8 grid.
+        let quantized = net.snapshot_weights();
+        let mut any_changed = false;
+        for (m, q) in masters.iter().zip(&quantized) {
+            if q.len() >= crate::quant::QUANT_MIN_LEN {
+                let scale = crate::quant::int8_scale(q);
+                if scale > 0.0 {
+                    for &v in q {
+                        let steps = v / scale;
+                        assert!((steps - steps.round()).abs() < 1e-3, "{v} off the int8 grid");
+                    }
+                }
+            }
+            if m != q {
+                any_changed = true;
+            }
+        }
+        assert!(any_changed, "fake quantization changed no weights");
+        // Restore must bring back the fp32 masters exactly.
+        net.restore_weights(&masters);
+        assert_eq!(net.snapshot_weights(), masters);
+    }
+
+    #[test]
+    fn qat_model_survives_int8_export_with_small_drift() {
+        use crate::csv::{ModelMetadata, Normalizer, TaskType};
+        use crate::loader::{from_bytes, to_bytes_quantized};
+        let mut rng = Rng::new(13);
+        let mut net = TransformerNet::new(4, 4, 8, 2, 16, 1, &mut rng).unwrap();
+        net.set_qat(true);
+        let tokens: Vec<usize> = (0..200).map(|i| i % 4).collect();
+        let adam = Adam::new(0.01);
+        for _ in 0..20 {
+            train_transformer_epoch(&mut net, &tokens, 8, &adam, &mut rng).unwrap();
+        }
+        let model = net.to_inference().unwrap();
+        let meta = ModelMetadata {
+            dataset_name: "qat".into(),
+            task: TaskType::TransformerSLM,
+            feature_names: vec![],
+            feature_ranges: vec![],
+            class_names: (0..4).map(|i| i.to_string()).collect(),
+            target_name: "next".into(),
+            target_range: [0.0, 4.0],
+            input_dim: 4,
+            output_dim: 4,
+            tokenizer_state: String::new(),
+        };
+        let norm = Normalizer { means: vec![], stds: vec![] };
+        let bytes = to_bytes_quantized(&model, &norm, &meta).unwrap();
+        let (m2, _, _) = from_bytes(&bytes).unwrap();
+        let x = Tensor::matrix(1, 4, vec![0.0, 1.0, 2.0, 3.0]).unwrap();
+        let before = model.forward(&x).unwrap();
+        let after = m2.forward(&x).unwrap();
+        // Output probabilities of the int8 export must track the fp32 model.
+        for (a, b) in before.data.iter().zip(&after.data) {
+            assert!((a - b).abs() < 0.05, "int8 export drifted: {a} vs {b}");
+        }
+    }
+
+    #[test]
     fn to_inference_matches_trainable_forward() {
         let mut rng = Rng::new(21);
         let net = TransformerNet::new(6, 4, 8, 2, 12, 2, &mut rng).unwrap();
@@ -914,6 +1068,7 @@ mod tests {
             target_range: [0.0, 6.0],
             input_dim: 4,
             output_dim: 6,
+            tokenizer_state: String::new(),
         };
         let norm = Normalizer { means: vec![], stds: vec![] };
         let bytes = to_bytes(&model, &norm, &meta).unwrap();

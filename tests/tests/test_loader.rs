@@ -29,6 +29,7 @@ fn make_test_bundle() -> (Sequential, Normalizer, ModelMetadata) {
         target_range: [0.0, 1.0],
         input_dim: 2,
         output_dim: 2,
+        tokenizer_state: String::new(),
     };
     (model, norm, meta)
 }

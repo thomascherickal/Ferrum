@@ -33,6 +33,10 @@ name = "test_regression"
 path = "tests/test_regression.rs"
 
 [[test]]
+name = "test_qat_cache"
+path = "tests/test_qat_cache.rs"
+
+[[test]]
 name = "integration"
 path = "tests/integration.rs"
 

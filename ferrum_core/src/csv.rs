@@ -65,6 +65,30 @@ pub struct ModelMetadata {
     pub target_range: [f32; 2],
     pub input_dim: usize,
     pub output_dim: usize,
+    /// Serialized BPE tokenizer state (the merge list from
+    /// [`ByteBpeTokenizer::encode_state`](crate::ByteBpeTokenizer::encode_state)).
+    /// Empty when the model uses character-level tokenization, in which case
+    /// `class_names` carries the per-character vocabulary instead. When set,
+    /// generation encodes and decodes text through the tokenizer rather than
+    /// through `class_names`.
+    pub tokenizer_state: String,
+}
+
+impl Default for ModelMetadata {
+    fn default() -> Self {
+        Self {
+            dataset_name: String::new(),
+            task: TaskType::Classification,
+            feature_names: Vec::new(),
+            feature_ranges: Vec::new(),
+            class_names: Vec::new(),
+            target_name: String::new(),
+            target_range: [0.0, 1.0],
+            input_dim: 0,
+            output_dim: 1,
+            tokenizer_state: String::new(),
+        }
+    }
 }
 
 impl ModelMetadata {
@@ -88,12 +112,16 @@ impl ModelMetadata {
             .map(|n| format!("\"{}\"", n.replace('"', "\\\"")))
             .collect::<Vec<_>>()
             .join(",");
+        let tok_state = self
+            .tokenizer_state
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
         format!(
             concat!(
                 r#"{{"dataset_name":"{dn}","task":"{task}","feature_names":[{fn_}],"#,
                 r#""feature_ranges":[{fr}],"class_names":[{cn}],"#,
                 r#""target_name":"{tn}","target_range":[{tlo:.6},{thi:.6}],"#,
-                r#""input_dim":{id},"output_dim":{od}}}"#
+                r#""input_dim":{id},"output_dim":{od},"tokenizer_state":"{ts}"}}"#
             ),
             dn = self.dataset_name.replace('"', "\\\""),
             task = self.task.as_str(),
@@ -105,6 +133,7 @@ impl ModelMetadata {
             thi = self.target_range[1],
             id = self.input_dim,
             od = self.output_dim,
+            ts = tok_state,
         )
     }
 
@@ -205,6 +234,10 @@ impl ModelMetadata {
             .unwrap_or([0.0, 1.0]);
         let input_dim = extract(s, "input_dim").and_then(usize_val).unwrap_or(0);
         let output_dim = extract(s, "output_dim").and_then(usize_val).unwrap_or(1);
+        // Absent in pre-BPE models → empty (character-level tokenization).
+        let tokenizer_state = extract(s, "tokenizer_state")
+            .and_then(str_val)
+            .unwrap_or_default();
 
         Ok(Self {
             dataset_name,
@@ -216,6 +249,7 @@ impl ModelMetadata {
             target_range,
             input_dim,
             output_dim,
+            tokenizer_state,
         })
     }
 }
@@ -751,6 +785,7 @@ x1,x2,price
             target_range: [0.0, 1.0],
             input_dim: 4,
             output_dim: 3,
+            tokenizer_state: String::new(),
         };
         let json = meta.to_json();
         let meta2 = ModelMetadata::from_json(&json).unwrap();
@@ -774,6 +809,35 @@ x1,x2,price
     }
 
     #[test]
+    fn tokenizer_state_survives_json_roundtrip() {
+        // BPE merge lists ("a,b;c,d;…") must round-trip through the metadata
+        // JSON unchanged; a model with no tokenizer keeps an empty string.
+        let mut meta = ModelMetadata {
+            tokenizer_state: "256,257;258,32;100,200".into(),
+            output_dim: 300,
+            ..Default::default()
+        };
+        let back = ModelMetadata::from_json(&meta.to_json()).unwrap();
+        assert_eq!(back.tokenizer_state, meta.tokenizer_state);
+        assert_eq!(back.output_dim, 300);
+
+        meta.tokenizer_state = String::new();
+        let back2 = ModelMetadata::from_json(&meta.to_json()).unwrap();
+        assert!(back2.tokenizer_state.is_empty());
+    }
+
+    #[test]
+    fn pre_bpe_metadata_json_defaults_tokenizer_state_empty() {
+        // Older models serialized before the tokenizer_state field must still
+        // parse, defaulting to character-level (empty tokenizer state).
+        let json = r#"{"dataset_name":"old","task":"transformer_slm","feature_names":[],"feature_ranges":[],"class_names":["61","62"],"target_name":"next_char","target_range":[0.000000,2.000000],"input_dim":4,"output_dim":2}"#;
+        let meta = ModelMetadata::from_json(json).unwrap();
+        assert!(meta.tokenizer_state.is_empty());
+        assert_eq!(meta.output_dim, 2);
+        assert_eq!(meta.class_names, vec!["61", "62"]);
+    }
+
+    #[test]
     fn regression_metadata_roundtrip() {
         let ds = CsvDataset::from_str(REGRESSION).unwrap();
         let meta = ModelMetadata {
@@ -786,6 +850,7 @@ x1,x2,price
             target_range: ds.target_range,
             input_dim: 2,
             output_dim: 1,
+            tokenizer_state: String::new(),
         };
         let json = meta.to_json();
         let meta2 = ModelMetadata::from_json(&json).unwrap();

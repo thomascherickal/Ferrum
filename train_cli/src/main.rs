@@ -215,6 +215,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         target_range: ds.target_range,
         input_dim: ds.num_features,
         output_dim,
+        tokenizer_state: String::new(),
     };
 
     // ── Export ────────────────────────────────────────────────────────────────

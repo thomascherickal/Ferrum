@@ -19,12 +19,16 @@
 //!
 //! Sequential ──► ordered pipeline of Layers
 //!
-//! loader     ──► FINF v4 binary format (save / load)
+//! loader     ──► FINF v4/v5 binary format (save / load, int8 quantized)
+//! quant      ──► int8 fake-quantization for QAT and serialization
+//! tokenizer  ──► ByteBpeTokenizer (byte-level BPE; char-level fallback)
 //! csv        ──► CsvDataset, Normalizer, ModelMetadata
 //! train      ──► Net (trainable MLP), train_epoch, accuracy
+//! train_transformer ──► TransformerNet, train_transformer_epoch
 //! loss       ──► softmax_cross_entropy, mse
-//! optim      ──► Sgd (with optional momentum)
+//! optim      ──► Sgd (with optional momentum), Adam
 //! rng        ──► seeded xorshift64* PRNG (deterministic)
+//! slm        ──► GenerativeSLM: train / train_embedded / train_transformer (int8 QAT, BPE) / generate
 //! ```
 //!
 //! ## Quick start — Transformer inference
@@ -58,6 +62,7 @@ pub mod loss;
 pub mod model;
 pub mod ops;
 pub mod optim;
+pub mod quant;
 pub mod rng;
 pub mod slm;
 pub mod tensor;
@@ -78,8 +83,9 @@ pub use loss::{mse, softmax_cross_entropy};
 pub use model::Sequential;
 pub use ops::argmax_rows;
 pub use optim::{Adam, Sgd};
+pub use quant::{fake_quantize_int8, QUANT_MIN_LEN};
 pub use rng::Rng;
-pub use slm::GenerativeSLM;
+pub use slm::{GenerativeSLM, TransformerConfig};
 pub use tensor::Tensor;
 pub use tokenizer::ByteBpeTokenizer;
 pub use train::{accuracy, train_epoch, EmbedT, Net};

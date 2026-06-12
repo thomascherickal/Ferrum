@@ -26,6 +26,7 @@ use crate::csv::{ModelMetadata, Normalizer};
 use crate::error::{InferError, Result};
 use crate::layer::{ActivationLayer, Embedding, Flatten, LayerNorm, Linear, TransformerBlock};
 use crate::model::Sequential;
+use crate::quant::{int8_scale, QUANT_MIN_LEN};
 
 const MAGIC: &[u8; 4] = b"FINF";
 const VERSION: u32 = 4;
@@ -40,9 +41,6 @@ const TAG_FLATTEN: u8 = 5;
 /// v5 weight-vector encoding markers.
 const ENC_F32: u8 = 0;
 const ENC_INT8: u8 = 1;
-/// Vectors shorter than this stay f32 even in quantized files: biases and
-/// LayerNorm parameters are small (no size win) and accuracy-sensitive.
-const QUANT_MIN_LEN: usize = 64;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Reader helper
@@ -155,8 +153,7 @@ fn push_weights(out: &mut Vec<u8>, data: &[f32], v5: bool, quantize: bool) {
     }
     let finite = data.iter().all(|v| v.is_finite());
     if quantize && data.len() >= QUANT_MIN_LEN && finite {
-        let max_abs = data.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-        let scale = max_abs / 127.0;
+        let scale = int8_scale(data);
         out.push(ENC_INT8);
         out.extend_from_slice(&scale.to_le_bytes());
         if scale == 0.0 {
@@ -465,6 +462,7 @@ mod tests {
             target_range: [0.0, 2.0],
             input_dim: 4,
             output_dim: 3,
+            tokenizer_state: String::new(),
         };
         (model, norm, meta)
     }
@@ -499,6 +497,7 @@ mod tests {
             target_range: [0.0, vocab_size as f32],
             input_dim: max_seq_len,
             output_dim: vocab_size,
+            tokenizer_state: String::new(),
         };
         (model, norm, meta)
     }
@@ -685,6 +684,7 @@ mod tests {
             target_range: [0.0, 0.0],
             input_dim: 0,
             output_dim: 0,
+            tokenizer_state: String::new(),
         };
         assert!(matches!(to_bytes(&model, &norm, &meta), Err(InferError::Format(_))));
     }
@@ -772,6 +772,7 @@ mod tests {
             target_range: [0.0, 0.0],
             input_dim: embedding_dim,
             output_dim: embedding_dim,
+            tokenizer_state: String::new(),
         };
 
         let bytes = to_bytes(&model, &norm, &meta).unwrap();
