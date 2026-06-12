@@ -8,7 +8,7 @@
 //! ## Architecture at a glance
 //!
 //! ```text
-//! Tensor ──► ops (matmul, softmax, …)  ──► parallel (std-only CPU threads)
+//! Tensor ──► ops (matmul, softmax, …)  ──► parallel (std-only persistent CPU worker pool)
 //!      │
 //!      └──► Layer trait
 //!             ├── Linear          (y = xW + b)

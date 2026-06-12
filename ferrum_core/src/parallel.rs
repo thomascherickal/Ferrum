@@ -1,23 +1,33 @@
 //! Dynamic CPU parallelism for the hot numeric kernels — built only on `std`.
 //!
-//! Ferrum has zero external dependencies, so there is no `rayon` or `num_cpus`.
-//! This module detects the machine's parallelism once via
-//! [`std::thread::available_parallelism`] (overridable with the
-//! `FERRUM_NUM_THREADS` environment variable) and splits row-major matrix
-//! outputs into contiguous row blocks computed on scoped threads.
+//! Ferrum has zero external dependencies and is `#![forbid(unsafe_code)]`, so
+//! there is no `rayon`/`num_cpus` and no `unsafe` lifetime tricks. Instead this
+//! module runs a **persistent worker pool**: a fixed set of `'static` threads is
+//! spawned once (lazily, on first use) and reused for every matmul, rather than
+//! creating fresh OS threads per call. This matters most for autoregressive
+//! generation, which issues thousands of small matmuls whose per-call
+//! thread-creation cost would otherwise dominate (and even regress at high
+//! thread counts).
+//!
+//! Because safe Rust cannot hand a borrowed closure to threads that outlive the
+//! call, kernels share their read-only inputs through [`std::sync::Arc`] (one
+//! cheap clone per matmul, not per worker) and each worker computes and returns
+//! an **owned** output block; the caller stitches the blocks back together.
 //!
 //! The design is opt-out-safe:
 //!
-//! * Workloads below a scalar-work threshold run serially (thread spawn cost
-//!   would dominate a small matmul).
-//! * The `wasm32` target, which has no thread support, always runs serially.
+//! * Workloads below a scalar-work threshold run serially on the calling thread
+//!   ([`should_parallelize`] returns `false`), so small matmuls pay nothing.
+//! * The `wasm32` target, which has no threads, always runs serially and never
+//!   spawns the pool.
 //! * Splitting the output by rows never changes the per-element arithmetic, so
 //!   results are **bit-for-bit identical** regardless of the thread count and
 //!   training/inference stay deterministic.
 //!
 //! GPUs are never used: all parallelism is plain CPU threads.
 
-use std::sync::OnceLock;
+use std::sync::mpsc::{channel, Sender};
+use std::sync::{Arc, OnceLock};
 
 static NUM_THREADS: OnceLock<usize> = OnceLock::new();
 
@@ -53,47 +63,117 @@ fn detect() -> usize {
         .unwrap_or(1)
 }
 
-/// Total scalar multiply–add count below which threading is not worth its spawn
-/// cost; smaller outputs are computed serially.
+/// Total scalar multiply–add count below which threading is not worth its
+/// dispatch cost; smaller outputs are computed serially.
 const PARALLEL_THRESHOLD: usize = 1 << 16;
 
-/// Fill a row-major `[m, n]` output by running `f(first_row, block)` over
-/// contiguous blocks of rows, in parallel across CPU threads when the workload
-/// justifies it.
+/// Whether a row-major output with `rows` rows and an estimated total scalar
+/// `cost` (e.g. `m * k * n` for a matmul) is worth splitting across the worker
+/// pool. Callers should run the serial path directly when this is `false` to
+/// avoid the input `Arc` clone the parallel path needs.
+pub fn should_parallelize(rows: usize, cost: usize) -> bool {
+    rows >= 2 && cost >= PARALLEL_THRESHOLD && num_threads() > 1
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Persistent worker pool
+// ─────────────────────────────────────────────────────────────────────────────
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+/// A fixed set of long-lived worker threads, each owning one job channel.
+struct Pool {
+    senders: Vec<Sender<Job>>,
+}
+
+static POOL: OnceLock<Pool> = OnceLock::new();
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pool() -> &'static Pool {
+    POOL.get_or_init(|| {
+        let n = num_threads().max(1);
+        let mut senders = Vec::with_capacity(n);
+        for id in 0..n {
+            let (tx, rx) = channel::<Job>();
+            std::thread::Builder::new()
+                .name(format!("ferrum-worker-{id}"))
+                .spawn(move || {
+                    // Park on the channel; run jobs until the sender is dropped
+                    // (only at process shutdown, since `POOL` is 'static).
+                    while let Ok(job) = rx.recv() {
+                        job();
+                    }
+                })
+                .expect("ferrum: failed to spawn worker thread");
+            senders.push(tx);
+        }
+        Pool { senders }
+    })
+}
+
+/// Fill a row-major `[m, n]` output by running `kernel(r0, r1, block)` over
+/// contiguous row blocks on the persistent worker pool.
 ///
-/// `cost` is an estimate of the total scalar work (e.g. `m * k * n` for a
-/// matmul); `out` must contain exactly `m * n` elements. `f` receives the
-/// global index of a block's first row and that block's mutable slice of `out`
-/// (whose length is a whole number of `n`-wide rows). Every output element is
-/// written by exactly one invocation of `f`, so the result does not depend on
-/// the number of threads.
-pub fn for_row_blocks<F>(m: usize, n: usize, cost: usize, out: &mut [f32], f: F)
+/// `kernel` must fill rows `r0..r1` into `block`, a fresh buffer of exactly
+/// `(r1 - r0) * n` elements indexed locally (row `i` lives at `(i - r0) * n`).
+/// Every row is produced by exactly one call, so the result does not depend on
+/// the number of threads. `kernel` is shared across workers via `Arc`, so it
+/// must own its inputs (typically `Arc<[f32]>` clones) — that ownership is what
+/// lets the work run on threads outliving this call without any `unsafe`.
+///
+/// Intended to be called only when [`should_parallelize`] is `true`; it is
+/// always correct, and on `wasm32` simply runs the kernel serially.
+pub fn run<K>(m: usize, n: usize, kernel: K) -> Vec<f32>
 where
-    F: Fn(usize, &mut [f32]) + Sync,
+    K: Fn(usize, usize, &mut [f32]) + Send + Sync + 'static,
 {
-    debug_assert_eq!(out.len(), m * n, "out must hold exactly m*n elements");
-
-    let threads = num_threads().min(m.max(1));
-    let parallel = threads > 1 && n > 0 && cost >= PARALLEL_THRESHOLD;
-
-    #[cfg(not(target_arch = "wasm32"))]
-    if parallel {
-        let rows_per = m.div_ceil(threads);
-        let block_len = rows_per * n;
-        std::thread::scope(|s| {
-            let f = &f;
-            let mut row0 = 0usize;
-            for block in out.chunks_mut(block_len) {
-                let start = row0;
-                s.spawn(move || f(start, block));
-                row0 += rows_per;
-            }
-        });
-        return;
+    #[cfg(target_arch = "wasm32")]
+    {
+        let mut out = vec![0.0f32; m * n];
+        kernel(0, m, &mut out);
+        out
     }
 
-    let _ = parallel; // used only on native; silences the wasm warning
-    f(0, out);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let threads = num_threads().max(1).min(m.max(1));
+        if threads <= 1 {
+            let mut out = vec![0.0f32; m * n];
+            kernel(0, m, &mut out);
+            return out;
+        }
+
+        let rows_per = m.div_ceil(threads);
+        let kernel = Arc::new(kernel);
+        let pool = pool();
+        let (tx, rx) = channel::<(usize, Vec<f32>)>();
+
+        let mut blocks = 0usize;
+        let mut r0 = 0usize;
+        while r0 < m {
+            let r1 = (r0 + rows_per).min(m);
+            let kernel = Arc::clone(&kernel);
+            let tx = tx.clone();
+            let job: Job = Box::new(move || {
+                let mut block = vec![0.0f32; (r1 - r0) * n];
+                kernel(r0, r1, &mut block);
+                let _ = tx.send((r0, block));
+            });
+            // One block per worker: `blocks` never exceeds `threads`.
+            let _ = pool.senders[blocks % pool.senders.len()].send(job);
+            blocks += 1;
+            r0 = r1;
+        }
+        drop(tx);
+
+        let mut out = vec![0.0f32; m * n];
+        for _ in 0..blocks {
+            let (r0, block) = rx.recv().expect("ferrum: worker thread disconnected");
+            let start = r0 * n;
+            out[start..start + block.len()].copy_from_slice(&block);
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -106,24 +186,30 @@ mod tests {
     }
 
     #[test]
-    fn for_row_blocks_covers_every_row_once() {
-        // A tiny serial workload (below threshold) and a large one must both
-        // fill the whole output exactly once.
-        for &(m, n) in &[(3usize, 4usize), (257, 129)] {
-            let mut out = vec![0.0f32; m * n];
-            let cost = m * n * 64; // large enough to cross the threshold for the big case
-            for_row_blocks(m, n, cost, &mut out, |row0, block| {
-                let rows = block.len() / n;
-                for li in 0..rows {
-                    let i = row0 + li;
-                    for j in 0..n {
-                        block[li * n + j] = (i * n + j) as f32;
-                    }
+    fn run_covers_every_row_exactly_once() {
+        // A large output (above the threshold) split across the pool must fill
+        // every element exactly once, regardless of how many workers ran it.
+        let (m, n) = (257usize, 129usize);
+        let out = run(m, n, move |r0, r1, block| {
+            for i in r0..r1 {
+                let o = (i - r0) * n;
+                for j in 0..n {
+                    block[o + j] = (i * n + j) as f32;
                 }
-            });
-            for (idx, &v) in out.iter().enumerate() {
-                assert_eq!(v, idx as f32, "element {idx} not written exactly once");
             }
+        });
+        assert_eq!(out.len(), m * n);
+        for (idx, &v) in out.iter().enumerate() {
+            assert_eq!(v, idx as f32, "element {idx} not written exactly once");
+        }
+    }
+
+    #[test]
+    fn should_parallelize_gates_on_size() {
+        assert!(!should_parallelize(1, usize::MAX), "single row stays serial");
+        assert!(!should_parallelize(1000, 0), "trivial work stays serial");
+        if num_threads() > 1 {
+            assert!(should_parallelize(1000, PARALLEL_THRESHOLD));
         }
     }
 }

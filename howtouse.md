@@ -217,8 +217,12 @@ training paths and generation get faster on multi-core machines automatically.
 - **Override.** Set the `FERRUM_NUM_THREADS` environment variable to a positive
   integer to pin the thread count (e.g. `FERRUM_NUM_THREADS=1` forces serial
   execution, useful for benchmarking or reproducibility audits).
-- **Zero dependencies.** Parallelism is built only on `std` (`thread::scope`),
-  so the no-external-crates guarantee still holds.
+- **Persistent worker pool.** A fixed set of worker threads is spawned once and
+  reused for every matmul, so autoregressive generation (thousands of small
+  matmuls) does not pay per-call thread-creation cost.
+- **Zero dependencies, no `unsafe`.** Parallelism is built only on `std`
+  (threads + channels + `Arc`), so both the no-external-crates and
+  `#![forbid(unsafe_code)]` guarantees still hold.
 - **Deterministic.** The row-split never changes per-element arithmetic, so
   results are bit-for-bit identical regardless of the thread count. Small
   workloads run serially (thread-spawn cost would dominate), and the `wasm32`

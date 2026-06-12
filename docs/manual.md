@@ -16,10 +16,17 @@ layers are built from.
 ### CPU parallelism
 
 The matmul kernels (in `ops` and the attention helpers) split their output rows
-across CPU threads using the `parallel` module, which is built only on `std`
-(`thread::scope`). The worker count is detected once from
-`std::thread::available_parallelism()` and can be overridden with the
-`FERRUM_NUM_THREADS` environment variable; query it with
+across a **persistent worker pool** in the `parallel` module, built only on
+`std` (threads, channels, and `Arc`) with no `unsafe`. Worker threads are
+spawned once and reused for every matmul, so autoregressive generation — which
+issues thousands of small matmuls — pays no per-call thread-creation cost.
+Because safe Rust cannot pass a borrowed closure to threads that outlive the
+call, each kernel shares its read-only inputs via `Arc` (one clone per matmul,
+not per worker) and every worker returns an owned output block that the caller
+stitches together.
+
+The worker count is detected once from `std::thread::available_parallelism()`
+and can be overridden with `FERRUM_NUM_THREADS`; query it with
 `ferrum_core::num_threads()`. Workloads below an internal scalar-work threshold,
 and the `wasm32` target, run serially. The row split does not change per-element
 arithmetic, so output is bit-for-bit identical regardless of thread count — both

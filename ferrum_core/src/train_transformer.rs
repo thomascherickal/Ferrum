@@ -147,25 +147,37 @@ fn ln_bwd(
 }
 
 /// out [m,n] = aᵀ·b where a is [k,m] and b is [k,n].
-fn matmul_transpose_a_helper(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
-    // out[i,j] = Σ_r a[r,i] · b[r,j]. Output rows (i) are independent, so split
-    // them across threads; the sum over r keeps its original order per element.
-    let mut out = vec![0.0f32; m * n];
-    crate::parallel::for_row_blocks(m, n, m * n * k, &mut out, |row0, block| {
-        let rows = block.len() / n;
-        for li in 0..rows {
-            let i = row0 + li;
-            let o_row = li * n;
-            for r in 0..k {
-                let a_ri = a[r * m + i];
-                let b_row = r * n;
-                for j in 0..n {
-                    block[o_row + j] += a_ri * b[b_row + j];
-                }
+/// Rows `r0..r1` of `Aᵀ·B`: `out[i,j] = Σ_r a[r,i] · b[r,j]` (A is `[k, m]`,
+/// B is `[k, n]`), written into a locally-indexed `out`. Output rows (i) are
+/// independent and the sum over r keeps its original order, so the split is
+/// exact. Shared by the serial and pooled paths.
+#[allow(clippy::too_many_arguments)]
+fn transpose_a_block(a: &[f32], b: &[f32], m: usize, n: usize, k: usize, r0: usize, r1: usize, out: &mut [f32]) {
+    for i in r0..r1 {
+        let o_row = (i - r0) * n;
+        for r in 0..k {
+            let a_ri = a[r * m + i];
+            let b_row = r * n;
+            for j in 0..n {
+                out[o_row + j] += a_ri * b[b_row + j];
             }
         }
-    });
-    out
+    }
+}
+
+fn matmul_transpose_a_helper(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    let cost = m.saturating_mul(n).saturating_mul(k);
+    if crate::parallel::should_parallelize(m, cost) {
+        let a_arc = std::sync::Arc::<[f32]>::from(a);
+        let b_arc = std::sync::Arc::<[f32]>::from(b);
+        crate::parallel::run(m, n, move |r0, r1, block| {
+            transpose_a_block(&a_arc, &b_arc, m, n, k, r0, r1, block);
+        })
+    } else {
+        let mut out = vec![0.0f32; m * n];
+        transpose_a_block(a, b, m, n, k, 0, m, &mut out);
+        out
+    }
 }
 
 /// Causal multi-head attention forward over [M=B·T, C] projections.
