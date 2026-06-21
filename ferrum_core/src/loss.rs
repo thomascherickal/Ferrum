@@ -65,10 +65,10 @@ pub fn softmax_cross_entropy(logits: &Tensor, targets: &[usize]) -> Result<(f32,
 
     if verbose::is_verbose() {
         if mean_loss.is_nan() {
-            println!("[ferrum_core::WARN] ⚠️  softmax_cross_entropy returned NaN loss!");
+            crate::verbose::log_line("[ferrum_core::WARN] ⚠️  softmax_cross_entropy returned NaN loss!");
         }
         if mean_loss.is_infinite() {
-            println!("[ferrum_core::WARN] ⚠️  softmax_cross_entropy returned Infinite loss!");
+            crate::verbose::log_line("[ferrum_core::WARN] ⚠️  softmax_cross_entropy returned Infinite loss!");
         }
         let (gmin, gmax, gmean) = verbose::stats(&grad);
         vprintln!("[loss::softmax_cross_entropy] gradient stats: min={:.6e}, max={:.6e}, mean={:.6e}", gmin, gmax, gmean);
@@ -202,7 +202,7 @@ pub fn mse(preds: &crate::tensor::Tensor, targets: &[f32]) -> Result<(f32, crate
 
     if verbose::is_verbose() {
         if mean_loss.is_nan() {
-            println!("[ferrum_core::WARN] ⚠️  MSE returned NaN loss!");
+            crate::verbose::log_line("[ferrum_core::WARN] ⚠️  MSE returned NaN loss!");
         }
         let (gmin, gmax, gmean) = verbose::stats(&grad);
         vprintln!("[loss::mse] gradient stats: min={:.6e}, max={:.6e}, mean={:.6e}", gmin, gmax, gmean);

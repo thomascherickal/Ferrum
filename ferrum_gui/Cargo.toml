@@ -1,0 +1,28 @@
+[package]
+name = "ferrum_gui"
+version = "0.3.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Ferrum SLM Studio — a Tauri GUI for training, evaluating, and running Ferrum SLMs"
+default-run = "ferrum_gui"
+
+# A library target is required for Tauri's mobile (Android/iOS) entry point.
+[lib]
+name = "ferrum_gui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "ferrum_gui"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = "0.33"
+ureq = "2"
+ferrum_core = { path = "../ferrum_core" }

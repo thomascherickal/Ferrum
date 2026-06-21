@@ -556,10 +556,10 @@ pub fn train_epoch(
 
         if verbose::is_verbose() {
             if loss.is_nan() {
-                println!("[ferrum_core::WARN] ⚠️  NaN loss detected at step {}! Training may diverge.", step+1);
+                crate::verbose::log_line(&format!("[ferrum_core::WARN] ⚠️  NaN loss detected at step {}! Training may diverge.", step+1));
             }
             if loss.is_infinite() {
-                println!("[ferrum_core::WARN] ⚠️  Infinite loss detected at step {}! Training may diverge.", step+1);
+                crate::verbose::log_line(&format!("[ferrum_core::WARN] ⚠️  Infinite loss detected at step {}! Training may diverge.", step+1));
             }
             verbose::check_nan_inf(&dlogits.data, &format!("train_epoch step {} dlogits", step+1));
         }

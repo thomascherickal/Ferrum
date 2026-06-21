@@ -35,6 +35,41 @@ The CLI prints loss at regular intervals during `train`:
 
 ---
 
+## 1a. Held-out perplexity
+
+Training loss measures *fit*; perplexity on text the model never saw measures
+*generalization*. `GenerativeSLM::evaluate` slides the context window across
+held-out text and scores the probability assigned to each actual next token,
+using the trained int8-aware weights:
+
+```rust
+let eval = slm.evaluate(&held_out_text)?;
+println!("perplexity   = {:.3}", eval.perplexity);     // lower is better; 1.0 is ideal
+println!("cross-entropy= {:.3} nats", eval.cross_entropy);
+println!("bits/token   = {:.3}", eval.bits_per_token);
+println!("scored {} predictions", eval.num_predictions);
+```
+
+A *uniform* model that learned nothing scores a perplexity equal to the
+vocabulary size; a trained model should be far below that. The CLI exposes the
+same metric:
+
+```bash
+train_transformer eval model.bin heldout.txt
+```
+
+```text
+Predictions  : 72
+Cross-entropy: 1.3112 nats/token
+Bits/token   : 1.8917
+Perplexity   : 3.7107
+```
+
+`evaluate` works for all model families (one-hot MLP, embedded, transformer,
+BPE) and requires text longer than the context window.
+
+---
+
 ## 2. Generation quality
 
 There is no GPU-scale benchmark here; evaluate generation qualitatively and with

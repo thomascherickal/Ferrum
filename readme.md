@@ -34,6 +34,7 @@ Raspberry Pi, or in a browser tab.
 | `train_cli`    | binary (`train_cli`)         | Train tabular MLP classifiers/regressors from any CSV               |
 | `tabular_wasm` | cdylib + rlib                | `wasm-bindgen` bindings for running models in the browser           |
 | `tests`        | integration                  | Cross-crate integration and regression tests                        |
+| `ferrum_gui`   | Tauri app (excluded crate)   | Cross-platform GUI (HTML/CSS/vanilla JS) for the whole project — see [ferrum_gui/README.md](ferrum_gui/README.md) |
 
 ---
 
@@ -132,6 +133,7 @@ tokenizer of that size.
 | Document                          | Contents                                            |
 |-----------------------------------|-----------------------------------------------------|
 | [installation.md](installation.md)| Build, install, and toolchain requirements          |
+| [instructions.md](instructions.md)| End-to-end SLM build walkthrough (train → eval → ship) |
 | [howtouse.md](howtouse.md)        | CLI and library usage guide                          |
 | [example.md](example.md)          | End-to-end worked examples                           |
 | [usecases.md](usecases.md)        | Ten scenarios where Ferrum is a good fit            |

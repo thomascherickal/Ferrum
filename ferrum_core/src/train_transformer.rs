@@ -23,6 +23,7 @@ const LN_EPS: f32 = 1e-5; // must match layer::LayerNorm
 // Parameter with gradient and Adam moment buffers
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct Param {
     data: Tensor,
     grad: Tensor,
@@ -319,6 +320,7 @@ fn attn_bwd(
 // Trainable block + forward cache
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct BlockT {
     ln1_g: Param,
     ln1_b: Param,
@@ -409,6 +411,11 @@ pub struct FwdCache {
 /// Train with `forward` / `backward` / `step` (Adam), then `to_inference()`
 /// to obtain a `Sequential` that serializes to FINF and runs anywhere
 /// (including WASM with KV-cached generation).
+///
+/// `Clone` produces a deep copy of every weight, gradient, and Adam moment
+/// buffer; [`train_transformer_epoch_threaded`] uses it to give each worker
+/// thread an independent network to accumulate gradients into.
+#[derive(Clone)]
 pub struct TransformerNet {
     vocab_size: usize,
     context_len: usize,
@@ -500,6 +507,72 @@ impl TransformerNet {
         v.push(&mut self.head_w.data);
         v.push(&mut self.head_b.data);
         v
+    }
+
+    /// Every gradient tensor, in the same fixed order as
+    /// [`TransformerNet::param_tensors_mut`]. Used to reduce per-shard
+    /// gradients in [`train_transformer_epoch_threaded`].
+    fn grad_tensors_mut(&mut self) -> Vec<&mut Tensor> {
+        let mut v: Vec<&mut Tensor> = vec![&mut self.tok_emb.grad, &mut self.pos_emb.grad];
+        for b in &mut self.blocks {
+            v.push(&mut b.ln1_g.grad);
+            v.push(&mut b.ln1_b.grad);
+            v.push(&mut b.q_w.grad);
+            v.push(&mut b.q_b.grad);
+            v.push(&mut b.k_w.grad);
+            v.push(&mut b.k_b.grad);
+            v.push(&mut b.v_w.grad);
+            v.push(&mut b.v_b.grad);
+            v.push(&mut b.o_w.grad);
+            v.push(&mut b.o_b.grad);
+            v.push(&mut b.ln2_g.grad);
+            v.push(&mut b.ln2_b.grad);
+            v.push(&mut b.f1_w.grad);
+            v.push(&mut b.f1_b.grad);
+            v.push(&mut b.f2_w.grad);
+            v.push(&mut b.f2_b.grad);
+        }
+        v.push(&mut self.lnf_g.grad);
+        v.push(&mut self.lnf_b.grad);
+        v.push(&mut self.head_w.grad);
+        v.push(&mut self.head_b.grad);
+        v
+    }
+
+    /// Flatten every gradient tensor into one contiguous vector, in canonical
+    /// parameter order. The inverse of [`TransformerNet::load_grads`].
+    pub(crate) fn collect_grads(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.num_params());
+        let push = |out: &mut Vec<f32>, p: &Param| out.extend_from_slice(&p.grad.data);
+        push(&mut out, &self.tok_emb);
+        push(&mut out, &self.pos_emb);
+        for b in &self.blocks {
+            for p in [
+                &b.ln1_g, &b.ln1_b, &b.q_w, &b.q_b, &b.k_w, &b.k_b, &b.v_w, &b.v_b,
+                &b.o_w, &b.o_b, &b.ln2_g, &b.ln2_b, &b.f1_w, &b.f1_b, &b.f2_w, &b.f2_b,
+            ] {
+                push(&mut out, p);
+            }
+        }
+        push(&mut out, &self.lnf_g);
+        push(&mut out, &self.lnf_b);
+        push(&mut out, &self.head_w);
+        push(&mut out, &self.head_b);
+        out
+    }
+
+    /// Overwrite every gradient tensor from a flat vector produced by
+    /// [`TransformerNet::collect_grads`] (e.g. a summed cross-shard gradient),
+    /// so a subsequent [`TransformerNet::step`] applies it. Panics if `flat`
+    /// has the wrong length.
+    pub(crate) fn load_grads(&mut self, flat: &[f32]) {
+        let mut offset = 0usize;
+        for g in self.grad_tensors_mut() {
+            let n = g.data.len();
+            g.data.copy_from_slice(&flat[offset..offset + n]);
+            offset += n;
+        }
+        debug_assert_eq!(offset, flat.len(), "load_grads: length mismatch");
     }
 
     /// Copy of every parameter tensor's data (the fp32 master weights).
@@ -837,6 +910,153 @@ pub fn train_transformer_epoch(
     Ok(avg)
 }
 
+/// Data-parallel version of [`train_transformer_epoch`]: each minibatch is split
+/// into up to `threads` shards processed concurrently on separate OS threads,
+/// then their gradients are summed and a single Adam update is applied.
+///
+/// Parallelism is **across training examples** (sequences), complementing the
+/// per-matmul row parallelism in [`crate::ops::matmul`]. It is built only on
+/// `std::thread::scope` — no external crates, no `unsafe`. Each shard clones the
+/// network (cheap relative to forward/backward for non-trivial models), computes
+/// gradients over its sequences against the shared weights, and the partial
+/// gradients are reduced in a **fixed shard order**, so a run is reproducible for
+/// a given `threads` value. With `threads <= 1` (or a single sequence) this is
+/// bit-for-bit identical to [`train_transformer_epoch`]; with more threads the
+/// only differences are the floating-point regrouping of the gradient sum.
+///
+/// The RNG is drawn exactly as in the serial path (the whole minibatch is
+/// sampled up front, then sharded), so the sequence of training windows does not
+/// depend on the thread count. QAT semantics are preserved: weights are
+/// int8-snapped on the shared master before the shards fork, and the fp32
+/// masters are restored before the optimizer step.
+///
+/// On `wasm32` (no threads) this transparently runs the serial path.
+pub fn train_transformer_epoch_threaded(
+    net: &mut TransformerNet,
+    tokens: &[usize],
+    batch_size: usize,
+    adam: &Adam,
+    rng: &mut Rng,
+    threads: usize,
+) -> Result<f32> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = threads;
+        return train_transformer_epoch(net, tokens, batch_size, adam, rng);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use crate::loss::softmax_cross_entropy;
+        let nshards = threads.max(1).min(batch_size.max(1));
+        // One shard (or a single-sequence batch) is exactly the serial path.
+        if nshards <= 1 {
+            return train_transformer_epoch(net, tokens, batch_size, adam, rng);
+        }
+
+        let t = net.context_len();
+        if tokens.len() < t + 1 {
+            return Err(InferError::DimMismatch(format!(
+                "need at least context_len+1 = {} tokens, got {}",
+                t + 1,
+                tokens.len()
+            )));
+        }
+        let num_windows = tokens.len() - t;
+        let steps = num_windows.div_ceil(batch_size);
+        let total_rows = (batch_size * t) as f32;
+        let mut total = 0.0f32;
+
+        for _ in 0..steps {
+            // Draw the whole minibatch up front — identical RNG use to serial.
+            let mut input = Vec::with_capacity(batch_size * t);
+            let mut targets = Vec::with_capacity(batch_size * t);
+            for _ in 0..batch_size {
+                let start = (rng.next_u64() as usize) % num_windows;
+                input.extend_from_slice(&tokens[start..start + t]);
+                targets.extend_from_slice(&tokens[start + 1..start + t + 1]);
+            }
+
+            // QAT: snap the shared master weights before forking the shards, so
+            // every shard's forward/backward runs at the int8 grid.
+            let masters = if net.qat_enabled() {
+                let snapshot = net.snapshot_weights();
+                net.fake_quantize_weights();
+                Some(snapshot)
+            } else {
+                None
+            };
+
+            let per = batch_size.div_ceil(nshards);
+            let net_ref: &TransformerNet = net;
+            let input_ref = &input;
+            let targets_ref = &targets;
+
+            // Each shard returns its weighted (loss, flat-gradients). Weighting by
+            // shard_rows / total_rows makes the summed result equal the serial
+            // gradient, which normalises by the full batch's row count.
+            let results: Vec<Result<(f32, Vec<f32>)>> = std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                let mut w0 = 0usize;
+                while w0 < batch_size {
+                    let w1 = (w0 + per).min(batch_size);
+                    handles.push(scope.spawn(move || -> Result<(f32, Vec<f32>)> {
+                        let mut worker = net_ref.clone();
+                        worker.zero_grad();
+                        let sub_in = &input_ref[w0 * t..w1 * t];
+                        let sub_tg = &targets_ref[w0 * t..w1 * t];
+                        let (logits, cache) = worker.forward(sub_in)?;
+                        let (loss, dlogits) = softmax_cross_entropy(&logits, sub_tg)?;
+                        worker.backward(&dlogits, &cache)?;
+                        let shard_rows = ((w1 - w0) * t) as f32;
+                        let weight = shard_rows / total_rows;
+                        let mut g = worker.collect_grads();
+                        for x in &mut g {
+                            *x *= weight;
+                        }
+                        Ok((loss * weight, g))
+                    }));
+                    w0 = w1;
+                }
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("ferrum: training worker thread panicked"))
+                    .collect()
+            });
+
+            // Reduce in deterministic shard order (independent of scheduling).
+            let mut summed: Option<Vec<f32>> = None;
+            let mut step_loss = 0.0f32;
+            for r in results {
+                let (loss, g) = r?;
+                step_loss += loss;
+                match &mut summed {
+                    None => summed = Some(g),
+                    Some(acc) => {
+                        for (a, b) in acc.iter_mut().zip(&g) {
+                            *a += b;
+                        }
+                    }
+                }
+            }
+            let summed = summed.expect("at least one shard always runs");
+
+            if let Some(snapshot) = &masters {
+                net.restore_weights(snapshot);
+            }
+            net.load_grads(&summed);
+            net.step(adam)?;
+            total += step_loss;
+        }
+
+        let avg = total / steps as f32;
+        if verbose::is_verbose() {
+            vprintln!("[train_transformer::epoch_threaded] shards={nshards}, steps={steps}, mean loss={avg:.6}");
+        }
+        Ok(avg)
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1114,5 +1334,118 @@ mod tests {
         assert!(net.forward(&[]).is_err());
         assert!(net.forward(&[1, 2]).is_err()); // not a multiple of T=3
         assert!(net.forward(&[1, 2, 99]).is_err()); // token out of vocab
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Multi-threaded (data-parallel) training
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// `threads <= 1` must be the serial path, bit-for-bit.
+    #[test]
+    fn threaded_one_shard_matches_serial_bitwise() {
+        let mut rng0 = Rng::new(7);
+        let base = TransformerNet::new(6, 4, 8, 2, 16, 1, &mut rng0).unwrap();
+        let tokens: Vec<usize> = (0..200).map(|i| (i * 7) % 6).collect();
+        let adam = Adam::new(0.01);
+
+        let mut serial = base.clone();
+        let mut rs = Rng::new(99);
+        let ls = train_transformer_epoch(&mut serial, &tokens, 8, &adam, &mut rs).unwrap();
+
+        let mut threaded = base.clone();
+        let mut rt = Rng::new(99);
+        let lt = train_transformer_epoch_threaded(&mut threaded, &tokens, 8, &adam, &mut rt, 1).unwrap();
+
+        assert_eq!(ls, lt, "loss differs with a single shard");
+        assert_eq!(
+            serial.snapshot_weights(),
+            threaded.snapshot_weights(),
+            "weights differ with a single shard"
+        );
+    }
+
+    /// Multi-shard data-parallel must match the serial gradient/step to within
+    /// floating-point regrouping error after one step (batch = all windows).
+    #[test]
+    fn threaded_multishard_matches_serial_one_step() {
+        let mut rng0 = Rng::new(7);
+        let base = TransformerNet::new(6, 4, 8, 2, 16, 1, &mut rng0).unwrap();
+        let tokens: Vec<usize> = (0..200).map(|i| (i * 7) % 6).collect();
+        let adam = Adam::new(0.05);
+        let batch = tokens.len() - 4; // a single optimizer step over every window
+
+        let mut serial = base.clone();
+        let mut rs = Rng::new(1);
+        let ls = train_transformer_epoch(&mut serial, &tokens, batch, &adam, &mut rs).unwrap();
+
+        let mut par = base.clone();
+        let mut rp = Rng::new(1);
+        let lp = train_transformer_epoch_threaded(&mut par, &tokens, batch, &adam, &mut rp, 4).unwrap();
+
+        assert!((ls - lp).abs() < 1e-4, "loss diverged: serial {ls} vs threaded {lp}");
+        let sw = serial.snapshot_weights();
+        let pw = par.snapshot_weights();
+        for (a, b) in sw.iter().zip(&pw) {
+            for (x, y) in a.iter().zip(b) {
+                assert!((x - y).abs() < 1e-4, "weight diverged: {x} vs {y}");
+            }
+        }
+    }
+
+    /// The QAT path must also behave identically for a single shard.
+    #[test]
+    fn threaded_qat_one_shard_matches_serial() {
+        let mut rng0 = Rng::new(13);
+        let mut base = TransformerNet::new(6, 4, 8, 2, 16, 1, &mut rng0).unwrap();
+        base.set_qat(true);
+        let tokens: Vec<usize> = (0..200).map(|i| (i * 3) % 6).collect();
+        let adam = Adam::new(0.01);
+
+        let mut serial = base.clone();
+        let mut rs = Rng::new(5);
+        for _ in 0..3 {
+            train_transformer_epoch(&mut serial, &tokens, 8, &adam, &mut rs).unwrap();
+        }
+        let mut threaded = base.clone();
+        let mut rt = Rng::new(5);
+        for _ in 0..3 {
+            train_transformer_epoch_threaded(&mut threaded, &tokens, 8, &adam, &mut rt, 1).unwrap();
+        }
+        assert_eq!(serial.snapshot_weights(), threaded.snapshot_weights());
+    }
+
+    /// Data-parallel training reduces loss like the serial path.
+    #[test]
+    fn threaded_multishard_reduces_loss() {
+        let mut rng0 = Rng::new(7);
+        let mut net = TransformerNet::new(4, 4, 8, 2, 16, 1, &mut rng0).unwrap();
+        let tokens: Vec<usize> = (0..400).map(|i| i % 4).collect();
+        let adam = Adam::new(0.01);
+        let mut rng = Rng::new(123);
+        let first = train_transformer_epoch_threaded(&mut net, &tokens, 16, &adam, &mut rng, 4).unwrap();
+        let mut last = first;
+        for _ in 0..30 {
+            last = train_transformer_epoch_threaded(&mut net, &tokens, 16, &adam, &mut rng, 4).unwrap();
+        }
+        assert!(last < first * 0.5, "threaded loss did not halve: {first:.4} → {last:.4}");
+    }
+
+    /// For a fixed `threads` value, training is reproducible regardless of how
+    /// the OS schedules the worker threads (deterministic shard reduction).
+    #[test]
+    fn threaded_training_is_reproducible() {
+        let mut rng0 = Rng::new(5);
+        let base = TransformerNet::new(5, 4, 8, 2, 16, 1, &mut rng0).unwrap();
+        let tokens: Vec<usize> = (0..300).map(|i| (i * 11) % 5).collect();
+        let adam = Adam::new(0.01);
+        let run = || {
+            let mut n = base.clone();
+            let mut r = Rng::new(321);
+            for _ in 0..10 {
+                train_transformer_epoch_threaded(&mut n, &tokens, 12, &adam, &mut r, 4).unwrap();
+            }
+            n.snapshot_weights()
+        };
+        assert_eq!(run(), run(), "threaded training is not reproducible");
     }
 }

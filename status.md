@@ -31,7 +31,17 @@ SLMs, and MLPs. The workspace builds clean and the full test suite passes.
 - **Tokenizer** — `ByteBpeTokenizer`, a byte-level BPE tokenizer that
   round-trips any UTF-8 text, with a portable merge-list state.
 - **Generative SLM** — `GenerativeSLM` with three training paths (`train`,
-  `train_embedded`, `train_transformer`), unified generation, and FINF I/O.
+  `train_embedded`, `train_transformer`), unified generation, **streaming
+  generation** (`generate_stream`, fragment-at-a-time + CLI `--stream`),
+  held-out perplexity evaluation (`evaluate` / CLI `eval`), seed-stripped
+  `generate_continuation`, and FINF I/O.
+- **Multi-threaded training** — data-parallel minibatch training for the
+  transformer (`train_transformer_epoch_threaded`, SLM
+  `train_transformer_threaded_with_callback`, CLI `--threads`). Each minibatch is
+  sharded across `std::thread::scope` workers and gradients are reduced in a
+  fixed order, so it is `unsafe`-free, zero-dependency, reproducible for a given
+  thread count, and bit-identical to the serial path at one shard. Complements
+  the existing per-matmul row parallelism.
 - **Model format** — FINF v4 (f32) / v5 (int8), self-contained (weights +
   normalizer + metadata JSON + tokenizer state).
 
@@ -74,9 +84,9 @@ SLMs, and MLPs. The workspace builds clean and the full test suite passes.
 ## Possible future work
 
 - Larger pre-tokenization vocabularies and merge caching for big corpora.
-- Multi-threaded training for larger models.
 - Additional activation and normalization variants.
-- Streaming generation APIs in the WASM bindings.
+- Streaming generation APIs in the WASM bindings (the native streaming API,
+  `generate_stream`, already exists).
 
 These are directions, not commitments. The current release is complete and
 self-consistent for the use cases documented in [usecases.md](usecases.md).

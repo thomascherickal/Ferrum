@@ -55,6 +55,7 @@ pub mod verbose;
 
 pub mod activation;
 pub mod csv;
+pub mod dataset;
 pub mod error;
 pub mod layer;
 pub mod loader;
@@ -75,6 +76,7 @@ pub use activation::Activation;
 pub use csv::{
     fit_normalizer_with_target, train_val_split, CsvDataset, ModelMetadata, Normalizer, TaskType,
 };
+pub use dataset::{clean_corpus, corpus_stats, validate_for_training, CleanOptions, CorpusStats};
 pub use error::{InferError, Result};
 pub use layer::{
     ActivationLayer, Embedding, Flatten, KvCache, Layer, LayerNorm, Linear, TransformerBlock,
@@ -87,9 +89,11 @@ pub use optim::{Adam, Sgd};
 pub use parallel::num_threads;
 pub use quant::{fake_quantize_int8, QUANT_MIN_LEN};
 pub use rng::Rng;
-pub use slm::{GenerativeSLM, TransformerConfig};
+pub use slm::{Evaluation, GenerativeSLM, TransformerConfig};
 pub use tensor::Tensor;
 pub use tokenizer::ByteBpeTokenizer;
 pub use train::{accuracy, train_epoch, EmbedT, Net};
-pub use train_transformer::{train_transformer_epoch, TransformerNet};
-pub use verbose::{set_verbose, is_verbose};
+pub use train_transformer::{
+    train_transformer_epoch, train_transformer_epoch_threaded, TransformerNet,
+};
+pub use verbose::{clear_log_sink, is_verbose, log_line, set_log_sink, set_verbose};

@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ferrum SLM Studio</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- ── Top bar ─────────────────────────────────────────────────────────── -->
+  <header id="topbar">
+    <div class="brand">
+      <img src="logo.png" alt="Ferrum" width="28" height="28" />
+      <span>Ferrum <b>SLM Studio</b></span>
+    </div>
+    <div class="mini-stats" id="miniStats">
+      <span class="mini" title="Total CPU load">CPU <b id="miniCpu">–</b></span>
+      <span class="mini" title="Memory used">MEM <b id="miniMem">–</b></span>
+      <span class="mini" title="Ferrum worker threads">THREADS <b id="miniThreads">–</b></span>
+      <span class="conn" id="connDot" title="Backend connection">●</span>
+    </div>
+  </header>
+
+  <!-- ── Tabs ────────────────────────────────────────────────────────────── -->
+  <nav id="tabs">
+    <button class="tab active" data-tab="datasets">Datasets</button>
+    <button class="tab" data-tab="train">Train</button>
+    <button class="tab" data-tab="generate">Generate</button>
+    <button class="tab" data-tab="evaluate">Evaluate</button>
+    <button class="tab" data-tab="models">Models</button>
+    <button class="tab" data-tab="tabular">Tabular (CLI)</button>
+    <button class="tab" data-tab="system">System</button>
+  </nav>
+
+  <main id="content">
+    <div id="webBanner" class="banner hidden">
+      ⚠ Running outside the Tauri runtime — backend features (training, the shell,
+      system monitor) are unavailable. Launch with <code>cargo tauri dev</code>.
+    </div>
+
+    <!-- ── Datasets ──────────────────────────────────────────────────────── -->
+    <section class="panel active" id="panel-datasets">
+      <h2>Datasets — fetch &amp; clean a corpus</h2>
+      <p class="hint">Download text from the internet (e.g. a Project Gutenberg
+        <code>.txt</code>), clean it to match the SLM's requirements, and save a
+        training corpus.</p>
+
+      <div class="row">
+        <label>Source URL
+          <input type="text" id="dsUrl" placeholder="https://www.gutenberg.org/cache/epub/11/pg11.txt" />
+        </label>
+        <label class="narrow">Max MB
+          <input type="number" id="dsMaxMb" value="8" min="1" step="1" />
+        </label>
+        <button id="dsDownload">Download</button>
+      </div>
+      <div class="row">
+        <label>…or local file
+          <input type="text" id="dsFile" placeholder="/path/to/corpus.txt" />
+        </label>
+        <button class="ghost browse" data-target="dsFile">Browse…</button>
+        <button id="dsLoadFile">Load file</button>
+      </div>
+      <span class="err" id="errDsSource"></span>
+
+      <label>Raw text
+        <textarea id="dsRaw" rows="6" placeholder="Downloaded / loaded / pasted text appears here. You can also paste directly."></textarea>
+      </label>
+
+      <fieldset>
+        <legend>Cleaning options</legend>
+        <label class="chk"><input type="checkbox" id="optGutenberg" checked /> Strip Project Gutenberg boilerplate</label>
+        <label class="chk"><input type="checkbox" id="optCollapse" checked /> Collapse blank lines / trailing spaces</label>
+        <label class="chk"><input type="checkbox" id="optPunct" checked /> Normalize smart punctuation → ASCII</label>
+        <label class="chk"><input type="checkbox" id="optControl" checked /> Strip control characters</label>
+        <label class="chk"><input type="checkbox" id="optLower" /> Lowercase (shrinks vocabulary)</label>
+        <label class="narrow">Max chars (0 = all)
+          <input type="number" id="optMaxChars" value="0" min="0" step="1000" />
+        </label>
+      </fieldset>
+
+      <div class="row">
+        <button id="dsClean" class="primary">Clean &amp; preview</button>
+        <div class="stats" id="dsStats"></div>
+      </div>
+      <span class="err" id="errDsClean"></span>
+
+      <label>Cleaned preview
+        <textarea id="dsPreview" rows="6" readonly placeholder="Cleaned corpus preview…"></textarea>
+      </label>
+
+      <div class="row">
+        <label>Save to
+          <input type="text" id="dsOut" placeholder="/path/to/clean_corpus.txt" />
+        </label>
+        <button class="ghost browse-save" data-target="dsOut">Browse…</button>
+        <button id="dsSave" class="primary">Save corpus</button>
+      </div>
+      <span class="err" id="errDsSave"></span>
+    </section>
+
+    <!-- ── Train ─────────────────────────────────────────────────────────── -->
+    <section class="panel" id="panel-train">
+      <h2>Train an SLM</h2>
+      <div class="row">
+        <label>Method
+          <select id="trMethod">
+            <option value="transformer">Causal Transformer (Adam, multi-threaded)</option>
+            <option value="embedded">Embedding + MLP (SGD)</option>
+            <option value="onehot">One-hot MLP (baseline)</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <label>Corpus <input type="text" id="trCorpus" placeholder="/path/to/corpus.txt" /></label>
+        <button class="ghost browse" data-target="trCorpus">Browse…</button>
+      </div>
+      <div class="row">
+        <label>Model output <input type="text" id="trModel" placeholder="/path/to/model.bin" /></label>
+        <button class="ghost browse-save" data-target="trModel">Browse…</button>
+      </div>
+
+      <div class="grid">
+        <label data-fields="transformer embedded onehot">Context <input type="number" id="trContext" value="16" min="1" /></label>
+        <label data-fields="transformer embedded">Embed dim <input type="number" id="trEmbed" value="32" min="1" /></label>
+        <label data-fields="transformer">Heads <input type="number" id="trHeads" value="4" min="1" /></label>
+        <label data-fields="transformer">Blocks <input type="number" id="trBlocks" value="2" min="1" /></label>
+        <label data-fields="transformer embedded onehot">Hidden <input type="number" id="trHidden" value="64" min="1" /></label>
+        <label data-fields="transformer embedded onehot">Epochs <input type="number" id="trEpochs" value="100" min="1" /></label>
+        <label data-fields="transformer embedded onehot">LR <input type="number" id="trLr" value="0.01" step="0.001" min="0" /></label>
+        <label data-fields="embedded onehot">Momentum <input type="number" id="trMomentum" value="0.9" step="0.05" min="0" /></label>
+        <label data-fields="transformer embedded onehot">Batch <input type="number" id="trBatch" value="16" min="1" /></label>
+        <label data-fields="transformer embedded">Vocab (0/≥256) <input type="number" id="trVocab" value="512" min="0" /></label>
+        <label data-fields="transformer">Threads (0=auto) <input type="number" id="trThreads" value="0" min="0" /></label>
+        <label data-fields="transformer embedded onehot">Seed <input type="number" id="trSeed" value="1337" min="0" /></label>
+      </div>
+      <label class="chk"><input type="checkbox" id="trVerbose" /> Verbose (stream engine internals to the terminal)</label>
+      <span class="err" id="errTrain"></span>
+
+      <div class="row">
+        <button id="trStart" class="primary">Train</button>
+        <div class="progress"><div class="bar" id="trBar"></div></div>
+        <span id="trStatus" class="muted">idle</span>
+      </div>
+      <canvas id="trChart" width="900" height="140"></canvas>
+      <pre id="trResult" class="result"></pre>
+    </section>
+
+    <!-- ── Generate ──────────────────────────────────────────────────────── -->
+    <section class="panel" id="panel-generate">
+      <h2>Generate (with live streaming)</h2>
+      <div class="row">
+        <label>Model <input type="text" id="genModel" placeholder="/path/to/model.bin" /></label>
+        <button class="ghost browse" data-target="genModel">Browse…</button>
+      </div>
+      <label>Seed text
+        <textarea id="genSeed" rows="3" placeholder="Once upon a time"></textarea>
+      </label>
+      <div class="grid">
+        <label>Chars <input type="number" id="genChars" value="200" min="1" /></label>
+        <label>Temperature <input type="number" id="genTemp" value="0.8" step="0.05" min="0.01" /></label>
+        <label>Gen seed (blank=random) <input type="number" id="genSeedNum" placeholder="random" /></label>
+      </div>
+      <label class="chk"><input type="checkbox" id="genStream" checked /> Stream output live</label>
+      <label class="chk"><input type="checkbox" id="genVerbose" /> Verbose</label>
+      <span class="err" id="errGen"></span>
+      <div class="row">
+        <button id="genStart" class="primary">Generate</button>
+        <span id="genStatus" class="muted"></span>
+      </div>
+      <div id="genOut" class="output" placeholder="Generated text appears here…"></div>
+    </section>
+
+    <!-- ── Evaluate ──────────────────────────────────────────────────────── -->
+    <section class="panel" id="panel-evaluate">
+      <h2>Evaluate — held-out perplexity</h2>
+      <p class="hint">Score one or more models on text they were <em>not</em> trained
+        on. Lower perplexity is better; a model that learned nothing scores its
+        vocabulary size.</p>
+      <div class="row">
+        <label>Model <input type="text" id="evModel" placeholder="/path/to/model.bin" /></label>
+        <button class="ghost browse" data-target="evModel">Browse…</button>
+      </div>
+      <div class="row">
+        <label>Held-out text file <input type="text" id="evFile" placeholder="/path/to/heldout.txt (or paste below)" /></label>
+        <button class="ghost browse" data-target="evFile">Browse…</button>
+      </div>
+      <label>…or paste held-out text
+        <textarea id="evText" rows="3" placeholder="Paste held-out text to score against"></textarea>
+      </label>
+      <span class="err" id="errEval"></span>
+      <div class="row">
+        <button id="evRun" class="primary">Evaluate &amp; add row</button>
+        <button id="evClear" class="ghost">Clear table</button>
+        <span id="evStatus" class="muted"></span>
+      </div>
+      <table id="evTable" class="data">
+        <thead><tr>
+          <th>Model</th><th>Predictions</th><th>Cross-entropy (nats)</th>
+          <th>Bits/token</th><th>Perplexity</th><th>Uniform baseline</th><th>Verdict</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <!-- ── Models ────────────────────────────────────────────────────────── -->
+    <section class="panel" id="panel-models">
+      <h2>Models — inspect / load from disk</h2>
+      <div class="row">
+        <label>Model file <input type="text" id="miPath" placeholder="/path/to/model.bin" /></label>
+        <button class="ghost browse" data-target="miPath">Browse…</button>
+        <button id="miInspect" class="primary">Inspect / reload</button>
+      </div>
+      <span class="err" id="errModel"></span>
+      <div id="miInfo" class="infocards"></div>
+    </section>
+
+    <!-- ── Tabular (train_cli) ───────────────────────────────────────────── -->
+    <section class="panel" id="panel-tabular">
+      <h2>Tabular MLP — <code>train_cli</code></h2>
+      <p class="hint">Trains a tabular classifier/regressor from any CSV via the
+        <code>train_cli</code> binary. Output streams into the terminal below.
+        Build it first with <code>cargo build -p train_cli --release</code>.</p>
+      <div class="row">
+        <label>train_cli binary <input type="text" id="tbBin" value="./target/release/train_cli" /></label>
+        <button class="ghost browse" data-target="tbBin">Browse…</button>
+      </div>
+      <div class="row">
+        <label>CSV <input type="text" id="tbCsv" placeholder="/path/to/data.csv" /></label>
+        <button class="ghost browse" data-target="tbCsv">Browse…</button>
+      </div>
+      <div class="row">
+        <label>Model output <input type="text" id="tbModel" placeholder="/path/to/tab_model.bin" /></label>
+        <button class="ghost browse-save" data-target="tbModel">Browse…</button>
+      </div>
+      <div class="grid">
+        <label>Dataset name <input type="text" id="tbName" value="Dataset" /></label>
+        <label>Hidden <input type="number" id="tbHidden" value="32" min="1" /></label>
+        <label>Epochs <input type="number" id="tbEpochs" value="500" min="1" /></label>
+      </div>
+      <span class="err" id="errTab"></span>
+      <button id="tbRun" class="primary">Run in terminal</button>
+    </section>
+
+    <!-- ── System ────────────────────────────────────────────────────────── -->
+    <section class="panel" id="panel-system">
+      <h2>System monitor</h2>
+      <div class="row">
+        <label class="chk"><input type="checkbox" id="sysOn" checked /> Monitoring on</label>
+        <label class="narrow">Interval (s) <input type="number" id="sysInterval" value="1.5" step="0.5" min="0.5" /></label>
+      </div>
+      <div class="sysgrid">
+        <div class="gauge">
+          <h3>CPU total</h3>
+          <div class="big" id="sysCpu">–</div>
+          <div class="meter"><div id="sysCpuBar"></div></div>
+        </div>
+        <div class="gauge">
+          <h3>Memory</h3>
+          <div class="big" id="sysMem">–</div>
+          <div class="meter"><div id="sysMemBar"></div></div>
+          <div class="muted" id="sysMemAbs"></div>
+        </div>
+        <div class="gauge">
+          <h3>Ferrum threads</h3>
+          <div class="big" id="sysThreads">–</div>
+          <div class="muted">used by parallel kernels</div>
+        </div>
+      </div>
+      <h3>Per-core load</h3>
+      <div id="sysCores" class="cores"></div>
+    </section>
+  </main>
+
+  <!-- ── Docked terminal ──────────────────────────────────────────────────── -->
+  <section id="terminal">
+    <div class="term-head">
+      <span>Terminal — engine <code>--verbose</code> log &amp; shell</span>
+      <div class="term-actions">
+        <button id="termClear" class="ghost small">Clear</button>
+      </div>
+    </div>
+    <div id="termOut" class="term-out"></div>
+    <div class="term-input">
+      <span id="termPrompt" class="prompt">$</span>
+      <input type="text" id="termCmd" placeholder="type a shell command and press Enter…" autocomplete="off" spellcheck="false" />
+    </div>
+  </section>
+
+  <div id="toasts"></div>
+  <script src="app.js"></script>
+</body>
+</html>

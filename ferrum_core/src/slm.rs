@@ -4,7 +4,7 @@ use crate::csv::{CsvDataset, ModelMetadata, Normalizer, TaskType};
 use crate::rng::Rng;
 use crate::optim::{Adam, Sgd};
 use crate::train::{Net, train_epoch};
-use crate::train_transformer::{train_transformer_epoch, TransformerNet};
+use crate::train_transformer::{train_transformer_epoch_threaded, TransformerNet};
 use crate::model::Sequential;
 use crate::loader::{to_bytes, from_bytes};
 use crate::tensor::Tensor;
@@ -54,6 +54,27 @@ impl Default for TransformerConfig {
             vocab_size: 512,
         }
     }
+}
+
+/// Result of scoring a trained model against held-out text with
+/// [`GenerativeSLM::evaluate`].
+///
+/// All three fields describe the model's next-token predictive quality on the
+/// supplied text, using exactly the same forward path that generation uses, so
+/// the numbers reflect the shipped (quantization-aware) model.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Evaluation {
+    /// Number of next-token predictions scored (positions past the first
+    /// `context_len` tokens of the held-out text).
+    pub num_predictions: usize,
+    /// Mean next-token negative log-likelihood in **nats** (natural-log
+    /// cross-entropy). Lower is better.
+    pub cross_entropy: f32,
+    /// Mean next-token cross-entropy in **bits** (`cross_entropy / ln 2`).
+    pub bits_per_token: f32,
+    /// Perplexity, `exp(cross_entropy)`. Lower is better; a uniform model over a
+    /// vocabulary of `V` tokens scores `V`.
+    pub perplexity: f32,
 }
 
 /// Unified Causal Small Language Model (SLM) for off-grid edge generative AI.
@@ -177,13 +198,13 @@ impl GenerativeSLM {
 
             if verbose::is_verbose() {
                 if loss.is_nan() {
-                    println!("[ferrum_core::WARN] ⚠️  NaN loss at epoch {}! Training is diverging!", ep);
+                    crate::verbose::log_line(&format!("[ferrum_core::WARN] ⚠️  NaN loss at epoch {}! Training is diverging!", ep));
                 }
                 if loss.is_infinite() {
-                    println!("[ferrum_core::WARN] ⚠️  Infinite loss at epoch {}! Training is diverging!", ep);
+                    crate::verbose::log_line(&format!("[ferrum_core::WARN] ⚠️  Infinite loss at epoch {}! Training is diverging!", ep));
                 }
                 if loss > 1e6 {
-                    println!("[ferrum_core::WARN] ⚠️  Very large loss ({:.2}) at epoch {} — possible explosion!", loss, ep);
+                    crate::verbose::log_line(&format!("[ferrum_core::WARN] ⚠️  Very large loss ({:.2}) at epoch {} — possible explosion!", loss, ep));
                 }
             }
 
@@ -261,6 +282,68 @@ impl GenerativeSLM {
         batch_size: usize,
         vocab_size: usize,
         rng: &mut Rng,
+        progress_callback: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(usize, f32),
+    {
+        // `threads = 1` is the serial path, bit-for-bit identical to before.
+        Self::train_transformer_inner(
+            corpus, context_len, embed_dim, num_heads, num_blocks, hidden_dim,
+            epochs, lr, batch_size, vocab_size, 1, rng, progress_callback,
+        )
+    }
+
+    /// Data-parallel [`GenerativeSLM::train_transformer_with_callback`]:
+    /// `threads` worker threads split each minibatch and their gradients are
+    /// reduced before each optimizer step (see
+    /// [`crate::train_transformer::train_transformer_epoch_threaded`]).
+    ///
+    /// Pass `0` to auto-detect the machine's parallelism via
+    /// [`crate::num_threads`]. `1` forces the serial path. Results are
+    /// reproducible for a fixed `threads` value; the model is identical to the
+    /// serial one when `threads` resolves to `1`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn train_transformer_threaded_with_callback<F>(
+        corpus: &str,
+        context_len: usize,
+        embed_dim: usize,
+        num_heads: usize,
+        num_blocks: usize,
+        hidden_dim: usize,
+        epochs: usize,
+        lr: f32,
+        batch_size: usize,
+        vocab_size: usize,
+        threads: usize,
+        rng: &mut Rng,
+        progress_callback: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(usize, f32),
+    {
+        let threads = if threads == 0 { crate::parallel::num_threads() } else { threads };
+        Self::train_transformer_inner(
+            corpus, context_len, embed_dim, num_heads, num_blocks, hidden_dim,
+            epochs, lr, batch_size, vocab_size, threads, rng, progress_callback,
+        )
+    }
+
+    /// Shared implementation behind the serial and threaded transformer trainers.
+    #[allow(clippy::too_many_arguments)]
+    fn train_transformer_inner<F>(
+        corpus: &str,
+        context_len: usize,
+        embed_dim: usize,
+        num_heads: usize,
+        num_blocks: usize,
+        hidden_dim: usize,
+        epochs: usize,
+        lr: f32,
+        batch_size: usize,
+        vocab_size: usize,
+        threads: usize,
+        rng: &mut Rng,
         mut progress_callback: F,
     ) -> Result<Self>
     where
@@ -268,19 +351,22 @@ impl GenerativeSLM {
     {
         let tc = tokenize_for_lm(corpus, context_len, vocab_size)?;
         let model_vocab = tc.vocab_size;
-        vprintln!("[slm::train_transformer] corpus={} chars, vocab={}, bpe={}, ctx={}, dim={}, heads={}, blocks={}, hidden={}",
+        vprintln!("[slm::train_transformer] corpus={} chars, vocab={}, bpe={}, ctx={}, dim={}, heads={}, blocks={}, hidden={}, threads={}",
             tc.tokens.len(), model_vocab, !tc.tokenizer_state.is_empty(),
-            context_len, embed_dim, num_heads, num_blocks, hidden_dim);
+            context_len, embed_dim, num_heads, num_blocks, hidden_dim, threads);
 
         let mut net = TransformerNet::new(
             model_vocab, context_len, embed_dim, num_heads, hidden_dim, num_blocks, rng,
         )?;
         net.set_qat(true);
-        vprintln!("[slm::train_transformer] {} params, Adam lr={}, QAT=int8", net.num_params(), lr);
+        vprintln!("[slm::train_transformer] {} params, Adam lr={}, QAT=int8, threads={}",
+            net.num_params(), lr, threads);
 
         let adam = Adam::new(lr);
         for ep in 1..=epochs {
-            let loss = train_transformer_epoch(&mut net, &tc.tokens, batch_size, &adam, rng)?;
+            let loss = train_transformer_epoch_threaded(
+                &mut net, &tc.tokens, batch_size, &adam, rng, threads,
+            )?;
             vprintln!("[slm::train_transformer] epoch {}/{}: loss={:.6}", ep, epochs, loss);
             progress_callback(ep, loss);
         }
@@ -442,6 +528,37 @@ impl GenerativeSLM {
         )
     }
 
+    /// Data-parallel [`GenerativeSLM::train_transformer_config`]: trains with
+    /// `threads` worker threads (`0` = auto-detect via [`crate::num_threads`],
+    /// `1` = serial). Training stays int8 quantization-aware (QAT) and the
+    /// result is reproducible for a fixed `threads` value.
+    pub fn train_transformer_config_threaded<F>(
+        corpus: &str,
+        cfg: &TransformerConfig,
+        threads: usize,
+        rng: &mut Rng,
+        progress_callback: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(usize, f32),
+    {
+        Self::train_transformer_threaded_with_callback(
+            corpus,
+            cfg.context_len,
+            cfg.embed_dim,
+            cfg.num_heads,
+            cfg.num_blocks,
+            cfg.hidden_dim,
+            cfg.epochs,
+            cfg.lr,
+            cfg.batch_size,
+            cfg.vocab_size,
+            threads,
+            rng,
+            progress_callback,
+        )
+    }
+
     /// Save the trained model to `model_path` as int8-quantized FINF v5
     /// (the default on-disk format — ≈4× smaller than f32). Parent
     /// directories are created as needed.
@@ -505,13 +622,49 @@ impl GenerativeSLM {
     /// (fewer only if generation is cut short). Character-level models keep the
     /// original per-character behaviour.
     pub fn generate(&self, seed: &str, num_chars: usize, temp: f32, rng: &mut Rng) -> Result<String> {
-        vprintln!("[slm::GenerativeSLM::generate] seed=\"{}\", num_chars={}, temp={:.2}",
+        // The full-string API is the streaming API with a no-op sink.
+        self.generate_stream(seed, num_chars, temp, rng, |_| {})
+    }
+
+    /// Streaming counterpart of [`GenerativeSLM::generate`]: identical sampling
+    /// and identical return value, but `on_text` is invoked with each newly
+    /// generated **fragment** as soon as it is produced, so callers can print a
+    /// completion token-by-token (a REPL, a server's SSE stream, a TUI) instead
+    /// of waiting for the whole result.
+    ///
+    /// Guarantees:
+    /// - Concatenating every fragment passed to `on_text` yields exactly the
+    ///   generated continuation — i.e. the return value with the `seed` prefix
+    ///   removed (equivalently, [`GenerativeSLM::generate_continuation`]'s
+    ///   output).
+    /// - The seed itself is never emitted.
+    /// - For a fixed RNG the output and the fragment sequence are deterministic,
+    ///   and the returned `String` equals what [`GenerativeSLM::generate`] would
+    ///   return for the same arguments.
+    ///
+    /// Character-level models emit one character per step. BPE models emit
+    /// decoded text as whole tokens land, holding back a partial trailing
+    /// multi-byte character until it completes (so no `U+FFFD` placeholder is
+    /// ever streamed and then revised).
+    pub fn generate_stream<F>(
+        &self,
+        seed: &str,
+        num_chars: usize,
+        temp: f32,
+        rng: &mut Rng,
+        on_text: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&str),
+    {
+        vprintln!("[slm::GenerativeSLM::generate_stream] seed=\"{}\", num_chars={}, temp={:.2}",
             seed.chars().take(50).collect::<String>(), num_chars, temp);
 
         if !self.meta.tokenizer_state.is_empty() {
-            return self.generate_bpe(seed, num_chars, temp, rng);
+            return self.generate_bpe_stream(seed, num_chars, temp, rng, on_text);
         }
 
+        let mut on_text = on_text;
         let mut generated = seed.to_string();
         let vocab_size = self.meta.output_dim;
         let input_dim = self.meta.input_dim;
@@ -582,20 +735,38 @@ impl GenerativeSLM {
                 step, next_idx, predicted_hex, next_char);
 
             generated.push(next_char);
+            // Stream exactly the new character (never the seed).
+            let mut buf = [0u8; 4];
+            on_text(next_char.encode_utf8(&mut buf));
         }
 
         vprintln!("[slm::generate] Generated {} total chars", generated.len());
         Ok(generated)
     }
 
-    /// BPE generation path. Rebuilds the stored [`ByteBpeTokenizer`], encodes
-    /// the seed to token IDs, samples one token at a time from the model
+    /// Streaming BPE generation path. Rebuilds the stored [`ByteBpeTokenizer`],
+    /// encodes the seed to token IDs, samples one token at a time from the model
     /// (always feeding the last `context_len` tokens, left-padded with token 0
     /// when the prompt is shorter than the window), and decodes the whole token
     /// stream back to text. Generation continues until at least `num_chars`
     /// characters have been added past the seed, then the result is trimmed to
     /// exactly that length so the character contract matches the char-level path.
-    fn generate_bpe(&self, seed: &str, num_chars: usize, temp: f32, rng: &mut Rng) -> Result<String> {
+    ///
+    /// As tokens land, the newly decoded continuation characters are streamed to
+    /// `on_text`, holding back the final (possibly partial) character until the
+    /// next token completes it so a `U+FFFD` placeholder is never emitted and
+    /// then revised.
+    fn generate_bpe_stream<F>(
+        &self,
+        seed: &str,
+        num_chars: usize,
+        temp: f32,
+        rng: &mut Rng,
+        mut on_text: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&str),
+    {
         let tok = ByteBpeTokenizer::from_state(&self.meta.tokenizer_state)?;
         let context_len = self.meta.input_dim;
         let seed_chars = seed.chars().count();
@@ -604,6 +775,30 @@ impl GenerativeSLM {
         let mut ids: Vec<usize> = tok.encode(seed);
         vprintln!("[slm::generate_bpe] seed encoded to {} tokens, ctx={}, target_chars={}",
             ids.len(), context_len, target_chars);
+
+        // Number of continuation characters already streamed (never includes the
+        // seed). Emit a delta after every token so output is incremental.
+        let mut emitted_cont = 0usize;
+        let mut flush = |full: &str, hold_back_partial: bool, on_text: &mut F| {
+            let cont_chars = full.chars().count().saturating_sub(seed_chars);
+            // While generating, withhold the last char (it may be an incomplete
+            // multi-byte sequence that the next token will complete); on the
+            // final flush emit everything up to the character budget.
+            let avail = if hold_back_partial {
+                cont_chars.saturating_sub(1).min(num_chars)
+            } else {
+                cont_chars.min(num_chars)
+            };
+            if avail > emitted_cont {
+                let delta: String = full
+                    .chars()
+                    .skip(seed_chars + emitted_cont)
+                    .take(avail - emitted_cont)
+                    .collect();
+                on_text(&delta);
+                emitted_cont = avail;
+            }
+        };
 
         // Bound the loop: every step adds ≥1 byte, but guard against a model
         // that keeps emitting zero-width or repeated control tokens.
@@ -630,14 +825,148 @@ impl GenerativeSLM {
             let next = sample_from_logits(&logits, temp, rng);
             ids.push(next);
             steps += 1;
+            // Stream what is safely decodable so far.
+            flush(&tok.decode(&ids), true, &mut on_text);
         }
 
         // Decode the full token stream, then keep seed + num_chars characters.
         let full = tok.decode(&ids);
+        // Final flush emits any remaining (now-complete) continuation chars.
+        flush(&full, false, &mut on_text);
         let trimmed: String = full.chars().take(target_chars).collect();
         vprintln!("[slm::generate_bpe] generated {} tokens → {} chars (trimmed to {})",
             ids.len(), full.chars().count(), trimmed.chars().count());
         Ok(trimmed)
+    }
+
+    /// Generate a completion from `seed` and return **only the newly generated
+    /// text**, excluding the seed prefix.
+    ///
+    /// [`GenerativeSLM::generate`] returns `seed` followed by the continuation
+    /// (the natural shape for printing a running document); this is the
+    /// ergonomic counterpart for callers that only want the model's own output
+    /// — chat replies, autocomplete suggestions, code completion. The character
+    /// budget (`num_chars`) and sampling semantics are identical to
+    /// [`GenerativeSLM::generate`]; only the returned slice differs.
+    pub fn generate_continuation(
+        &self,
+        seed: &str,
+        num_chars: usize,
+        temp: f32,
+        rng: &mut Rng,
+    ) -> Result<String> {
+        let full = self.generate(seed, num_chars, temp, rng)?;
+        // `generate` always returns the seed verbatim as a prefix, so skipping
+        // the seed's character count yields exactly the continuation.
+        let seed_chars = seed.chars().count();
+        Ok(full.chars().skip(seed_chars).collect())
+    }
+
+    /// Score the model's next-token predictions against held-out `text`,
+    /// returning cross-entropy, bits-per-token, and perplexity.
+    ///
+    /// This slides the model's context window across `text` and, at every
+    /// position past the first `context_len` tokens, measures the probability
+    /// the model assigns to the token that actually follows. It dispatches over
+    /// the same three families [`GenerativeSLM::generate`] handles — byte-level
+    /// BPE, char/token-ID transformer & embedded, and the one-hot MLP — using
+    /// the trained (quantization-aware) weights, so the reported perplexity is
+    /// the quality of the model you will ship, not a separate f32 reference.
+    ///
+    /// `text` must contain at least `context_len + 1` tokens; otherwise no
+    /// prediction can be scored and a [`InferError::DimMismatch`] is returned.
+    /// Use a corpus the model was **not** trained on to measure generalization.
+    pub fn evaluate(&self, text: &str) -> Result<Evaluation> {
+        vprintln!("[slm::evaluate] scoring {} chars of held-out text", text.chars().count());
+
+        if !self.meta.tokenizer_state.is_empty() {
+            let tok = ByteBpeTokenizer::from_state(&self.meta.tokenizer_state)?;
+            let ids = tok.encode(text);
+            return self.score_token_ids(&ids, self.meta.input_dim);
+        }
+
+        let vocab_size = self.meta.output_dim;
+        let input_dim = self.meta.input_dim;
+        let is_transformer = self.meta.task == TaskType::TransformerSLM;
+        let context_len = if is_transformer { input_dim } else { input_dim / vocab_size };
+
+        let chars: Vec<char> = text.chars().filter(|&c| c != '\r').collect();
+        let ids: Vec<usize> = chars
+            .iter()
+            .map(|&ch| {
+                let hex = char_to_hex(ch);
+                self.meta.class_names.iter().position(|s| s == &hex).unwrap_or(0)
+            })
+            .collect();
+
+        if is_transformer {
+            self.score_token_ids(&ids, context_len)
+        } else {
+            self.score_onehot(&ids, context_len, vocab_size)
+        }
+    }
+
+    /// Accumulate held-out cross-entropy for the token-ID families (BPE,
+    /// char-level transformer, and embedded MLP). The model is fed the last
+    /// `context_len` token IDs and its final-row softmax row gives the predicted
+    /// next-token distribution.
+    fn score_token_ids(&self, ids: &[usize], context_len: usize) -> Result<Evaluation> {
+        if ids.len() <= context_len {
+            return Err(InferError::DimMismatch(
+                "evaluation text must contain more than context_len tokens".into(),
+            ));
+        }
+        let mut total_nll = 0.0f64;
+        let mut count = 0usize;
+        for i in context_len..ids.len() {
+            let ctx: Vec<f32> = ids[i - context_len..i].iter().map(|&t| t as f32).collect();
+            let input = Tensor::matrix(1, context_len, ctx)?;
+            let out = self.model.forward(&input)?;
+            let (rows, cols) = out.matrix_dims()?;
+            // The model ends in Softmax, so the last row holds probabilities.
+            let p = out.data[(rows - 1) * cols + ids[i]].max(1e-12);
+            total_nll += -(p as f64).ln();
+            count += 1;
+        }
+        Ok(finish_evaluation(total_nll, count))
+    }
+
+    /// Accumulate held-out cross-entropy for the one-hot MLP path: the context
+    /// is encoded as a flattened `context_len × vocab_size` one-hot row and the
+    /// single output row holds the next-token probabilities.
+    fn score_onehot(&self, ids: &[usize], context_len: usize, vocab_size: usize) -> Result<Evaluation> {
+        if ids.len() <= context_len {
+            return Err(InferError::DimMismatch(
+                "evaluation text must contain more than context_len tokens".into(),
+            ));
+        }
+        let mut total_nll = 0.0f64;
+        let mut count = 0usize;
+        for i in context_len..ids.len() {
+            let mut input_data = Vec::with_capacity(context_len * vocab_size);
+            for &idx in &ids[i - context_len..i] {
+                for j in 0..vocab_size {
+                    input_data.push(if j == idx { 1.0 } else { 0.0 });
+                }
+            }
+            let input = self.norm.transform(&Tensor::row(input_data)?)?;
+            let out = self.model.forward(&input)?;
+            let p = out.data.get(ids[i]).copied().unwrap_or(1e-12).max(1e-12);
+            total_nll += -(p as f64).ln();
+            count += 1;
+        }
+        Ok(finish_evaluation(total_nll, count))
+    }
+}
+
+/// Turn an accumulated negative-log-likelihood sum into an [`Evaluation`].
+fn finish_evaluation(total_nll: f64, count: usize) -> Evaluation {
+    let ce = if count == 0 { 0.0 } else { (total_nll / count as f64) as f32 };
+    Evaluation {
+        num_predictions: count,
+        cross_entropy: ce,
+        bits_per_token: ce / std::f32::consts::LN_2,
+        perplexity: ce.exp(),
     }
 }
 

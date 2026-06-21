@@ -1,5 +1,10 @@
 [workspace]
 members  = ["ferrum_core", "tabular_wasm", "train_cli", "slm_cli", "tests"]
+# The Tauri desktop/mobile GUI is its own crate. It is deliberately excluded
+# from this workspace because it pulls in heavy GUI system dependencies
+# (webkit2gtk / wry) that the headless core build must not require. Build it
+# from inside `ferrum_gui/` with `cargo tauri dev`.
+exclude  = ["ferrum_gui"]
 resolver = "2"
 
 [workspace.package]

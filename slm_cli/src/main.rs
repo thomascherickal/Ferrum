@@ -29,6 +29,7 @@
 //!   --batch   <N>   minibatch size                 (default 16)
 //!   --vocab   <N>   BPE vocab size (0 = char-level)(default 512)
 //!   --seed    <N>   RNG seed                       (default 1337)
+//!   --threads <N>   data-parallel worker threads   (default 0 = auto)
 //!   --force         retrain even if the model file exists
 //!   --sample        print a short sample after training
 //!   --verbose | -v  print all engine internals
@@ -39,6 +40,7 @@
 //!   --chars <N>  characters to generate            (default 200)
 //!   --temp  <F>  sampling temperature              (default 0.8)
 //!   --gen-seed <N>  generation RNG seed            (default time-based)
+//!   --stream     print the completion live as it is generated
 //! ```
 
 use ferrum_core::{GenerativeSLM, Rng, TaskType, TransformerConfig};
@@ -61,7 +63,7 @@ impl Args {
         // Flags that take a value rather than acting as a boolean switch.
         const VALUE_FLAGS: &[&str] = &[
             "context", "embed", "heads", "blocks", "hidden", "epochs",
-            "lr", "batch", "seed", "chars", "temp", "gen-seed", "vocab",
+            "lr", "batch", "seed", "chars", "temp", "gen-seed", "vocab", "threads",
         ];
         let mut i = 0;
         while i < raw.len() {
@@ -138,6 +140,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "train" => cmd_train(&args),
         "run" => cmd_run(&args),
         "generate" | "gen" => cmd_generate(&args),
+        "eval" => cmd_eval(&args),
         "info" => cmd_info(&args),
         "-h" | "--help" | "help" => {
             print_usage();
@@ -159,14 +162,17 @@ fn print_usage() {
          \x20 train_transformer train    <corpus.txt> <model.bin> [options]\n\
          \x20 train_transformer run      <corpus.txt> <model.bin> <seed text> [options]\n\
          \x20 train_transformer generate <model.bin>  <seed text> [options]\n\
+         \x20 train_transformer eval     <model.bin>  <heldout.txt>\n\
          \x20 train_transformer info     <model.bin>\n\n\
          TRAIN / RUN options:\n\
          \x20 --context N  --embed N  --heads N  --blocks N  --hidden N\n\
          \x20 --epochs N   --lr F     --batch N  --vocab N  --seed N\n\
-         \x20 --force      --sample   --verbose|-v\n\
-         \x20 (--vocab 0 = character-level; >=256 = byte-level BPE, default 512)\n\n\
+         \x20 --threads N  --force    --sample   --verbose|-v\n\
+         \x20 (--vocab 0 = character-level; >=256 = byte-level BPE, default 512)\n\
+         \x20 (--threads 0 = auto-detect cores [default]; 1 = serial training)\n\n\
          GENERATE / RUN options:\n\
-         \x20 --chars N    --temp F   --gen-seed N\n\n\
+         \x20 --chars N    --temp F   --gen-seed N   --stream\n\
+         \x20 (--stream prints the completion live as it is generated)\n\n\
          If <model.bin> already exists, train/run load the saved weights from\n\
          disk instead of retraining. Pass --force to retrain from scratch.\n\n\
          EXAMPLES:\n\
@@ -195,6 +201,8 @@ fn train_and_save(
 ) -> Result<GenerativeSLM, Box<dyn std::error::Error>> {
     let cfg = args.config();
     let seed: u64 = args.get("seed", 1337);
+    // 0 = auto-detect the machine's parallelism; 1 = serial.
+    let threads: usize = args.get("threads", 0);
     let mut rng = Rng::new(seed);
     let chars = corpus.chars().filter(|&c| c != '\r').count();
 
@@ -210,6 +218,8 @@ fn train_and_save(
     println!("  Heads   : {}   Blocks: {}", cfg.num_heads, cfg.num_blocks);
     println!("  Tokenizer: {tok_desc}");
     println!("  Epochs  : {}   LR: {}   Batch: {}   Seed: {seed}", cfg.epochs, cfg.lr, cfg.batch_size);
+    let resolved_threads = if threads == 0 { ferrum_core::num_threads() } else { threads };
+    println!("  Threads : {resolved_threads} (data-parallel minibatch training)");
     println!("╚══════════════════════════════════════════════════════════╝\n");
 
     let t0 = Instant::now();
@@ -221,7 +231,7 @@ fn train_and_save(
         }
     };
 
-    let slm = GenerativeSLM::train_transformer_config(corpus, &cfg, &mut rng, progress)?;
+    let slm = GenerativeSLM::train_transformer_config_threaded(corpus, &cfg, threads, &mut rng, progress)?;
 
     println!("\nTrained in {:.2}s.", t0.elapsed().as_secs_f32());
     let vocab_kind = if slm.meta.tokenizer_state.is_empty() { "chars" } else { "BPE tokens" };
@@ -302,7 +312,9 @@ fn cmd_run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let out = generate_text(&slm, &seed_text, args)?;
-    println!("{out}");
+    if !args.has("stream") {
+        println!("{out}");
+    }
     Ok(())
 }
 
@@ -317,7 +329,10 @@ fn cmd_generate(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let slm = GenerativeSLM::load(model_path)
         .map_err(|e| format!("cannot load model {model_path}: {e}"))?;
     let out = generate_text(&slm, &seed_text, args)?;
-    println!("{out}");
+    // Streaming already printed the text live; avoid printing it twice.
+    if !args.has("stream") {
+        println!("{out}");
+    }
     Ok(())
 }
 
@@ -349,7 +364,42 @@ fn generate_text(
     }
 
     let mut rng = Rng::new(seed);
-    Ok(slm.generate(seed_text, num_chars, temp, &mut rng)?)
+    if args.has("stream") {
+        // Print the seed, then each generated fragment as it lands, flushing so
+        // the terminal shows the completion appearing live.
+        use std::io::Write;
+        print!("{seed_text}");
+        let _ = std::io::stdout().flush();
+        let out = slm.generate_stream(seed_text, num_chars, temp, &mut rng, |frag| {
+            print!("{frag}");
+            let _ = std::io::stdout().flush();
+        })?;
+        println!();
+        Ok(out)
+    } else {
+        Ok(slm.generate(seed_text, num_chars, temp, &mut rng)?)
+    }
+}
+
+fn cmd_eval(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    if args.positional.len() < 2 {
+        return Err("usage: train_transformer eval <model.bin> <heldout.txt>".into());
+    }
+    let model_path = &args.positional[0];
+    let text_path = &args.positional[1];
+
+    let slm = GenerativeSLM::load(model_path)
+        .map_err(|e| format!("cannot load model {model_path}: {e}"))?;
+    let text = read_corpus(text_path)?;
+
+    let eval = slm.evaluate(&text)?;
+    println!("Model        : {model_path}");
+    println!("Held-out text: {text_path}  ({} chars)", text.chars().count());
+    println!("Predictions  : {}", eval.num_predictions);
+    println!("Cross-entropy: {:.4} nats/token", eval.cross_entropy);
+    println!("Bits/token   : {:.4}", eval.bits_per_token);
+    println!("Perplexity   : {:.4}", eval.perplexity);
+    Ok(())
 }
 
 fn cmd_info(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
