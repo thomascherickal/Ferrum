@@ -11,6 +11,9 @@ pub enum Activation {
     Sigmoid,
     Tanh,
     Softmax,
+    /// SiLU / swish: `x · sigmoid(x)`. The gate nonlinearity in SwiGLU FFNs
+    /// (Llama / Qwen / Mistral).
+    SiLU,
 }
 
 impl Activation {
@@ -22,6 +25,7 @@ impl Activation {
             Activation::Sigmoid => Ok(input.map(|x| 1.0 / (1.0 + (-x).exp()))),
             Activation::Tanh => Ok(input.map(|x| x.tanh())),
             Activation::Softmax => ops::softmax_rows(input),
+            Activation::SiLU => Ok(input.map(|x| x / (1.0 + (-x).exp()))),
         }?;
         if verbose::is_verbose() {
             let (vmin, vmax, vmean) = verbose::stats(&result.data);
@@ -38,6 +42,7 @@ impl Activation {
             Activation::Sigmoid => 2,
             Activation::Tanh => 3,
             Activation::Softmax => 4,
+            Activation::SiLU => 5,
         }
     }
 
@@ -48,6 +53,7 @@ impl Activation {
             2 => Some(Activation::Sigmoid),
             3 => Some(Activation::Tanh),
             4 => Some(Activation::Softmax),
+            5 => Some(Activation::SiLU),
             _ => None,
         }
     }
@@ -99,8 +105,21 @@ mod tests {
             Activation::Sigmoid,
             Activation::Tanh,
             Activation::Softmax,
+            Activation::SiLU,
         ] {
             assert_eq!(Activation::from_tag(a.tag()), Some(a));
+        }
+    }
+
+    #[test]
+    fn silu_matches_x_times_sigmoid() {
+        // SiLU(0) = 0; SiLU(x) = x·σ(x); monotone-ish and smooth.
+        let t = Tensor::vector(vec![0.0, 1.0, -1.0, 2.0]);
+        let out = Activation::SiLU.apply(&t).unwrap();
+        let expect: Vec<f32> = t.data.iter().map(|&x| x / (1.0 + (-x).exp())).collect();
+        assert_eq!(out.data[0], 0.0);
+        for (a, b) in out.data.iter().zip(&expect) {
+            assert!((a - b).abs() < 1e-6);
         }
     }
 

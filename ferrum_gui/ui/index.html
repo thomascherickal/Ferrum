@@ -45,6 +45,45 @@
         <code>.txt</code>), clean it to match the SLM's requirements, and save a
         training corpus.</p>
 
+      <fieldset>
+        <legend>Browse CPU-friendly datasets (HuggingFace / Kaggle)</legend>
+        <p class="hint">Curated text datasets small enough to train/run on CPU.
+          Kaggle entries need credentials — set <code>KAGGLE_USERNAME</code> /
+          <code>KAGGLE_KEY</code> or place <code>kaggle.json</code> in
+          <code>~/.kaggle/</code>.</p>
+        <div class="row">
+          <label>Download into folder
+            <input type="text" id="dsDestDir" placeholder="/path/to/datasets" />
+          </label>
+          <button class="ghost browse-dir" data-target="dsDestDir">Browse…</button>
+          <button id="dsCatalogLoad" class="ghost">Refresh list</button>
+        </div>
+        <div id="dsCatalog" class="catalog"></div>
+
+        <div class="row">
+          <label>HuggingFace repo
+            <input type="text" id="dsHfRepo" placeholder="owner/name (e.g. roneneldan/TinyStories)" />
+          </label>
+          <label>File
+            <input type="text" id="dsHfFile" placeholder="TinyStories-valid.txt" />
+          </label>
+          <label class="narrow">Token (gated)
+            <input type="text" id="dsHfToken" placeholder="optional" />
+          </label>
+          <button id="dsHfDownload">Fetch HF</button>
+        </div>
+        <div class="row">
+          <label>Kaggle owner/slug
+            <input type="text" id="dsKgRepo" placeholder="owner/dataset" />
+          </label>
+          <label>File
+            <input type="text" id="dsKgFile" placeholder="data.csv" />
+          </label>
+          <button id="dsKgDownload">Fetch Kaggle</button>
+        </div>
+        <span class="err" id="errDsCatalog"></span>
+      </fieldset>
+
       <div class="row">
         <label>Source URL
           <input type="text" id="dsUrl" placeholder="https://www.gutenberg.org/cache/epub/11/pg11.txt" />

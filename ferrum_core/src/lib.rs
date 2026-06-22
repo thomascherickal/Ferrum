@@ -57,7 +57,9 @@ pub mod activation;
 pub mod csv;
 pub mod dataset;
 pub mod error;
+pub mod gguf;
 pub mod layer;
+pub mod llm;
 pub mod loader;
 pub mod loss;
 pub mod model;
@@ -78,16 +80,24 @@ pub use csv::{
 };
 pub use dataset::{clean_corpus, corpus_stats, validate_for_training, CleanOptions, CorpusStats};
 pub use error::{InferError, Result};
+pub use gguf::{f16_to_f32, Gguf, MetaValue, TensorInfo};
 pub use layer::{
     ActivationLayer, Embedding, Flatten, KvCache, Layer, LayerNorm, Linear, TransformerBlock,
 };
-pub use loader::{from_bytes, load, save, save_quantized, to_bytes, to_bytes_quantized};
+pub use llm::{
+    apply_rope, Attention, FeedForward, LlamaBlock, LlamaCache, LlamaConfig, LlamaModel, RmsNorm,
+    RopeType,
+};
+pub use loader::{
+    from_bytes, load, save, save_quantized, save_quantized_int4, to_bytes, to_bytes_quantized,
+    to_bytes_quantized_int4,
+};
 pub use loss::{mse, softmax_cross_entropy};
 pub use model::Sequential;
 pub use ops::argmax_rows;
 pub use optim::{clip_grad_norm, Adam, LrDecay, LrSchedule, Sgd};
 pub use parallel::num_threads;
-pub use quant::{fake_quantize_int8, QUANT_MIN_LEN};
+pub use quant::{fake_quantize_int8, QKind, QWeight, QUANT_MIN_LEN};
 pub use rng::Rng;
 pub use slm::{
     Evaluation, GenerativeSLM, SamplingParams, TransformerConfig, ValidationConfig,

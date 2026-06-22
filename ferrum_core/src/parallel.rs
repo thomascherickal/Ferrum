@@ -176,6 +176,82 @@ where
     }
 }
 
+/// Fill a length-`total` 1-D output by running `kernel(j0, j1, block)` over
+/// contiguous column ranges on the persistent worker pool, where `block` is a
+/// fresh buffer of `j1 - j0` elements indexed locally (`j` at `j - j0`).
+///
+/// This is the column-split counterpart of [`run`]: where `run` parallelizes a
+/// `[m, n]` output by **rows** (needs `m ≥ 2`, useless for single-token decode),
+/// this parallelizes a single output vector by **columns**. It is what lets the
+/// autoregressive GEMV — every decode matmul has `m = 1` — use more than one
+/// core. Because each output index is produced by exactly one worker and the
+/// reduction over the contraction dimension happens entirely inside that worker,
+/// the result is **bit-for-bit identical** regardless of the thread count.
+///
+/// `min_chunk` keeps workers from being handed trivially small slices; the whole
+/// thing runs serially below it or when threading is unavailable.
+pub fn run_1d<K>(total: usize, min_chunk: usize, kernel: K) -> Vec<f32>
+where
+    K: Fn(usize, usize, &mut [f32]) + Send + Sync + 'static,
+{
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = min_chunk;
+        let mut out = vec![0.0f32; total];
+        kernel(0, total, &mut out);
+        out
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let threads = num_threads()
+            .max(1)
+            .min(total.div_ceil(min_chunk.max(1)).max(1));
+        if threads <= 1 {
+            let mut out = vec![0.0f32; total];
+            kernel(0, total, &mut out);
+            return out;
+        }
+
+        let cols_per = total.div_ceil(threads);
+        let kernel = Arc::new(kernel);
+        let pool = pool();
+        let (tx, rx) = channel::<(usize, Vec<f32>)>();
+
+        let mut blocks = 0usize;
+        let mut j0 = 0usize;
+        while j0 < total {
+            let j1 = (j0 + cols_per).min(total);
+            let kernel = Arc::clone(&kernel);
+            let tx = tx.clone();
+            let job: Job = Box::new(move || {
+                let mut block = vec![0.0f32; j1 - j0];
+                kernel(j0, j1, &mut block);
+                let _ = tx.send((j0, block));
+            });
+            let _ = pool.senders[blocks % pool.senders.len()].send(job);
+            blocks += 1;
+            j0 = j1;
+        }
+        drop(tx);
+
+        let mut out = vec![0.0f32; total];
+        for _ in 0..blocks {
+            let (j0, block) = rx.recv().expect("ferrum: worker thread disconnected");
+            out[j0..j0 + block.len()].copy_from_slice(&block);
+        }
+        out
+    }
+}
+
+/// Whether a 1-D output of `total` elements with `per_element` scalar work each
+/// is worth splitting across the pool (the GEMV/decode gate).
+pub fn should_parallelize_1d(total: usize, per_element: usize) -> bool {
+    total >= 2
+        && total.saturating_mul(per_element) >= PARALLEL_THRESHOLD
+        && num_threads() > 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +286,41 @@ mod tests {
         assert!(!should_parallelize(1000, 0), "trivial work stays serial");
         if num_threads() > 1 {
             assert!(should_parallelize(1000, PARALLEL_THRESHOLD));
+        }
+    }
+
+    #[test]
+    fn run_1d_covers_every_column_exactly_once() {
+        let total = 1000usize;
+        let out = run_1d(total, 64, move |j0, j1, block| {
+            for (idx, j) in (j0..j1).enumerate() {
+                block[idx] = (j * 2) as f32;
+            }
+        });
+        assert_eq!(out.len(), total);
+        for (j, &v) in out.iter().enumerate() {
+            assert_eq!(v, (j * 2) as f32, "column {j} not written exactly once");
+        }
+    }
+
+    #[test]
+    fn run_1d_serial_when_min_chunk_exceeds_total() {
+        // min_chunk ≥ total collapses to a single serial invocation.
+        let out = run_1d(50, 1_000_000, move |j0, j1, block| {
+            for (idx, j) in (j0..j1).enumerate() {
+                block[idx] = j as f32;
+            }
+        });
+        assert_eq!(out.len(), 50);
+        assert!(out.iter().enumerate().all(|(j, &v)| v == j as f32));
+    }
+
+    #[test]
+    fn should_parallelize_1d_gates() {
+        assert!(!should_parallelize_1d(1, usize::MAX), "single element stays serial");
+        assert!(!should_parallelize_1d(1000, 0), "no work stays serial");
+        if num_threads() > 1 {
+            assert!(should_parallelize_1d(PARALLEL_THRESHOLD, 1));
         }
     }
 }

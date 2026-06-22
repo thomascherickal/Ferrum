@@ -17,16 +17,29 @@
 //!   5 = Flatten (v5 only, no payload)
 //!
 //! v5 is a tag-compatible extension of v4: each weight vector is prefixed by a
-//! one-byte encoding marker — 0 = raw f32, 1 = int8 symmetric quantisation
-//! (f32 scale followed by one i8 per value, value = i8 × scale). `to_bytes`
-//! writes v4 whenever the model is expressible in it; `to_bytes_quantized`
-//! writes v5 with large weight tensors stored int8 (≈4× smaller files).
+//! one-byte encoding marker —
+//!   0 = raw f32,
+//!   1 = int8 symmetric per-tensor (f32 scale, then one i8 per value),
+//!   2 = int8 symmetric per-channel (one f32 scale per input row),
+//!   3 = int4 symmetric per-tensor (f32 scale, then packed nibbles),
+//!   4 = int4 symmetric per-channel (one f32 scale per input row) — the default
+//!       for `to_bytes_quantized_int4`.
+//! value = q × scale. `to_bytes` writes v4 whenever the model is expressible in
+//! it; `to_bytes_quantized` writes v5 with large weight matrices stored int8
+//! (≈4× smaller), and `to_bytes_quantized_int4` stores them int4 (≈8× smaller).
+//!
+//! Crucially, the **loader keeps quantized matrices packed in memory** (Opt#1):
+//! a Linear / TransformerBlock projection read from an int8/int4 file becomes a
+//! [`crate::quant::QWeight`], never an expanded f32 buffer, so a large model
+//! both fits in RAM and streams fewer bytes per generated token. Biases,
+//! LayerNorm parameters and embeddings stay f32 in memory (the embedding table
+//! is dequantized on load).
 use crate::activation::Activation;
 use crate::csv::{ModelMetadata, Normalizer};
 use crate::error::{InferError, Result};
 use crate::layer::{ActivationLayer, Embedding, Flatten, LayerNorm, Linear, TransformerBlock};
 use crate::model::Sequential;
-use crate::quant::{int8_scale, int8_scales_per_channel, QUANT_MIN_LEN};
+use crate::quant::{int8_scale, int8_scales_per_channel, QKind, QWeight, QUANT_MIN_LEN};
 
 const MAGIC: &[u8; 4] = b"FINF";
 const VERSION: u32 = 4;
@@ -46,6 +59,14 @@ const ENC_INT8: u8 = 1;
 /// with `row_len = n / channels`. A tag-compatible extension of v5 — older v5
 /// readers reject the unknown marker rather than misreading.
 const ENC_INT8_PER_CHANNEL: u8 = 2;
+/// Per-tensor int4 (§Opt#1): `f32` scale, then `rows·ceil(cols/2)` bytes of
+/// packed nibbles (low nibble = even column first, each row padded to a whole
+/// byte — the same packing as [`crate::quant::QWeight`], so the loader copies
+/// straight into one without re-quantizing). Symmetric, levels −7..=7.
+const ENC_INT4: u8 = 3;
+/// Per-channel int4: `u32` channel count, one `f32` scale per channel, then the
+/// packed nibbles. Channels are the matrix's input rows (`= in_features`).
+const ENC_INT4_PER_CHANNEL: u8 = 4;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Reader helper
@@ -137,8 +158,141 @@ impl<'a> Reader<'a> {
                     .map(|(i, &b)| (b as i8) as f32 * scales[i / row])
                     .collect())
             }
+            ENC_INT4 | ENC_INT4_PER_CHANNEL => Err(InferError::Format(
+                "int4 weights are only valid for matrices (read via weights_q)".into(),
+            )),
             m => Err(InferError::Format(format!("bad weight encoding marker {m}"))),
         }
+    }
+
+    /// Read a `[rows, cols]` weight matrix, **preserving quantization** when the
+    /// file is int8/int4 so the weights stay packed in memory (Opt#1). Returns
+    /// either an f32 buffer (v4, or an `ENC_F32` v5 tensor) or a [`QWeight`].
+    ///
+    /// The FINF per-channel convention for matrices is one scale per input row
+    /// (`channels = in_features = rows`), which maps exactly onto `QWeight`'s
+    /// per-row scales; a per-tensor encoding becomes a `QWeight` whose row scales
+    /// are all equal. An unexpected `channels != rows` (never produced by this
+    /// writer) is dequantized to f32 defensively.
+    fn weights_q(&mut self, rows: usize, cols: usize) -> Result<LoadedWeights> {
+        let n = mul_dims(rows, cols)?;
+        if !self.v5 {
+            return Ok(LoadedWeights::F32(self.f32_vec(n)?));
+        }
+        match self.u8()? {
+            ENC_F32 => Ok(LoadedWeights::F32(self.f32_vec(n)?)),
+            ENC_INT8 => {
+                let scale = self.read_f32()?;
+                let raw = self.take(n)?.to_vec();
+                Ok(LoadedWeights::Quant(QWeight {
+                    rows,
+                    cols,
+                    kind: QKind::Int8,
+                    scales: vec![scale; rows],
+                    q: raw,
+                }))
+            }
+            ENC_INT8_PER_CHANNEL => {
+                let channels = self.usize()?;
+                if channels == 0 || n % channels != 0 {
+                    return Err(InferError::Format(format!(
+                        "per-channel int8: {channels} channels do not divide {n}"
+                    )));
+                }
+                let scales = self.read_scales(channels)?;
+                let raw = self.take(n)?;
+                if channels == rows {
+                    Ok(LoadedWeights::Quant(QWeight {
+                        rows,
+                        cols,
+                        kind: QKind::Int8,
+                        scales,
+                        q: raw.to_vec(),
+                    }))
+                } else {
+                    let row = n / channels;
+                    Ok(LoadedWeights::F32(
+                        raw.iter()
+                            .enumerate()
+                            .map(|(i, &b)| (b as i8) as f32 * scales[i / row])
+                            .collect(),
+                    ))
+                }
+            }
+            ENC_INT4 => {
+                let scale = self.read_f32()?;
+                let packed = mul_dims(rows, cols.div_ceil(2))?;
+                let raw = self.take(packed)?.to_vec();
+                Ok(LoadedWeights::Quant(QWeight {
+                    rows,
+                    cols,
+                    kind: QKind::Int4,
+                    scales: vec![scale; rows],
+                    q: raw,
+                }))
+            }
+            ENC_INT4_PER_CHANNEL => {
+                let channels = self.usize()?;
+                let packed = mul_dims(rows, cols.div_ceil(2))?;
+                if channels == rows {
+                    let scales = self.read_scales(channels)?;
+                    let raw = self.take(packed)?.to_vec();
+                    Ok(LoadedWeights::Quant(QWeight {
+                        rows,
+                        cols,
+                        kind: QKind::Int4,
+                        scales,
+                        q: raw,
+                    }))
+                } else {
+                    // Defensive: not produced by this writer for matrices.
+                    let scales = self.read_scales(channels.max(1))?;
+                    let qw = QWeight {
+                        rows: channels.max(1),
+                        cols: n / channels.max(1),
+                        kind: QKind::Int4,
+                        scales,
+                        q: self.take(packed)?.to_vec(),
+                    };
+                    Ok(LoadedWeights::F32(qw.to_f32()))
+                }
+            }
+            m => Err(InferError::Format(format!("bad weight encoding marker {m}"))),
+        }
+    }
+
+    fn read_f32(&mut self) -> Result<f32> {
+        let b = self.take(4)?;
+        Ok(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn read_scales(&mut self, n: usize) -> Result<Vec<f32>> {
+        (0..n).map(|_| self.read_f32()).collect()
+    }
+}
+
+/// A weight matrix as read from FINF: either full f32, or kept quantized.
+enum LoadedWeights {
+    F32(Vec<f32>),
+    Quant(QWeight),
+}
+
+impl LoadedWeights {
+    /// Materialize to f32 (used where the in-memory layer stays f32, e.g.
+    /// embeddings).
+    fn into_f32(self) -> Vec<f32> {
+        match self {
+            LoadedWeights::F32(v) => v,
+            LoadedWeights::Quant(q) => q.to_f32(),
+        }
+    }
+}
+
+/// Build a `Linear` from a loaded weight matrix, keeping it quantized in memory
+/// when the file was quantized (Opt#1) and falling back to f32 otherwise.
+fn linear_from_loaded(in_f: usize, out_f: usize, w: LoadedWeights, bias: Vec<f32>) -> Result<Linear> {
+    match w {
+        LoadedWeights::Quant(qw) => Linear::quantized(in_f, out_f, qw, bias),
+        LoadedWeights::F32(data) => Linear::new(in_f, out_f, data, bias),
     }
 }
 
@@ -179,39 +333,69 @@ fn push_int8(out: &mut Vec<u8>, data: &[f32], scale: f32) {
     }
 }
 
+/// On-disk weight precision selected at save time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QPrec {
+    /// Full f32 (FINF v4, or v5 `ENC_F32`).
+    F32,
+    /// int8 symmetric, per-channel for matrices (the historical `to_bytes_quantized`).
+    Int8,
+    /// int4 symmetric, per-channel for matrices (~8× smaller than f32).
+    Int4,
+}
+
 /// Write one weight vector. v4: raw f32. v5: a marker byte then either raw f32,
-/// per-tensor int8 (one scale), or per-channel int8 (§7: one scale per
-/// `channels` contiguous rows, isolating outliers). `channels` is the weight
+/// per-tensor/-channel int8, or per-channel int4. `channels` is the weight
 /// matrix's row count (`1` for biases / 1-D parameters). Small or non-finite
 /// vectors stay f32 even when quantisation is requested.
-fn push_weights(out: &mut Vec<u8>, data: &[f32], channels: usize, v5: bool, quantize: bool) {
+///
+/// int4 is always written per-row (`ENC_INT4_PER_CHANNEL`, `channels` = rows)
+/// with [`QWeight`]'s exact packing, so the loader reconstructs the `QWeight`
+/// byte-for-byte with no re-quantization.
+fn push_weights(out: &mut Vec<u8>, data: &[f32], channels: usize, v5: bool, prec: QPrec) {
     if !v5 {
         push_f32s(out, data);
         return;
     }
     let finite = data.iter().all(|v| v.is_finite());
-    if !(quantize && data.len() >= QUANT_MIN_LEN && finite) {
+    if prec == QPrec::F32 || !(data.len() >= QUANT_MIN_LEN && finite) {
         out.push(ENC_F32);
         push_f32s(out, data);
         return;
     }
-    // Per-channel when the matrix splits into >1 even rows; else per-tensor.
-    if channels > 1 && data.len() % channels == 0 {
-        let row = data.len() / channels;
-        let scales = int8_scales_per_channel(data, channels);
-        out.push(ENC_INT8_PER_CHANNEL);
-        push_u32(out, channels as u32);
-        for &s in &scales {
-            out.extend_from_slice(&s.to_le_bytes());
+    match prec {
+        QPrec::F32 => unreachable!(),
+        QPrec::Int8 => {
+            // Per-channel when the matrix splits into >1 even rows; else per-tensor.
+            if channels > 1 && data.len() % channels == 0 {
+                let row = data.len() / channels;
+                let scales = int8_scales_per_channel(data, channels);
+                out.push(ENC_INT8_PER_CHANNEL);
+                push_u32(out, channels as u32);
+                for &s in &scales {
+                    out.extend_from_slice(&s.to_le_bytes());
+                }
+                for (c, chunk) in data.chunks(row).enumerate() {
+                    push_int8(out, chunk, scales[c]);
+                }
+            } else {
+                let scale = int8_scale(data);
+                out.push(ENC_INT8);
+                out.extend_from_slice(&scale.to_le_bytes());
+                push_int8(out, data, scale);
+            }
         }
-        for (c, chunk) in data.chunks(row).enumerate() {
-            push_int8(out, chunk, scales[c]);
+        QPrec::Int4 => {
+            let rows = if channels > 0 && data.len() % channels == 0 { channels } else { 1 };
+            let cols = data.len() / rows;
+            let qw = QWeight::from_f32(data, rows, cols, QKind::Int4);
+            out.push(ENC_INT4_PER_CHANNEL);
+            push_u32(out, rows as u32);
+            for &s in &qw.scales {
+                out.extend_from_slice(&s.to_le_bytes());
+            }
+            out.extend_from_slice(&qw.q);
         }
-    } else {
-        let scale = int8_scale(data);
-        out.push(ENC_INT8);
-        out.extend_from_slice(&scale.to_le_bytes());
-        push_int8(out, data, scale);
     }
 }
 
@@ -227,7 +411,7 @@ pub fn to_bytes(model: &Sequential, norm: &Normalizer, meta: &ModelMetadata) -> 
         .iter()
         .any(|l| l.as_any().downcast_ref::<Flatten>().is_some());
     let version = if needs_v5 { VERSION_QUANT } else { VERSION };
-    to_bytes_impl(model, norm, meta, version, false)
+    to_bytes_impl(model, norm, meta, version, QPrec::F32)
 }
 
 /// Serialize as FINF v5 with int8 post-training quantisation: every weight
@@ -239,7 +423,19 @@ pub fn to_bytes_quantized(
     norm: &Normalizer,
     meta: &ModelMetadata,
 ) -> Result<Vec<u8>> {
-    to_bytes_impl(model, norm, meta, VERSION_QUANT, true)
+    to_bytes_impl(model, norm, meta, VERSION_QUANT, QPrec::Int8)
+}
+
+/// Serialize as FINF v5 with **int4** post-training quantisation (~8× smaller
+/// than f32). Matrices are stored per-row at 4 bits/weight; biases and
+/// LayerNorm parameters stay int8/f32. This is the recommended on-disk format
+/// for large (≥1B) models, and the loader keeps the matrices packed in memory.
+pub fn to_bytes_quantized_int4(
+    model: &Sequential,
+    norm: &Normalizer,
+    meta: &ModelMetadata,
+) -> Result<Vec<u8>> {
+    to_bytes_impl(model, norm, meta, VERSION_QUANT, QPrec::Int4)
 }
 
 fn to_bytes_impl(
@@ -247,17 +443,20 @@ fn to_bytes_impl(
     norm: &Normalizer,
     meta: &ModelMetadata,
     version: u32,
-    quantize: bool,
+    prec: QPrec,
 ) -> Result<Vec<u8>> {
     let v5 = version == VERSION_QUANT;
-    // Matrices quantise per output-row (`channels = rows`); 1-D parameters
-    // (biases, LayerNorm) use `channels = 1` (and stay f32 below QUANT_MIN_LEN).
+    // Matrices quantise per input-row (`channels = in_features`). 1-D parameters
+    // (biases, LayerNorm) use `channels = 1` and are read back through the f32
+    // path, which has no int4 decoder — so they never go below int8 (int4 is
+    // demoted to int8 for them). Both stay f32 below QUANT_MIN_LEN anyway.
+    let vec_prec = if prec == QPrec::Int4 { QPrec::Int8 } else { prec };
     let push_mat = |out: &mut Vec<u8>, data: &[f32], channels: usize| {
-        push_weights(out, data, channels, v5, quantize)
+        push_weights(out, data, channels, v5, prec)
     };
-    let push_vec = |out: &mut Vec<u8>, data: &[f32]| push_weights(out, data, 1, v5, quantize);
-    vprintln!("[loader::to_bytes] Serializing FINF v{} model ({} layers, quantize={})",
-        version, model.len(), quantize);
+    let push_vec = |out: &mut Vec<u8>, data: &[f32]| push_weights(out, data, 1, v5, vec_prec);
+    vprintln!("[loader::to_bytes] Serializing FINF v{} model ({} layers, prec=int{})",
+        version, model.len(), match prec { QPrec::F32 => 32, QPrec::Int8 => 8, QPrec::Int4 => 4 });
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
     push_u32(&mut out, version);
@@ -277,7 +476,9 @@ fn to_bytes_impl(
             out.push(TAG_LINEAR);
             push_usize(&mut out, lin.in_features());
             push_usize(&mut out, lin.out_features());
-            push_mat(&mut out, &lin.weight.data, lin.in_features());
+            // `weight_f32` dequantizes if the Linear is already quantized in
+            // memory, so a load-quantized model re-serializes correctly.
+            push_mat(&mut out, &lin.weight_f32(), lin.in_features());
             push_vec(&mut out, &lin.bias.data);
 
         } else if let Some(act) = any.downcast_ref::<ActivationLayer>() {
@@ -307,22 +508,23 @@ fn to_bytes_impl(
             push_usize(&mut out, tb.num_heads());
             push_usize(&mut out, tb.embedding_dim());
             push_usize(&mut out, tb.hidden_dim());
-            // Serialize all projection weights in order: ln1, q, k, v, out, ln2, ffn1, ffn2
+            // Serialize all projection weights in order: ln1, q, k, v, out, ln2,
+            // ffn1, ffn2. `weight_f32` dequantizes any in-memory-quantized proj.
             push_vec(&mut out, &tb.ln1.gamma.data);
             push_vec(&mut out, &tb.ln1.beta.data);
-            push_mat(&mut out, &tb.q_proj.weight.data, tb.q_proj.in_features());
+            push_mat(&mut out, &tb.q_proj.weight_f32(), tb.q_proj.in_features());
             push_vec(&mut out, &tb.q_proj.bias.data);
-            push_mat(&mut out, &tb.k_proj.weight.data, tb.k_proj.in_features());
+            push_mat(&mut out, &tb.k_proj.weight_f32(), tb.k_proj.in_features());
             push_vec(&mut out, &tb.k_proj.bias.data);
-            push_mat(&mut out, &tb.v_proj.weight.data, tb.v_proj.in_features());
+            push_mat(&mut out, &tb.v_proj.weight_f32(), tb.v_proj.in_features());
             push_vec(&mut out, &tb.v_proj.bias.data);
-            push_mat(&mut out, &tb.out_proj.weight.data, tb.out_proj.in_features());
+            push_mat(&mut out, &tb.out_proj.weight_f32(), tb.out_proj.in_features());
             push_vec(&mut out, &tb.out_proj.bias.data);
             push_vec(&mut out, &tb.ln2.gamma.data);
             push_vec(&mut out, &tb.ln2.beta.data);
-            push_mat(&mut out, &tb.ffn1.weight.data, tb.ffn1.in_features());
+            push_mat(&mut out, &tb.ffn1.weight_f32(), tb.ffn1.in_features());
             push_vec(&mut out, &tb.ffn1.bias.data);
-            push_mat(&mut out, &tb.ffn2.weight.data, tb.ffn2.in_features());
+            push_mat(&mut out, &tb.ffn2.weight_f32(), tb.ffn2.in_features());
             push_vec(&mut out, &tb.ffn2.bias.data);
 
         } else {
@@ -376,11 +578,9 @@ pub fn from_bytes(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata
                 let in_f = r.usize()?;
                 let out_f = r.usize()?;
                 vprintln!("[loader::from_bytes]   layer[{}]: Linear({}→{})", layer_i, in_f, out_f);
-                model.push(Box::new(Linear::new(
-                    in_f, out_f,
-                    r.weights(mul_dims(in_f, out_f)?)?,
-                    r.weights(out_f)?,
-                )?));
+                let w = r.weights_q(in_f, out_f)?;
+                let bias = r.weights(out_f)?;
+                model.push(Box::new(linear_from_loaded(in_f, out_f, w, bias)?));
             }
             TAG_ACTIVATION => {
                 let t = r.u8()?;
@@ -394,10 +594,12 @@ pub fn from_bytes(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata
                 let max_seq_len = r.usize()?;
                 let embedding_dim = r.usize()?;
                 vprintln!("[loader::from_bytes]   layer[{}]: Embedding(vocab={}, seq={}, dim={})", layer_i, vocab_size, max_seq_len, embedding_dim);
+                // Embeddings stay f32 in memory (lookup + add, not a GEMV), but
+                // we still read a quantized table by dequantizing on load.
+                let tok = r.weights_q(vocab_size, embedding_dim)?.into_f32();
+                let pos = r.weights_q(max_seq_len, embedding_dim)?.into_f32();
                 model.push(Box::new(Embedding::new(
-                    vocab_size, max_seq_len, embedding_dim,
-                    r.weights(mul_dims(vocab_size, embedding_dim)?)?,
-                    r.weights(mul_dims(max_seq_len, embedding_dim)?)?,
+                    vocab_size, max_seq_len, embedding_dim, tok, pos,
                 )?));
             }
             TAG_LAYERNORM => {
@@ -418,18 +620,37 @@ pub fn from_bytes(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata
                     layer_i, context_len, num_heads, embedding_dim, hidden_dim);
                 let c = embedding_dim;
                 let h = hidden_dim;
-                let cc = mul_dims(c, c)?;
-                let ch = mul_dims(c, h)?;
-                model.push(Box::new(TransformerBlock::new(
-                    context_len, num_heads, embedding_dim,
-                    r.weights(c)?,  r.weights(c)?,    // ln1 gamma, beta
-                    r.weights(cc)?, r.weights(c)?,    // q weight, bias
-                    r.weights(cc)?, r.weights(c)?,    // k weight, bias
-                    r.weights(cc)?, r.weights(c)?,    // v weight, bias
-                    r.weights(cc)?, r.weights(c)?,    // out weight, bias
-                    r.weights(c)?,  r.weights(c)?,    // ln2 gamma, beta
-                    r.weights(ch)?, r.weights(h)?,    // ffn1 weight, bias
-                    r.weights(ch)?, r.weights(c)?,    // ffn2 weight, bias
+                // Read in the exact serialization order. The six projection
+                // matrices stay quantized in memory (Opt#1) — they are the bulk
+                // of a large model's weights; LayerNorm and biases stay f32.
+                let ln1_g = r.weights(c)?;
+                let ln1_b = r.weights(c)?;
+                let q_w = r.weights_q(c, c)?;
+                let q_b = r.weights(c)?;
+                let k_w = r.weights_q(c, c)?;
+                let k_b = r.weights(c)?;
+                let v_w = r.weights_q(c, c)?;
+                let v_b = r.weights(c)?;
+                let o_w = r.weights_q(c, c)?;
+                let o_b = r.weights(c)?;
+                let ln2_g = r.weights(c)?;
+                let ln2_b = r.weights(c)?;
+                let f1_w = r.weights_q(c, h)?;
+                let f1_b = r.weights(h)?;
+                let f2_w = r.weights_q(h, c)?;
+                let f2_b = r.weights(c)?;
+                model.push(Box::new(TransformerBlock::from_parts(
+                    context_len,
+                    num_heads,
+                    embedding_dim,
+                    LayerNorm::new(c, ln1_g, ln1_b)?,
+                    linear_from_loaded(c, c, q_w, q_b)?,
+                    linear_from_loaded(c, c, k_w, k_b)?,
+                    linear_from_loaded(c, c, v_w, v_b)?,
+                    linear_from_loaded(c, c, o_w, o_b)?,
+                    LayerNorm::new(c, ln2_g, ln2_b)?,
+                    linear_from_loaded(c, h, f1_w, f1_b)?,
+                    linear_from_loaded(h, c, f2_w, f2_b)?,
                 )?));
             }
             TAG_FLATTEN => {
@@ -461,6 +682,17 @@ pub fn save_quantized(
     vprintln!("[loader::save_quantized] Saving quantized model to: {}", path);
     let bytes = to_bytes_quantized(model, norm, meta)?;
     vprintln!("[loader::save_quantized] Writing {} bytes to disk", bytes.len());
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+/// Like [`save_quantized`] but writes **int4** weights (~8× smaller than f32).
+pub fn save_quantized_int4(
+    model: &Sequential,
+    norm: &Normalizer,
+    meta: &ModelMetadata,
+    path: &str,
+) -> Result<()> {
+    let bytes = to_bytes_quantized_int4(model, norm, meta)?;
     std::fs::write(path, bytes)?;
     Ok(())
 }
@@ -513,6 +745,54 @@ mod tests {
             target_range: [0.0, 2.0],
             input_dim: 4,
             output_dim: 3,
+            tokenizer_state: String::new(),
+        };
+        (model, norm, meta)
+    }
+
+    /// A transformer bundle whose matrices are ≥ QUANT_MIN_LEN, so int4/int8
+    /// quantization actually engages (the small `make_embedding_bundle` stays
+    /// f32). `Embedding → TransformerBlock → LayerNorm → Linear(head) → Softmax`.
+    fn make_embedding_bundle_big() -> (Sequential, Normalizer, ModelMetadata) {
+        let vocab = 10usize;
+        let ctx = 4usize;
+        let dim = 64usize;
+        let heads = 4usize;
+        let hidden = 128usize;
+        let f = |n: usize, s: f32| -> Vec<f32> {
+            (0..n).map(|i| (i as f32 * s).sin() * 0.2).collect()
+        };
+        let emb = Embedding::new(vocab, ctx, dim, f(vocab * dim, 0.01), f(ctx * dim, 0.02)).unwrap();
+        let tb = TransformerBlock::new(
+            ctx, heads, dim,
+            vec![1.0; dim], vec![0.0; dim],
+            f(dim * dim, 0.013), vec![0.0; dim],
+            f(dim * dim, 0.017), vec![0.0; dim],
+            f(dim * dim, 0.019), vec![0.0; dim],
+            f(dim * dim, 0.023), vec![0.0; dim],
+            vec![1.0; dim], vec![0.0; dim],
+            f(dim * hidden, 0.007), vec![0.0; hidden],
+            f(hidden * dim, 0.009), vec![0.0; dim],
+        ).unwrap();
+        let lnf = LayerNorm::new(dim, vec![1.0; dim], vec![0.0; dim]).unwrap();
+        let head = Linear::new(dim, vocab, f(dim * vocab, 0.005), vec![0.0; vocab]).unwrap();
+        let model = Sequential::new()
+            .with(Box::new(emb))
+            .with(Box::new(tb))
+            .with(Box::new(lnf))
+            .with(Box::new(head))
+            .with(Box::new(ActivationLayer::new(Activation::Softmax)));
+        let norm = Normalizer { means: vec![], stds: vec![] };
+        let meta = ModelMetadata {
+            dataset_name: "big".into(),
+            task: TaskType::TransformerSLM,
+            feature_names: (0..ctx).map(|i| format!("c_{i}")).collect(),
+            feature_ranges: vec![[0.0, vocab as f32]; ctx],
+            class_names: (0..vocab).map(|i| format!("{i:x}")).collect(),
+            target_name: "next".into(),
+            target_range: [0.0, vocab as f32],
+            input_dim: ctx,
+            output_dim: vocab,
             tokenizer_state: String::new(),
         };
         (model, norm, meta)
@@ -632,6 +912,65 @@ mod tests {
     }
 
     #[test]
+    fn int4_roundtrip_keeps_weights_quantized_in_memory() {
+        // A Linear big enough to quantize (≥ QUANT_MIN_LEN). After an int4
+        // save→load the layer must still be quantized *in memory* (Opt#1: no f32
+        // expansion) and produce output close to the f32 original.
+        let (in_f, out_f) = (96usize, 96usize);
+        let w: Vec<f32> = (0..in_f * out_f).map(|i| (i as f32 * 0.011).sin() * 0.4).collect();
+        let big = Linear::new(in_f, out_f, w, vec![0.0; out_f]).unwrap();
+        let model = Sequential::new().with(Box::new(big));
+        let norm = Normalizer { means: vec![], stds: vec![] };
+        let (_, _, meta) = make_bundle();
+
+        let x = Tensor::matrix(1, in_f, (0..in_f).map(|i| (i as f32 * 0.03).cos()).collect()).unwrap();
+        let y_f32 = model.forward(&x).unwrap();
+
+        let bytes = to_bytes_quantized_int4(&model, &norm, &meta).unwrap();
+        assert_eq!(&bytes[4..8], &VERSION_QUANT.to_le_bytes());
+        // ~8× smaller than the f32 file for the weight payload.
+        let f32_bytes = to_bytes(&model, &norm, &meta).unwrap();
+        assert!(
+            (bytes.len() as f32) < (f32_bytes.len() as f32) * 0.4,
+            "int4 file {} not far smaller than f32 {}", bytes.len(), f32_bytes.len()
+        );
+
+        let (loaded, _, _) = from_bytes(&bytes).unwrap();
+        let lin = loaded.layers()[0]
+            .as_any()
+            .downcast_ref::<Linear>()
+            .expect("layer 0 is Linear");
+        let qw = lin.qweight().expect("weights stay quantized in memory");
+        assert_eq!(qw.kind, crate::quant::QKind::Int4);
+        assert!(lin.weight.data.is_empty(), "f32 copy must be dropped");
+
+        let y_q = loaded.forward(&x).unwrap();
+        let mae: f32 = y_f32.data.iter().zip(&y_q.data).map(|(a, b)| (a - b).abs()).sum::<f32>()
+            / out_f as f32;
+        assert!(mae < 0.2, "int4 forward drifted too far: mae={mae}");
+    }
+
+    #[test]
+    fn int4_transformer_block_projections_stay_quantized() {
+        // The bulk of a large model is the transformer block projections; verify
+        // they survive an int4 round trip as in-memory QWeights.
+        let (model, norm, meta) = make_embedding_bundle_big();
+        let bytes = to_bytes_quantized_int4(&model, &norm, &meta).unwrap();
+        let (loaded, _, _) = from_bytes(&bytes).unwrap();
+        let tb = loaded
+            .layers()
+            .iter()
+            .find_map(|l| l.as_any().downcast_ref::<TransformerBlock>())
+            .expect("has a transformer block");
+        assert!(tb.q_proj.qweight().is_some(), "q_proj should be quantized");
+        assert!(tb.ffn1.qweight().is_some(), "ffn1 should be quantized");
+        // Forward still runs and is finite.
+        let x = Tensor::matrix(1, meta.input_dim, vec![1.0; meta.input_dim]).unwrap();
+        let y = loaded.forward(&x).unwrap();
+        assert!(y.data.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
     fn per_channel_weight_vector_roundtrips_and_isolates_outlier() {
         // 4 channels × 32 values; channel 2 holds a large outlier.
         let channels = 4;
@@ -640,7 +979,7 @@ mod tests {
         data[2 * row + 1] = 25.0;
 
         let mut out = Vec::new();
-        push_weights(&mut out, &data, channels, /*v5=*/ true, /*quantize=*/ true);
+        push_weights(&mut out, &data, channels, /*v5=*/ true, QPrec::Int8);
         assert_eq!(out[0], ENC_INT8_PER_CHANNEL, "matrix should use the per-channel marker");
 
         let mut r = Reader::new(&out);
@@ -665,7 +1004,7 @@ mod tests {
         // int8 marker, not the per-channel one.
         let data: Vec<f32> = (0..QUANT_MIN_LEN).map(|i| (i as f32 * 0.1).cos() * 0.2).collect();
         let mut out = Vec::new();
-        push_weights(&mut out, &data, 1, true, true);
+        push_weights(&mut out, &data, 1, true, QPrec::Int8);
         assert_eq!(out[0], ENC_INT8, "1-D vector should use the per-tensor marker");
         let mut r = Reader::new(&out);
         r.v5 = true;

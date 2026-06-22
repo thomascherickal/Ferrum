@@ -146,3 +146,17 @@ table.data td:first-child, table.data th:first-child { text-align: left; }
 .toast.err { border-left-color: var(--err); }
 .toast.ok { border-left-color: var(--ok); }
 @keyframes slidein { from { transform: translateX(20px); opacity: 0; } }
+
+/* Dataset catalog (HuggingFace / Kaggle) */
+.catalog { display: flex; flex-direction: column; gap: 8px; margin: 8px 0; }
+.catalog-item {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; padding: 8px 12px; border: 1px solid var(--border, #333);
+  border-radius: 8px;
+}
+.catalog-item button { white-space: nowrap; }
+.badge {
+  display: inline-block; padding: 1px 7px; border-radius: 10px;
+  font-size: 0.78em; background: var(--accent, #2d6); color: #04210f;
+  text-transform: uppercase; letter-spacing: 0.03em;
+}

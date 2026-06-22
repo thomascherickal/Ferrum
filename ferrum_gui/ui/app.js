@@ -68,8 +68,16 @@ async function pickSave(targetId) {
     if (file) $(targetId).value = typeof file === "string" ? file : file.path || file;
   } catch (e) { toast("dialog error: " + e, "error"); }
 }
+async function pickDir(targetId) {
+  if (!dialog) { toast("File dialog unavailable; type the path manually.", "info"); return; }
+  try {
+    const dir = await dialog.open({ multiple: false, directory: true });
+    if (dir) $(targetId).value = typeof dir === "string" ? dir : dir.path || dir;
+  } catch (e) { toast("dialog error: " + e, "error"); }
+}
 bySel(".browse").forEach((b) => b.addEventListener("click", () => pickOpen(b.dataset.target)));
 bySel(".browse-save").forEach((b) => b.addEventListener("click", () => pickSave(b.dataset.target)));
+bySel(".browse-dir").forEach((b) => b.addEventListener("click", () => pickDir(b.dataset.target)));
 
 // ── Terminal (bottom dock) ───────────────────────────────────────────────────
 const termOut = $("termOut");
@@ -135,6 +143,86 @@ $("dsLoadFile").addEventListener("click", async () => {
     toast(`Loaded ${text.length.toLocaleString()} chars`, "ok");
   } catch (e) { setErr("errDsSource", String(e)); }
 });
+
+// ── Dataset catalog (HuggingFace / Kaggle) ───────────────────────────────────
+function destDir() {
+  const d = $("dsDestDir").value.trim();
+  if (!d) throw new Error("Choose a download folder first");
+  return d;
+}
+
+// After a dataset lands on disk, point the local-file loader at it so it flows
+// straight into the clean pipeline.
+function afterDownload(res) {
+  const mb = (res.bytes / (1024 * 1024)).toFixed(2);
+  $("dsFile").value = res.path;
+  toast(`Downloaded ${mb} MB from ${res.source} → ${res.path}. Click “Load file”.`, "ok");
+}
+
+function renderCatalog(list) {
+  const box = $("dsCatalog");
+  box.innerHTML = "";
+  if (!list.length) { box.textContent = "No datasets listed."; return; }
+  for (const d of list) {
+    const card = document.createElement("div");
+    card.className = "catalog-item";
+    const meta = document.createElement("div");
+    meta.innerHTML =
+      `<strong>${d.name}</strong> <span class="badge">${d.source}</span> ` +
+      `<span class="muted">~${d.approxMb} MB · ${d.format}</span><br>` +
+      `<span class="muted">${d.description}</span>`;
+    const btn = document.createElement("button");
+    btn.textContent = "Download";
+    btn.addEventListener("click", async () => {
+      clearErr("errDsCatalog");
+      try {
+        btn.disabled = true; toast(`Downloading ${d.name}…`);
+        const res = await invoke("download_dataset", { id: d.id, destDir: destDir() });
+        afterDownload(res);
+      } catch (e) { setErr("errDsCatalog", String(e)); }
+      finally { btn.disabled = false; }
+    });
+    card.appendChild(meta);
+    card.appendChild(btn);
+    box.appendChild(card);
+  }
+}
+
+async function loadCatalog() {
+  try {
+    renderCatalog(await invoke("list_datasets"));
+  } catch (e) { setErr("errDsCatalog", String(e)); }
+}
+
+$("dsCatalogLoad").addEventListener("click", loadCatalog);
+
+$("dsHfDownload").addEventListener("click", async () => {
+  clearErr("errDsCatalog");
+  try {
+    const repo = reqStr("dsHfRepo", "HuggingFace repo");
+    const file = reqStr("dsHfFile", "File");
+    const hfToken = $("dsHfToken").value.trim() || null;
+    $("dsHfDownload").disabled = true; toast("Downloading from HuggingFace…");
+    const res = await invoke("download_hf_file", { repo, file, revision: null, destDir: destDir(), hfToken });
+    afterDownload(res);
+  } catch (e) { setErr("errDsCatalog", String(e)); }
+  finally { $("dsHfDownload").disabled = false; }
+});
+
+$("dsKgDownload").addEventListener("click", async () => {
+  clearErr("errDsCatalog");
+  try {
+    const ownerSlug = reqStr("dsKgRepo", "Kaggle owner/slug");
+    const file = reqStr("dsKgFile", "File");
+    $("dsKgDownload").disabled = true; toast("Downloading from Kaggle…");
+    const res = await invoke("download_kaggle_file", { ownerSlug, file, destDir: destDir() });
+    afterDownload(res);
+  } catch (e) { setErr("errDsCatalog", String(e)); }
+  finally { $("dsKgDownload").disabled = false; }
+});
+
+// Populate the catalog on startup (best-effort).
+loadCatalog();
 
 $("dsClean").addEventListener("click", async () => {
   clearErr("errDsClean");

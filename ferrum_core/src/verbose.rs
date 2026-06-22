@@ -104,3 +104,74 @@ pub fn check_nan_inf(data: &[f32], label: &str) -> bool {
     }
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Serializes the tests that mutate the process-global VERBOSE/SINK state so
+    // they cannot observe each other's writes when the harness runs in parallel.
+    static GUARD: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn stats_handles_empty_and_values() {
+        assert_eq!(stats(&[]), (0.0, 0.0, 0.0));
+        let (mn, mx, mean) = stats(&[1.0, -2.0, 3.0, 4.0]);
+        assert_eq!(mn, -2.0);
+        assert_eq!(mx, 4.0);
+        assert!((mean - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn check_nan_inf_flags_bad_and_passes_clean() {
+        assert!(!check_nan_inf(&[1.0, 2.0, 3.0], "clean"));
+        assert!(check_nan_inf(&[1.0, f32::NAN, 3.0], "has-nan"));
+        assert!(check_nan_inf(&[1.0, f32::INFINITY], "has-inf"));
+    }
+
+    #[test]
+    fn verbose_flag_toggles() {
+        let _g = GUARD.lock().unwrap();
+        let prev = is_verbose();
+        set_verbose(false);
+        assert!(!is_verbose());
+        set_verbose(true);
+        assert!(is_verbose());
+        set_verbose(prev);
+    }
+
+    #[test]
+    fn sink_receives_logged_lines_then_clears() {
+        let _g = GUARD.lock().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let c2 = Arc::clone(&captured);
+        set_log_sink(move |line| c2.lock().unwrap().push(line.to_string()));
+        log_line("hello-sink");
+        clear_log_sink();
+        // After clearing, further lines are not captured.
+        log_line("after-clear");
+        let got = captured.lock().unwrap();
+        assert!(got.iter().any(|l| l == "hello-sink"));
+        assert!(!got.iter().any(|l| l == "after-clear"));
+    }
+
+    #[test]
+    fn vprintln_macro_only_emits_when_verbose() {
+        let _g = GUARD.lock().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let c2 = Arc::clone(&captured);
+        set_log_sink(move |line| c2.lock().unwrap().push(line.to_string()));
+
+        let prev = is_verbose();
+        set_verbose(false);
+        vprintln!("should-not-appear {}", 1);
+        set_verbose(true);
+        vprintln!("should-appear {}", 2);
+        set_verbose(prev);
+        clear_log_sink();
+
+        let got = captured.lock().unwrap();
+        assert!(got.iter().any(|l| l == "should-appear 2"));
+        assert!(!got.iter().any(|l| l.contains("should-not-appear")));
+    }
+}

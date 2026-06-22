@@ -47,7 +47,7 @@ fn is_sandboxed() -> bool {
 
 /// HTTP client with bounded connect/read timeouts so a hung or slow host can
 /// never block a download task indefinitely (G2).
-fn http_agent() -> ureq::Agent {
+pub(crate) fn http_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(15))
         .timeout_read(std::time::Duration::from_secs(30))

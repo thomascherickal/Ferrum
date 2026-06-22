@@ -178,6 +178,36 @@ The 1-thread run is marginally **faster** (no pool-dispatch overhead), since the
 This sharpens §3: the "low ceiling" for generation is, for single-token steps
 specifically, no parallelism at all.
 
+### 4d. What changed (the three bottlenecks above are now addressed in code)
+
+The three levers this section identified are now implemented (see the `Opt#1/2/3`
+references in the source). These are **structural** changes, not yet re-measured
+on this machine — re-run `cargo bench --bench gemm` and a real int4 decode to put
+numbers here:
+
+- **int4/int8 weights are kept packed in memory and consumed directly**
+  (`quant::QWeight`, `ops::qlinear`, and the loader, which no longer expands
+  quantized matrices to f32). This cuts both the resident footprint *and* the
+  bytes streamed per token — the only lever that raises the bandwidth-bound
+  ceiling. A ~1B model is ~0.5 GB resident at int4 vs ~3.7 GB at f32.
+- **Single-token decode now uses every core.** `ops::qlinear` splits the `m = 1`
+  GEMV across the worker pool by output column (`parallel::run_1d`), so the
+  decode path is no longer pinned to one core. The split is deterministic
+  (bit-stable across thread counts).
+- **The Linear epilogue is fused and the GEMM is cache-tiled** (`ops::linear_forward`,
+  `matmul_block`): no `add_bias` clone per call, and a `KC×NC` panel of `B` is
+  reused across rows to remove the 2048² cliff in §4a. The fused path is
+  bit-identical to `add_bias(matmul(..))`.
+
+GGUF weights can be imported into this int4/int8 path with the std-only reader in
+`gguf.rs`. Llama/Qwen-family checkpoints are **runnable**: `llm.rs` implements
+RMSNorm, RoPE, grouped-query attention (KV-cached), and the SwiGLU FFN, and
+`Gguf::load_llama` maps a `llama`/`qwen2` GGUF onto a runnable `LlamaModel`
+(weights packed to int4/int8). Bit-exact parity with llama.cpp on a real
+checkpoint is not asserted (it needs the actual multi-GB file), but every
+primitive is unit-covered and the imported model's KV-cached decode matches its
+own full forward.
+
 ---
 
 ## Reproducing

@@ -591,6 +591,17 @@ impl GenerativeSLM {
         Ok(bytes)
     }
 
+    /// Serialize to FINF v5 with **int4** weights (~8× smaller than f32). The
+    /// recommended on-disk format for large (≥1B) models: the loader keeps the
+    /// weight matrices packed in memory (int4), so a model both *fits* and
+    /// *streams ⅛ the bytes per token* on the decode hot path.
+    pub fn to_bytes_quantized_int4(&self) -> Result<Vec<u8>> {
+        vprintln!("[slm::GenerativeSLM::to_bytes_quantized_int4] Serializing int4 model...");
+        let bytes = crate::loader::to_bytes_quantized_int4(&self.model, &self.norm, &self.meta)?;
+        vprintln!("[slm::GenerativeSLM::to_bytes_quantized_int4] Serialized to {} bytes", bytes.len());
+        Ok(bytes)
+    }
+
     /// [`GenerativeSLM::train_transformer_with_callback`] driven by a
     /// [`TransformerConfig`]. Training is int8 quantization-aware (QAT).
     pub fn train_transformer_config<F>(
@@ -761,6 +772,25 @@ impl GenerativeSLM {
         }
         std::fs::write(model_path, &bytes)?;
         vprintln!("[slm::GenerativeSLM::save] Wrote {} bytes → {}", bytes.len(), model_path);
+        Ok(())
+    }
+
+    /// Save as **int4** FINF v5 (~8× smaller than f32; the matrices load back
+    /// packed in memory). Recommended for large or GGUF-imported models. Note:
+    /// for the small QAT-trained SLMs produced here, weights are int8-snapped
+    /// during training, so [`GenerativeSLM::save`] (int8) is bit-faithful to the
+    /// in-memory model whereas int4 adds extra quantization drift — int4 pays off
+    /// at scale, where fitting in RAM and streaming fewer bytes per token matter
+    /// more than the last bit of small-model accuracy.
+    pub fn save_int4(&self, model_path: &str) -> Result<()> {
+        let bytes = self.to_bytes_quantized_int4()?;
+        if let Some(parent) = std::path::Path::new(model_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        std::fs::write(model_path, &bytes)?;
+        vprintln!("[slm::GenerativeSLM::save_int4] Wrote {} bytes → {}", bytes.len(), model_path);
         Ok(())
     }
 
@@ -1673,7 +1703,7 @@ impl<'a> CachedTransformer<'a> {
 /// `SamplingParams::with_temperature` (top_k=0, top_p=1, penalty=1, recent
 /// ignored) this draws exactly one `rng.next_f32()` from the temperature softmax
 /// — bit-identical to the pre-I2 sampler.
-fn sample_with_params(
+pub(crate) fn sample_with_params(
     logits: &[f32],
     params: &SamplingParams,
     recent: &[usize],
@@ -1937,6 +1967,43 @@ mod tests {
         assert_eq!(a, b, "generation must be deterministic for a fixed RNG");
         assert!(a.starts_with("abca"));
         assert_eq!(a.chars().count(), 4 + 10);
+    }
+
+    /// End-to-end int4 (Opt#1): a trained transformer serialized to int4 and
+    /// reloaded must keep its projection weights packed in memory, generate
+    /// deterministically, and stay roughly faithful to the in-memory model.
+    #[test]
+    fn int4_serialize_load_keeps_weights_packed_and_generates() {
+        let corpus: String = "the quick brown fox jumps over the lazy dog. ".repeat(8);
+        let mut rng = Rng::new(7);
+        // dim 32 / 1 block keeps the test cheap while the [32,32] projections are
+        // still well above QUANT_MIN_LEN, so int4 packing genuinely engages.
+        let slm = GenerativeSLM::train_transformer(
+            &corpus, 8, 32, 4, 1, 64, 8, 0.01, 8, 0, &mut rng,
+        )
+        .unwrap();
+
+        let bytes = slm.to_bytes_quantized_int4().unwrap();
+        // FINF v5.
+        assert_eq!(&bytes[4..8], &5u32.to_le_bytes());
+        let loaded = GenerativeSLM::from_bytes(&bytes).unwrap();
+
+        // A transformer block projection must be quantized in memory (int4).
+        let tb = loaded
+            .model
+            .layers()
+            .iter()
+            .find_map(|l| l.as_any().downcast_ref::<TransformerBlock>())
+            .expect("loaded model has a transformer block");
+        let qw = tb.q_proj.qweight().expect("q_proj kept packed in memory");
+        assert_eq!(qw.kind, crate::quant::QKind::Int4);
+
+        // Generation runs and is deterministic for a fixed RNG.
+        let a = loaded.generate("the quick", 20, 0.7, &mut Rng::new(99)).unwrap();
+        let b = loaded.generate("the quick", 20, 0.7, &mut Rng::new(99)).unwrap();
+        assert_eq!(a, b);
+        assert!(a.starts_with("the quick"));
+        assert_eq!(a.chars().count(), "the quick".chars().count() + 20);
     }
 
     // ── Validation split / early stopping / best checkpoint (T5) ──────────────

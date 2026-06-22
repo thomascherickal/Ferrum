@@ -2,10 +2,12 @@
 use crate::activation::Activation;
 use crate::error::{InferError, Result};
 use crate::ops;
+use crate::quant::{QKind, QWeight};
 use crate::tensor::Tensor;
 use crate::verbose;
 use std::any::Any;
 use std::cell::RefCell;
+use std::sync::Arc;
 
 /// Everything a layer must provide. `as_any` allows the loader to downcast
 /// a trait object back to its concrete type for serialisation.
@@ -21,9 +23,19 @@ pub trait Layer {
 
 /// Fully-connected affine layer: y = x · W + b.
 /// Weight shape: [in_features, out_features] — no transpose needed in forward.
+///
+/// The weights are held either as full f32 (`weight`) or, for inference of large
+/// models, as an in-memory quantized matrix (`qweight`, int8/int4). When
+/// `qweight` is `Some` the f32 `weight` is an empty placeholder — the whole
+/// point of quantizing is to *not* keep the f32 copy resident — and the forward
+/// pass runs the packed kernel ([`ops::qlinear`]) directly on the int8/int4
+/// data. The two paths produce numerically equivalent results (within the
+/// quantization error already baked in at save time).
+#[derive(Clone, Debug)]
 pub struct Linear {
     pub weight: Tensor,
     pub bias: Tensor,
+    qweight: Option<Arc<QWeight>>,
     in_f: usize,
     out_f: usize,
 }
@@ -40,9 +52,62 @@ impl Linear {
         Ok(Self {
             weight: Tensor::matrix(in_f, out_f, weight)?,
             bias: Tensor::vector(bias),
+            qweight: None,
             in_f,
             out_f,
         })
+    }
+
+    /// Build a Linear whose weights are kept **quantized in memory** (int8/int4).
+    /// `qw` must be the `[in_f, out_f]` quantization of the weight matrix. No f32
+    /// weight copy is retained.
+    pub fn quantized(in_f: usize, out_f: usize, qw: QWeight, bias: Vec<f32>) -> Result<Self> {
+        if bias.len() != out_f {
+            return Err(InferError::DimMismatch(format!(
+                "bias length {} ≠ out_features {out_f}",
+                bias.len()
+            )));
+        }
+        if qw.rows != in_f || qw.cols != out_f {
+            return Err(InferError::DimMismatch(format!(
+                "quantized weight [{},{}] ≠ Linear [{in_f},{out_f}]",
+                qw.rows, qw.cols
+            )));
+        }
+        vprintln!("[layer::Linear::quantized] in={}, out={}, kind={:?}, resident={} bytes",
+            in_f, out_f, qw.kind, qw.resident_bytes());
+        Ok(Self {
+            weight: Tensor { shape: vec![0], data: vec![] },
+            bias: Tensor::vector(bias),
+            qweight: Some(Arc::new(qw)),
+            in_f,
+            out_f,
+        })
+    }
+
+    /// Convert an f32 Linear into a quantized one in place, dropping the f32
+    /// weight. Returns `self` for chaining. No-op if already quantized.
+    pub fn quantize(mut self, kind: QKind) -> Self {
+        if self.qweight.is_none() {
+            let qw = QWeight::from_f32(&self.weight.data, self.in_f, self.out_f, kind);
+            self.weight = Tensor { shape: vec![0], data: vec![] };
+            self.qweight = Some(Arc::new(qw));
+        }
+        self
+    }
+
+    /// The in-memory quantized weight, if this Linear holds one.
+    pub fn qweight(&self) -> Option<&QWeight> {
+        self.qweight.as_deref()
+    }
+
+    /// The weight matrix as row-major f32, dequantizing from `qweight` if the
+    /// f32 copy was dropped. Used by serialization (not the hot path).
+    pub fn weight_f32(&self) -> Vec<f32> {
+        match &self.qweight {
+            Some(qw) => qw.to_f32(),
+            None => self.weight.data.clone(),
+        }
     }
     pub fn in_features(&self) -> usize {
         self.in_f
@@ -62,7 +127,10 @@ impl Layer for Linear {
             )));
         }
         vprintln!("[layer::Linear::forward] input={:?}, weight=[{},{}]", input.shape, self.in_f, self.out_f);
-        let result = ops::add_bias(&ops::matmul(input, &self.weight)?, &self.bias)?;
+        let result = match &self.qweight {
+            Some(qw) => ops::qlinear(input, qw, &self.bias.data)?,
+            None => ops::linear_forward(input, &self.weight, &self.bias.data)?,
+        };
         if verbose::is_verbose() {
             let (vmin, vmax, vmean) = verbose::stats(&result.data);
             vprintln!("[layer::Linear::forward]   output={:?}, stats: min={:.6}, max={:.6}, mean={:.6}", result.shape, vmin, vmax, vmean);
@@ -427,6 +495,48 @@ impl TransformerBlock {
         let ffn1 = Linear::new(embedding_dim, hidden_dim, ffn1_w, ffn1_b)?;
         let ffn2 = Linear::new(hidden_dim, embedding_dim, ffn2_w, ffn2_b)?;
 
+        Ok(Self {
+            ln1,
+            q_proj,
+            k_proj,
+            v_proj,
+            out_proj,
+            ln2,
+            ffn1,
+            ffn2,
+            context_len,
+            num_heads,
+            embedding_dim,
+            last_attention: RefCell::new(Vec::new()),
+        })
+    }
+
+    /// Assemble a block from already-constructed sublayers. Lets the loader feed
+    /// in **quantized** projection Linears (int8/int4) so a transformer block —
+    /// which holds the bulk of a large model's weights (≈12·d² per block) — stays
+    /// quantized in memory instead of being expanded to f32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        context_len: usize,
+        num_heads: usize,
+        embedding_dim: usize,
+        ln1: LayerNorm,
+        q_proj: Linear,
+        k_proj: Linear,
+        v_proj: Linear,
+        out_proj: Linear,
+        ln2: LayerNorm,
+        ffn1: Linear,
+        ffn2: Linear,
+    ) -> Result<Self> {
+        if context_len == 0 {
+            return Err(InferError::DimMismatch("context_len must be > 0".into()));
+        }
+        if num_heads == 0 || embedding_dim % num_heads != 0 {
+            return Err(InferError::DimMismatch(format!(
+                "embedding_dim {embedding_dim} must be divisible by num_heads {num_heads}"
+            )));
+        }
         Ok(Self {
             ln1,
             q_proj,

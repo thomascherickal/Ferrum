@@ -14,6 +14,7 @@
 //! | `term-output`   | `{ line, stream }`                   | interactive terminal  |
 
 mod commands;
+mod datasets;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -58,6 +59,10 @@ pub fn run() {
             commands::run_terminal,
             commands::term_cwd,
             commands::system_stats,
+            datasets::list_datasets,
+            datasets::download_dataset,
+            datasets::download_hf_file,
+            datasets::download_kaggle_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Ferrum SLM Studio");
