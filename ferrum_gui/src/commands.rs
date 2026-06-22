@@ -45,27 +45,47 @@ fn is_sandboxed() -> bool {
 // 1. Datasets — download + clean (requirement #1)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// HTTP client with bounded connect/read timeouts so a hung or slow host can
+/// never block a download task indefinitely (G2).
+fn http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(15))
+        .timeout_read(std::time::Duration::from_secs(30))
+        .timeout_write(std::time::Duration::from_secs(30))
+        .build()
+}
+
+/// Synchronous core of [`download_text`]: validate the URL, fetch with timeouts,
+/// and return at most `cap` bytes decoded as UTF-8. Separated from the Tauri
+/// command so it is unit-testable without an `AppHandle`.
+fn fetch_text(url: &str, cap: usize) -> Result<String, String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("URL must start with http:// or https://".to_string());
+    }
+    let cap = cap.max(1);
+    let resp = http_agent()
+        .get(url)
+        .call()
+        .map_err(|e| format!("download failed: {e}"))?;
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .take(cap as u64)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read failed: {e}"))?;
+    if buf.is_empty() {
+        return Err("downloaded resource was empty".to_string());
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// Download a text resource (e.g. a Project Gutenberg `.txt`) and return it as a
-/// UTF-8 string (lossily decoded), capped at `max_bytes` (default 8 MiB).
+/// UTF-8 string (lossily decoded), capped at `max_bytes` (default 8 MiB). Uses an
+/// HTTP client with connect/read timeouts so a slow host cannot hang the task.
 #[tauri::command]
 pub async fn download_text(url: String, max_bytes: Option<usize>) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return Err("URL must start with http:// or https://".to_string());
-        }
-        let cap = max_bytes.unwrap_or(8 * 1024 * 1024).max(1);
-        let resp = ureq::get(&url)
-            .call()
-            .map_err(|e| format!("download failed: {e}"))?;
-        let mut buf = Vec::new();
-        resp.into_reader()
-            .take(cap as u64)
-            .read_to_end(&mut buf)
-            .map_err(|e| format!("read failed: {e}"))?;
-        if buf.is_empty() {
-            return Err("downloaded resource was empty".to_string());
-        }
-        Ok(String::from_utf8_lossy(&buf).into_owned())
+        let cap = max_bytes.unwrap_or(8 * 1024 * 1024);
+        fetch_text(&url, cap)
     })
     .await
     .map_err(|e| format!("task error: {e}"))?
@@ -638,4 +658,43 @@ pub fn system_stats(state: State<'_, AppState>) -> Result<SysStats, String> {
         mem_percent,
         ferrum_threads: ferrum_core::num_threads(),
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests (X1): pure command logic, no GUI runtime required.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── G2: download timeouts + URL validation ────────────────────────────────
+
+    #[test]
+    fn http_agent_builds() {
+        // Building the timeout-bounded agent must not panic.
+        let _ = http_agent();
+    }
+
+    #[test]
+    fn fetch_text_rejects_non_http_urls() {
+        // Validation happens before any network access, so these never hit the
+        // wire — they fail fast with a clear message.
+        for url in ["ftp://example.com/x", "file:///etc/passwd", "javascript:1", ""] {
+            let err = fetch_text(url, 1024).unwrap_err();
+            assert!(err.contains("http://"), "unexpected error for {url:?}: {err}");
+        }
+    }
+
+    // ── file_name helper ──────────────────────────────────────────────────────
+
+    #[test]
+    fn file_name_extracts_basename() {
+        assert_eq!(file_name("/a/b/model.bin"), "model.bin");
+        assert_eq!(file_name("model.bin"), "model.bin");
+    }
+
+    #[test]
+    fn time_seed_is_nonzero() {
+        assert_ne!(time_seed(), 0);
+    }
 }

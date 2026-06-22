@@ -42,5 +42,41 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
+      # X2: the WASM target uses the KV cache and is excluded from the workspace
+      # build, so verify it compiles for wasm32 on every change.
       - name: Build WASM bindings
         run: cargo build -p tabular_wasm --target wasm32-unknown-unknown --release
+
+  gui:
+    name: Build & test (ferrum_gui, Tauri)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # X1: ferrum_gui is its own crate (heavy webkit deps) and is excluded from
+      # the workspace, so it needs a dedicated job to stay covered by CI.
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libxdo-dev
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ferrum_gui/target
+          key: ${{ runner.os }}-cargo-gui-${{ hashFiles('**/Cargo.lock') }}
+      - name: cargo check (all targets)
+        working-directory: ferrum_gui
+        run: cargo check --all-targets
+      - name: Run backend command tests
+        working-directory: ferrum_gui
+        run: cargo test
+      - name: Run UI stream-reconciliation tests
+        run: node ferrum_gui/ui/stream.test.js

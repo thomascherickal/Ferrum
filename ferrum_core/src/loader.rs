@@ -26,7 +26,7 @@ use crate::csv::{ModelMetadata, Normalizer};
 use crate::error::{InferError, Result};
 use crate::layer::{ActivationLayer, Embedding, Flatten, LayerNorm, Linear, TransformerBlock};
 use crate::model::Sequential;
-use crate::quant::{int8_scale, QUANT_MIN_LEN};
+use crate::quant::{int8_scale, int8_scales_per_channel, QUANT_MIN_LEN};
 
 const MAGIC: &[u8; 4] = b"FINF";
 const VERSION: u32 = 4;
@@ -41,6 +41,11 @@ const TAG_FLATTEN: u8 = 5;
 /// v5 weight-vector encoding markers.
 const ENC_F32: u8 = 0;
 const ENC_INT8: u8 = 1;
+/// Per-channel int8 (§7): `u32` channel count, then one `f32` scale per channel,
+/// then one `i8` per value. Value `i` dequantises as `i8 × scale[i / row_len]`
+/// with `row_len = n / channels`. A tag-compatible extension of v5 — older v5
+/// readers reject the unknown marker rather than misreading.
+const ENC_INT8_PER_CHANNEL: u8 = 2;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Reader helper
@@ -112,6 +117,26 @@ impl<'a> Reader<'a> {
                 let raw = self.take(n)?;
                 Ok(raw.iter().map(|&b| (b as i8) as f32 * scale).collect())
             }
+            ENC_INT8_PER_CHANNEL => {
+                let channels = self.usize()?;
+                if channels == 0 || n % channels != 0 {
+                    return Err(InferError::Format(format!(
+                        "per-channel weights: {channels} channels do not divide {n} values"
+                    )));
+                }
+                let row = n / channels;
+                let mut scales = Vec::with_capacity(channels);
+                for _ in 0..channels {
+                    let b = self.take(4)?;
+                    scales.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+                }
+                let raw = self.take(n)?;
+                Ok(raw
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &b)| (b as i8) as f32 * scales[i / row])
+                    .collect())
+            }
             m => Err(InferError::Format(format!("bad weight encoding marker {m}"))),
         }
     }
@@ -143,29 +168,50 @@ fn push_str(out: &mut Vec<u8>, s: &str) {
     push_u32(out, s.len() as u32);
     out.extend_from_slice(s.as_bytes());
 }
-/// Write one weight vector. v4: raw f32. v5: marker byte, then either raw f32
-/// or int8 symmetric (f32 scale + i8 per value). Small or non-finite vectors
-/// stay f32 even when quantisation is requested.
-fn push_weights(out: &mut Vec<u8>, data: &[f32], v5: bool, quantize: bool) {
+/// Encode `data` as one i8 per value against `scale` (the symmetric int8 grid).
+fn push_int8(out: &mut Vec<u8>, data: &[f32], scale: f32) {
+    if scale == 0.0 {
+        out.extend(std::iter::repeat(0u8).take(data.len()));
+    } else {
+        for &v in data {
+            out.push((v / scale).round().clamp(-127.0, 127.0) as i8 as u8);
+        }
+    }
+}
+
+/// Write one weight vector. v4: raw f32. v5: a marker byte then either raw f32,
+/// per-tensor int8 (one scale), or per-channel int8 (§7: one scale per
+/// `channels` contiguous rows, isolating outliers). `channels` is the weight
+/// matrix's row count (`1` for biases / 1-D parameters). Small or non-finite
+/// vectors stay f32 even when quantisation is requested.
+fn push_weights(out: &mut Vec<u8>, data: &[f32], channels: usize, v5: bool, quantize: bool) {
     if !v5 {
         push_f32s(out, data);
         return;
     }
     let finite = data.iter().all(|v| v.is_finite());
-    if quantize && data.len() >= QUANT_MIN_LEN && finite {
+    if !(quantize && data.len() >= QUANT_MIN_LEN && finite) {
+        out.push(ENC_F32);
+        push_f32s(out, data);
+        return;
+    }
+    // Per-channel when the matrix splits into >1 even rows; else per-tensor.
+    if channels > 1 && data.len() % channels == 0 {
+        let row = data.len() / channels;
+        let scales = int8_scales_per_channel(data, channels);
+        out.push(ENC_INT8_PER_CHANNEL);
+        push_u32(out, channels as u32);
+        for &s in &scales {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        for (c, chunk) in data.chunks(row).enumerate() {
+            push_int8(out, chunk, scales[c]);
+        }
+    } else {
         let scale = int8_scale(data);
         out.push(ENC_INT8);
         out.extend_from_slice(&scale.to_le_bytes());
-        if scale == 0.0 {
-            out.extend(std::iter::repeat(0u8).take(data.len()));
-        } else {
-            for &v in data {
-                out.push((v / scale).round().clamp(-127.0, 127.0) as i8 as u8);
-            }
-        }
-    } else {
-        out.push(ENC_F32);
-        push_f32s(out, data);
+        push_int8(out, data, scale);
     }
 }
 
@@ -204,7 +250,12 @@ fn to_bytes_impl(
     quantize: bool,
 ) -> Result<Vec<u8>> {
     let v5 = version == VERSION_QUANT;
-    let push_f32s = |out: &mut Vec<u8>, data: &[f32]| push_weights(out, data, v5, quantize);
+    // Matrices quantise per output-row (`channels = rows`); 1-D parameters
+    // (biases, LayerNorm) use `channels = 1` (and stay f32 below QUANT_MIN_LEN).
+    let push_mat = |out: &mut Vec<u8>, data: &[f32], channels: usize| {
+        push_weights(out, data, channels, v5, quantize)
+    };
+    let push_vec = |out: &mut Vec<u8>, data: &[f32]| push_weights(out, data, 1, v5, quantize);
     vprintln!("[loader::to_bytes] Serializing FINF v{} model ({} layers, quantize={})",
         version, model.len(), quantize);
     let mut out = Vec::new();
@@ -226,8 +277,8 @@ fn to_bytes_impl(
             out.push(TAG_LINEAR);
             push_usize(&mut out, lin.in_features());
             push_usize(&mut out, lin.out_features());
-            push_f32s(&mut out, &lin.weight.data);
-            push_f32s(&mut out, &lin.bias.data);
+            push_mat(&mut out, &lin.weight.data, lin.in_features());
+            push_vec(&mut out, &lin.bias.data);
 
         } else if let Some(act) = any.downcast_ref::<ActivationLayer>() {
             out.push(TAG_ACTIVATION);
@@ -241,14 +292,14 @@ fn to_bytes_impl(
             push_usize(&mut out, emb.vocab_size());
             push_usize(&mut out, emb.max_seq_len());
             push_usize(&mut out, emb.embedding_dim());
-            push_f32s(&mut out, &emb.token_weight.data);
-            push_f32s(&mut out, &emb.pos_weight.data);
+            push_mat(&mut out, &emb.token_weight.data, emb.vocab_size());
+            push_mat(&mut out, &emb.pos_weight.data, emb.max_seq_len());
 
         } else if let Some(ln) = any.downcast_ref::<LayerNorm>() {
             out.push(TAG_LAYERNORM);
             push_usize(&mut out, ln.dim());
-            push_f32s(&mut out, &ln.gamma.data);
-            push_f32s(&mut out, &ln.beta.data);
+            push_vec(&mut out, &ln.gamma.data);
+            push_vec(&mut out, &ln.beta.data);
 
         } else if let Some(tb) = any.downcast_ref::<TransformerBlock>() {
             out.push(TAG_TRANSFORMER_BLOCK);
@@ -257,22 +308,22 @@ fn to_bytes_impl(
             push_usize(&mut out, tb.embedding_dim());
             push_usize(&mut out, tb.hidden_dim());
             // Serialize all projection weights in order: ln1, q, k, v, out, ln2, ffn1, ffn2
-            push_f32s(&mut out, &tb.ln1.gamma.data);
-            push_f32s(&mut out, &tb.ln1.beta.data);
-            push_f32s(&mut out, &tb.q_proj.weight.data);
-            push_f32s(&mut out, &tb.q_proj.bias.data);
-            push_f32s(&mut out, &tb.k_proj.weight.data);
-            push_f32s(&mut out, &tb.k_proj.bias.data);
-            push_f32s(&mut out, &tb.v_proj.weight.data);
-            push_f32s(&mut out, &tb.v_proj.bias.data);
-            push_f32s(&mut out, &tb.out_proj.weight.data);
-            push_f32s(&mut out, &tb.out_proj.bias.data);
-            push_f32s(&mut out, &tb.ln2.gamma.data);
-            push_f32s(&mut out, &tb.ln2.beta.data);
-            push_f32s(&mut out, &tb.ffn1.weight.data);
-            push_f32s(&mut out, &tb.ffn1.bias.data);
-            push_f32s(&mut out, &tb.ffn2.weight.data);
-            push_f32s(&mut out, &tb.ffn2.bias.data);
+            push_vec(&mut out, &tb.ln1.gamma.data);
+            push_vec(&mut out, &tb.ln1.beta.data);
+            push_mat(&mut out, &tb.q_proj.weight.data, tb.q_proj.in_features());
+            push_vec(&mut out, &tb.q_proj.bias.data);
+            push_mat(&mut out, &tb.k_proj.weight.data, tb.k_proj.in_features());
+            push_vec(&mut out, &tb.k_proj.bias.data);
+            push_mat(&mut out, &tb.v_proj.weight.data, tb.v_proj.in_features());
+            push_vec(&mut out, &tb.v_proj.bias.data);
+            push_mat(&mut out, &tb.out_proj.weight.data, tb.out_proj.in_features());
+            push_vec(&mut out, &tb.out_proj.bias.data);
+            push_vec(&mut out, &tb.ln2.gamma.data);
+            push_vec(&mut out, &tb.ln2.beta.data);
+            push_mat(&mut out, &tb.ffn1.weight.data, tb.ffn1.in_features());
+            push_vec(&mut out, &tb.ffn1.bias.data);
+            push_mat(&mut out, &tb.ffn2.weight.data, tb.ffn2.in_features());
+            push_vec(&mut out, &tb.ffn2.bias.data);
 
         } else {
             return Err(InferError::Format(format!(
@@ -577,6 +628,51 @@ mod tests {
         let y_quant = m3.forward(&x).unwrap();
         for (a, b) in y_full.data.iter().zip(&y_quant.data) {
             assert!((a - b).abs() < 0.05, "quantized output drifted: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn per_channel_weight_vector_roundtrips_and_isolates_outlier() {
+        // 4 channels × 32 values; channel 2 holds a large outlier.
+        let channels = 4;
+        let row = 32;
+        let mut data: Vec<f32> = (0..channels * row).map(|i| (i as f32 * 0.05).sin() * 0.3).collect();
+        data[2 * row + 1] = 25.0;
+
+        let mut out = Vec::new();
+        push_weights(&mut out, &data, channels, /*v5=*/ true, /*quantize=*/ true);
+        assert_eq!(out[0], ENC_INT8_PER_CHANNEL, "matrix should use the per-channel marker");
+
+        let mut r = Reader::new(&out);
+        r.v5 = true;
+        let decoded = r.weights(data.len()).unwrap();
+        assert_eq!(r.pos, out.len(), "reader did not consume the whole vector");
+
+        // Each value is within its own channel's scale/2.
+        let scales = int8_scales_per_channel(&data, channels);
+        for (i, (o, q)) in data.iter().zip(&decoded).enumerate() {
+            assert!((o - q).abs() <= scales[i / row] * 0.5 + 1e-6, "value {i}: {o} vs {q}");
+        }
+        // The outlier did NOT inflate the clean channels' scale: channel 0 stays
+        // accurate (this is the per-channel win over per-tensor).
+        let clean_err: f32 = data[..row].iter().zip(&decoded[..row]).map(|(a, b)| (a - b).abs()).sum();
+        assert!(clean_err < 0.05, "clean channel error too large: {clean_err}");
+    }
+
+    #[test]
+    fn one_dimensional_weight_uses_per_tensor_marker() {
+        // channels = 1 (a bias-like vector) must fall back to the single-scale
+        // int8 marker, not the per-channel one.
+        let data: Vec<f32> = (0..QUANT_MIN_LEN).map(|i| (i as f32 * 0.1).cos() * 0.2).collect();
+        let mut out = Vec::new();
+        push_weights(&mut out, &data, 1, true, true);
+        assert_eq!(out[0], ENC_INT8, "1-D vector should use the per-tensor marker");
+        let mut r = Reader::new(&out);
+        r.v5 = true;
+        let decoded = r.weights(data.len()).unwrap();
+        let scale = int8_scale(&data);
+        for (o, q) in data.iter().zip(&decoded) {
+            assert!((o - q).abs() <= scale * 0.5 + 1e-6);
         }
     }
 

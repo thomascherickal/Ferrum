@@ -106,6 +106,8 @@ impl Args {
             lr: self.get("lr", d.lr),
             batch_size: self.get("batch", d.batch_size),
             vocab_size: self.get("vocab", d.vocab_size),
+            weight_decay: self.get("weight_decay", d.weight_decay),
+            dropout: self.get("dropout", d.dropout),
         }
     }
 }

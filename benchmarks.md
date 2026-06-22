@@ -97,6 +97,89 @@ implementations.
 
 ---
 
+## 4. Matmul kernel — GEMM throughput & decode bandwidth
+
+The sections above time end-to-end training and generation of small models. This
+one isolates the kernel that dominates both — `ops::matmul` — at **synthetic
+~1B-class shapes**, to gauge how the current scalar kernels would behave for a
+much larger SLM. It uses a std-only microbenchmark
+(`ferrum_core/benches/gemm.rs`, `harness = false`, no Criterion), reporting the
+best of many timed iterations on random data. These are raw-kernel numbers, **not
+a trained Ferrum model**; the shapes (`d_model = 2048`, `d_ff = 8192`,
+`vocab = 32000`, 16 layers) stand in for a ~1B-parameter model.
+
+### 4a. Square GEMM — `C[m×n] = A[m×k]·B[k×n]` (compute-bound)
+
+Large square multiplies cross the internal work threshold, so they run on the
+persistent pool. Reported as GFLOP/s (`2·m·k·n / time`).
+
+| Size  | 8 threads        | 1 thread        | thread speedup |
+|-------|------------------|-----------------|----------------|
+| 256²  | 44.9 GFLOP/s     | 17.4 GFLOP/s    | 2.6×           |
+| 512²  | 45.8 GFLOP/s     | 15.9 GFLOP/s    | 2.9×           |
+| 1024² | 47.9 GFLOP/s     | 13.4 GFLOP/s    | 3.6×           |
+| 2048² | **23.5 GFLOP/s** | **6.1 GFLOP/s** | 3.9×           |
+
+- **Cache cliff at 2048².** Throughput holds ~46–48 GFLOP/s through 1024², then
+  roughly halves at 2048², where each matrix (16 MB in f32) overflows cache and
+  the untiled i-k-j kernel re-streams `B` from memory. A cache-tiled kernel would
+  not fall off here.
+- **Vector units sit idle.** Peak ~48 GFLOP/s across 8 cores is ~6 GFLOP/s/core —
+  about what scalar f32 yields; a single AVX2+FMA core can do several times this.
+  The kernels carry no explicit SIMD.
+
+### 4b. Decode GEMV — `c[1×n] = a[1×k]·W[k×n]` (the autoregressive hot path)
+
+With a KV cache, each generated token feeds **one row** through the network, so
+every decode matmul has `m = 1`. `should_parallelize` requires `rows ≥ 2`, so
+these run **serial on one core regardless of thread count**. Reported as GB/s of
+weight `W` streamed (the quantity that bounds bandwidth-limited decode).
+
+| Weight shape          | 8 threads  | 1 thread   |
+|-----------------------|------------|------------|
+| attn proj `2048×2048` | 17.9 GB/s  | 17.8 GB/s  |
+| ffn up `2048×8192`    | 15.4 GB/s  | 16.7 GB/s  |
+| ffn down `8192×2048`  | 16.3 GB/s  | 15.5 GB/s  |
+| logits `2048×32000`   | 15.0 GB/s  | 14.6 GB/s  |
+
+The two columns are identical within noise — **direct confirmation that
+single-token decode never uses more than one core**, and that it is bound by
+memory bandwidth (~15–18 GB/s, one core's share) rather than compute.
+
+### 4c. Synthesized decode step (~1B-class)
+
+One token through 16 layers (4 attention projections + FFN up/down each) plus the
+output projection. **Estimate** — excludes attention score·V matmuls, layernorm,
+softmax, and sampling; one layer's weights are replayed (so they may stay warmer
+in cache than a true 16-layer model).
+
+| Metric                 | 8 threads | 1 thread  |
+|------------------------|-----------|-----------|
+| ms/token               | 268       | 250       |
+| tokens/sec             | 3.7       | 4.0       |
+| weights streamed/token | 3.48 GB   | 3.48 GB   |
+| effective bandwidth    | 13.0 GB/s | 13.9 GB/s |
+
+The 1-thread run is marginally **faster** (no pool-dispatch overhead), since the
+`m = 1` GEMVs cannot use the extra cores anyway.
+
+### What this shows
+
+- **Decode is bandwidth-bound and single-threaded.** The 3.48 GB streamed per
+  token at f32 sets the ceiling; at ~14 GB/s that is ~4 tok/s. Quantizing weights
+  and consuming them in the kernel cuts the bytes — int8 ≈ ¼, int4 ≈ ⅛ — and
+  lifts the ceiling proportionally (int4 ≈ ~30 tok/s here, from bandwidth alone).
+- **The pool helps prefill/training, not single-token decode.** Row-split
+  parallelism needs `m ≥ 2`; splitting GEMV along columns (`n`) or `k` would put
+  the idle cores to work on the decode path.
+- **The scalar kernel leaves a large SIMD/tiling factor on the table**, most
+  visible as the 2048² cache cliff in §4a.
+
+This sharpens §3: the "low ceiling" for generation is, for single-token steps
+specifically, no parallelism at all.
+
+---
+
 ## Reproducing
 
 ```bash
@@ -120,6 +203,14 @@ done
 md5sum out_*.txt   # all hashes identical
 ```
 
+Matmul kernel microbenchmark (§4), std-only, no Criterion:
+
+```bash
+cargo bench --bench gemm                        # auto-detected threads
+FERRUM_NUM_THREADS=1 cargo bench --bench gemm    # force serial
+cargo bench --bench gemm -- 512 1024 4096        # custom square GEMM sizes
+```
+
 ---
 
 ## Caveats
@@ -133,3 +224,7 @@ md5sum out_*.txt   # all hashes identical
   serial by design (below the internal work threshold).
 - No GPU is used anywhere. All parallelism is plain CPU threads built on `std`
   only, with no `unsafe`.
+- §4 measures the raw `ops::matmul` kernel on **synthetic ~1B-class shapes with
+  random data**, not a trained model; its decode-step figure is an estimate (see
+  §4c). The §4 GFLOP/s and GB/s numbers are best-of-many-iterations, lower
+  variance than the wall-clock best-of-two above, but still single-machine.

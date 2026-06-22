@@ -286,6 +286,11 @@ pub struct Net {
     /// forward/backward against int8-snapped weights while SGD updates
     /// full-precision master weights (straight-through estimator).
     qat: bool,
+    /// Global-norm gradient clipping threshold. When `Some(max_norm)`,
+    /// `train_epoch` rescales the gradients so their global L2 norm is at most
+    /// `max_norm` before the SGD update. `None` (default) leaves the update
+    /// unchanged.
+    grad_clip: Option<f32>,
 }
 
 impl Net {
@@ -304,6 +309,7 @@ impl Net {
             input_dim,
             output_dim,
             qat: false,
+            grad_clip: None,
         };
         vprintln!("[train::Net::mlp] Total params: {}", net.num_params());
         net
@@ -339,6 +345,7 @@ impl Net {
             input_dim: context_len,
             output_dim,
             qat: false,
+            grad_clip: None,
         };
         vprintln!("[train::Net::embedding_mlp] Total params: {}", net.num_params());
         net
@@ -351,6 +358,41 @@ impl Net {
     }
     pub fn qat_enabled(&self) -> bool {
         self.qat
+    }
+
+    /// Set the global-norm gradient-clipping threshold (see the `grad_clip`
+    /// field docs). `Some(max_norm)` clips before each step; `None` disables.
+    pub fn set_grad_clip(&mut self, max_norm: Option<f32>) {
+        self.grad_clip = max_norm;
+    }
+    pub fn grad_clip(&self) -> Option<f32> {
+        self.grad_clip
+    }
+
+    /// Every gradient tensor, in layer order (embedding table, then each dense
+    /// layer's weight and bias). Used by [`Net::clip_grad_norm`].
+    fn grad_tensors_mut(&mut self) -> Vec<&mut Tensor> {
+        let mut v = Vec::new();
+        for l in &mut self.layers {
+            match l {
+                TLayer::Embed(e) => v.push(&mut e.grad),
+                TLayer::Dense(d) => {
+                    v.push(&mut d.grad_w);
+                    v.push(&mut d.grad_b);
+                }
+                TLayer::Relu(_) => {}
+            }
+        }
+        v
+    }
+
+    /// Rescale all gradients so their global L2 norm is at most `max_norm`,
+    /// returning the pre-clip norm. Call after [`Net::backward`] and before
+    /// [`Net::step`]; [`train_epoch`] does this automatically when
+    /// [`Net::set_grad_clip`] is set.
+    pub fn clip_grad_norm(&mut self, max_norm: f32) -> f32 {
+        let mut grads = self.grad_tensors_mut();
+        crate::optim::clip_grad_norm(&mut grads, max_norm)
     }
 
     /// Every parameter tensor, in a fixed order (used by the QAT snapshot /
@@ -378,10 +420,13 @@ impl Net {
             .collect()
     }
 
-    /// Snap every (large-enough) parameter tensor onto the int8 grid in place.
+    /// Snap every (large-enough) parameter tensor onto the int8 grid in place,
+    /// per output-row (§7) to match the per-channel FINF v5 quantization. 1-D
+    /// parameters fall back to a single scale.
     pub(crate) fn fake_quantize_weights(&mut self) {
         for t in self.param_tensors_mut() {
-            crate::quant::fake_quantize_int8(&mut t.data);
+            let channels = if t.shape.len() >= 2 { t.shape[0].max(1) } else { 1 };
+            crate::quant::fake_quantize_int8_per_channel(&mut t.data, channels);
         }
     }
 
@@ -509,8 +554,11 @@ pub fn train_epoch(
     let mut total_loss = 0.0f32;
     let mut batches = 0usize;
 
-    // Random minibatch indices (with replacement).
+    // Shuffle a permutation of every sample once per epoch and draw minibatches
+    // without replacement (T4): an epoch now covers the whole dataset exactly
+    // once instead of ≈63% in expectation under sampling with replacement.
     let steps = n.div_ceil(batch_size);
+    let perm = rng.shuffled_indices(n);
     vprintln!("[train::train_epoch] samples={}, batch_size={}, steps={}, lr={}, momentum={}",
         n, batch_size, steps, opt.lr, opt.momentum);
 
@@ -519,20 +567,19 @@ pub fn train_epoch(
     for step in 0..steps {
         let step_start = std::time::Instant::now();
 
-        let indices: Vec<usize> = (0..batch_size)
-            .map(|_| (rng.next_u64() as usize) % n)
-            .collect();
+        let indices = &perm[step * batch_size..((step + 1) * batch_size).min(n)];
+        let cur_bs = indices.len();
 
-        let mut xb_data = Vec::with_capacity(batch_size * net.input_dim);
-        let mut yb = Vec::with_capacity(batch_size);
+        let mut xb_data = Vec::with_capacity(cur_bs * net.input_dim);
+        let mut yb = Vec::with_capacity(cur_bs);
         let (_, cols) = x.matrix_dims()?;
-        for &i in &indices {
+        for &i in indices {
             xb_data.extend_from_slice(&x.data[i * cols..(i + 1) * cols]);
             yb.push(y[i]);
         }
-        let xb = Tensor::matrix(batch_size, cols, xb_data)?;
+        let xb = Tensor::matrix(cur_bs, cols, xb_data)?;
 
-        vprintln!("[train::train_epoch]   step {}/{}: batch shape=[{},{}]", step+1, steps, batch_size, cols);
+        vprintln!("[train::train_epoch]   step {}/{}: batch shape=[{},{}]", step+1, steps, cur_bs, cols);
 
         // QAT: gradients are computed at the int8-snapped weights, but the
         // optimizer updates the fp32 masters (straight-through estimator).
@@ -570,6 +617,9 @@ pub fn train_epoch(
         // Step (against restored fp32 masters when QAT is on)
         if let Some(snapshot) = &masters {
             net.restore_weights(snapshot);
+        }
+        if let Some(max_norm) = net.grad_clip {
+            net.clip_grad_norm(max_norm);
         }
         net.step(opt)?;
 
@@ -707,6 +757,60 @@ mod tests {
         }
         let (loss1, _) = softmax_cross_entropy(&net.forward(&x).unwrap(), &y).unwrap();
         assert!(loss1 < loss0 * 0.5, "loss: {loss0:.4} → {loss1:.4}");
+    }
+
+    #[test]
+    fn clip_grad_norm_caps_net_global_norm() {
+        // After backward, clipping must cap the global gradient norm.
+        let mut rng = Rng::new(42);
+        let x = Tensor::matrix(8, 4, (0..32).map(|_| rng.next_normal() * 50.0).collect()).unwrap();
+        let y: Vec<usize> = (0..8).map(|i| i % 3).collect();
+        let mut net = Net::mlp(4, 16, 3, &mut rng);
+        let logits = net.forward(&x).unwrap();
+        let (_, dl) = softmax_cross_entropy(&logits, &y).unwrap();
+        net.backward(&dl).unwrap();
+
+        let max_norm = 0.5f32;
+        let pre = net.clip_grad_norm(max_norm);
+        let mut sumsq = 0.0f64;
+        for g in net.grad_tensors_mut() {
+            for &v in &g.data {
+                sumsq += (v as f64) * (v as f64);
+            }
+        }
+        let post = sumsq.sqrt() as f32;
+        assert!(pre > max_norm, "pre-clip norm {pre} should exceed the budget");
+        assert!(post <= max_norm + 1e-4, "post-clip norm {post} exceeds {max_norm}");
+    }
+
+    #[test]
+    fn train_epoch_respects_grad_clip_flag() {
+        // With a destructive LR the unclipped run diverges to non-finite
+        // weights; enabling grad-clip keeps the MLP finite.
+        let mut rng = Rng::new(42);
+        let x = Tensor::matrix(30, 4, (0..120).map(|_| rng.next_normal()).collect()).unwrap();
+        let y: Vec<usize> = (0..30).map(|i| i % 3).collect();
+        let opt = Sgd::new(50.0);
+
+        let finite = |net: &mut Net| {
+            net.snapshot_weights().iter().all(|t| t.iter().all(|v| v.is_finite()))
+        };
+
+        let mut diverging = Net::mlp(4, 16, 3, &mut Rng::new(1));
+        let mut r1 = Rng::new(9);
+        for _ in 0..20 {
+            let _ = train_epoch(&mut diverging, &x, &y, 10, &opt, &mut r1);
+        }
+        assert!(!finite(&mut diverging), "high LR expected to diverge without clipping");
+
+        let mut clipped = Net::mlp(4, 16, 3, &mut Rng::new(1));
+        clipped.set_grad_clip(Some(1.0));
+        assert_eq!(clipped.grad_clip(), Some(1.0));
+        let mut r2 = Rng::new(9);
+        for _ in 0..20 {
+            train_epoch(&mut clipped, &x, &y, 10, &opt, &mut r2).unwrap();
+        }
+        assert!(finite(&mut clipped), "clipped run must keep weights finite");
     }
 
     #[test]

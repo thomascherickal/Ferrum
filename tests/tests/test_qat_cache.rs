@@ -27,6 +27,8 @@ fn tiny_config() -> TransformerConfig {
         lr: 0.01,
         batch_size: 8,
         vocab_size: 0, // character-level baseline
+        weight_decay: 0.0,
+        dropout: 0.0,
     }
 }
 
@@ -185,8 +187,10 @@ fn bpe_model_generates_and_preserves_seed() {
 
 #[test]
 fn bpe_short_seed_is_left_padded_not_rejected() {
-    // A seed shorter than the context window still generates because the BPE
-    // path left-pads the token context.
+    // A seed shorter than the context window still generates: the KV-cached
+    // transformer path primes a partial window (positions 0..len), and the
+    // embedded-MLP fallback left-pads the token context. Either way a short
+    // prompt is accepted rather than rejected.
     let mut rng = Rng::new(303);
     let slm =
         GenerativeSLM::train_transformer_config(BPE_CORPUS, &tiny_bpe_config(), &mut rng, |_, _| {})

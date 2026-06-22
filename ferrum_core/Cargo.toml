@@ -13,3 +13,9 @@ categories  = ["science", "algorithms", "wasm", "mathematics"]
 
 [dependencies]
 # intentionally empty — std only, zero external dependencies
+
+# Std-only matmul benchmark (no Criterion): `harness = false` runs its own
+# `fn main()` with `std::time::Instant`, keeping the zero-dependency guarantee.
+[[bench]]
+name    = "gemm"
+harness = false

@@ -284,7 +284,15 @@ $("genStart").addEventListener("click", async () => {
   generating = params.stream;
   try {
     const out = await invoke("generate_slm", { params });
-    if (!params.stream) $("genOut").textContent = out;
+    // Stop accepting late gen-fragment events *before* reconciling, then set the
+    // display from the authoritative return value so a dropped/late stream tail
+    // can never leave the output truncated (G1).
+    generating = false;
+    if (params.stream) {
+      $("genOut").textContent = streamContinuation(out, params.seedText);
+    } else {
+      $("genOut").textContent = out;
+    }
     $("genStatus").textContent = `done (${out.length} chars)`;
   } catch (e) {
     $("genStatus").textContent = "error";

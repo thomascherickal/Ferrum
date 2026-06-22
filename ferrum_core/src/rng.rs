@@ -12,6 +12,18 @@ impl Rng {
         }
     }
 
+    /// The raw internal state — pair with [`Rng::from_state`] to checkpoint and
+    /// resume a generator exactly where it left off (T6).
+    pub fn state(&self) -> u64 {
+        self.state
+    }
+
+    /// Rebuild a generator from a raw [`Rng::state`] value (no zero-remapping —
+    /// the state already came from a live generator).
+    pub fn from_state(state: u64) -> Self {
+        Self { state }
+    }
+
     pub fn next_u64(&mut self) -> u64 {
         let mut x = self.state;
         x ^= x << 13;
@@ -30,6 +42,18 @@ impl Rng {
         let u1 = self.next_f32().max(1e-7);
         let u2 = self.next_f32();
         (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
+    }
+
+    /// A uniformly random permutation of `0..n` via Fisher–Yates, so a training
+    /// epoch can visit every index exactly once (without replacement) instead of
+    /// sampling with replacement. Returns an empty vector for `n == 0`.
+    pub fn shuffled_indices(&mut self, n: usize) -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..n).collect();
+        for i in (1..n).rev() {
+            let j = (self.next_u64() % (i as u64 + 1)) as usize;
+            idx.swap(i, j);
+        }
+        idx
     }
 }
 
@@ -82,6 +106,27 @@ mod tests {
         let mut r = Rng::new(99);
         let mean: f32 = (0..50_000).map(|_| r.next_normal()).sum::<f32>() / 50_000.0;
         assert!(mean.abs() < 0.05, "mean = {mean}");
+    }
+
+    #[test]
+    fn shuffled_indices_is_a_permutation() {
+        let mut r = Rng::new(7);
+        let n = 100;
+        let perm = r.shuffled_indices(n);
+        assert_eq!(perm.len(), n);
+        let mut seen = perm.clone();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..n).collect::<Vec<_>>(), "not a permutation of 0..n");
+        // Empty / singleton edge cases.
+        assert!(Rng::new(1).shuffled_indices(0).is_empty());
+        assert_eq!(Rng::new(1).shuffled_indices(1), vec![0]);
+    }
+
+    #[test]
+    fn shuffled_indices_is_deterministic_and_actually_shuffles() {
+        assert_eq!(Rng::new(5).shuffled_indices(64), Rng::new(5).shuffled_indices(64));
+        // Overwhelmingly likely to differ from the identity for n=64.
+        assert_ne!(Rng::new(5).shuffled_indices(64), (0..64).collect::<Vec<_>>());
     }
 
     #[test]

@@ -85,13 +85,16 @@ pub use loader::{from_bytes, load, save, save_quantized, to_bytes, to_bytes_quan
 pub use loss::{mse, softmax_cross_entropy};
 pub use model::Sequential;
 pub use ops::argmax_rows;
-pub use optim::{Adam, Sgd};
+pub use optim::{clip_grad_norm, Adam, LrDecay, LrSchedule, Sgd};
 pub use parallel::num_threads;
 pub use quant::{fake_quantize_int8, QUANT_MIN_LEN};
 pub use rng::Rng;
-pub use slm::{Evaluation, GenerativeSLM, TransformerConfig};
+pub use slm::{
+    Evaluation, GenerativeSLM, SamplingParams, TransformerConfig, ValidationConfig,
+    ValidationProgress,
+};
 pub use tensor::Tensor;
-pub use tokenizer::ByteBpeTokenizer;
+pub use tokenizer::{ByteBpeTokenizer, TOK_BOS, TOK_EOS, TOK_PAD, TOK_UNK};
 pub use train::{accuracy, train_epoch, EmbedT, Net};
 pub use train_transformer::{
     train_transformer_epoch, train_transformer_epoch_threaded, TransformerNet,

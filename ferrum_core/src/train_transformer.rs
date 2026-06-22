@@ -54,12 +54,14 @@ impl Param {
             *g = 0.0;
         }
     }
-    fn accumulate(&mut self, g: &Tensor) {
-        for (a, b) in self.grad.data.iter_mut().zip(&g.data) {
-            *a += b;
-        }
-    }
     fn step(&mut self, adam: &Adam, t: u64) -> Result<()> {
+        // Decoupled weight decay (AdamW) applies to weight matrices only — never
+        // to biases or LayerNorm gains/biases (rank-1 params), per convention.
+        if adam.weight_decay != 0.0 && self.data.shape.len() < 2 {
+            let mut a = *adam;
+            a.weight_decay = 0.0;
+            return a.step(t, &mut self.data, &self.grad, &mut self.m, &mut self.v);
+        }
         adam.step(t, &mut self.data, &self.grad, &mut self.m, &mut self.v)
     }
 }
@@ -374,6 +376,78 @@ impl BlockT {
             &mut self.f2_w, &mut self.f2_b,
         ]
     }
+
+    fn params(&self) -> [&Param; 16] {
+        [
+            &self.ln1_g, &self.ln1_b,
+            &self.q_w, &self.q_b,
+            &self.k_w, &self.k_b,
+            &self.v_w, &self.v_b,
+            &self.o_w, &self.o_b,
+            &self.ln2_g, &self.ln2_b,
+            &self.f1_w, &self.f1_b,
+            &self.f2_w, &self.f2_b,
+        ]
+    }
+}
+
+/// Minimal little-endian byte cursor for checkpoint deserialization (T6).
+struct Cur<'a> {
+    b: &'a [u8],
+    pos: usize,
+}
+impl Cur<'_> {
+    fn take(&mut self, n: usize) -> Result<&[u8]> {
+        let end = self.pos.checked_add(n).filter(|&e| e <= self.b.len());
+        match end {
+            Some(end) => {
+                let s = &self.b[self.pos..end];
+                self.pos = end;
+                Ok(s)
+            }
+            None => Err(InferError::Format("checkpoint truncated".into())),
+        }
+    }
+    fn u32(&mut self) -> Result<u32> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn u64(&mut self) -> Result<u64> {
+        let b = self.take(8)?;
+        Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    }
+    fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+    fn fill_f32(&mut self, dst: &mut [f32]) -> Result<()> {
+        let raw = self.take(dst.len() * 4)?;
+        for (d, c) in dst.iter_mut().zip(raw.chunks_exact(4)) {
+            *d = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        }
+        Ok(())
+    }
+}
+
+/// Owned gradient tensors for one `BlockT`, produced by
+/// [`TransformerNet::backward_grads`] so a worker can compute gradients without
+/// mutating (or cloning) the shared parameters. Fields mirror `BlockT`.
+struct BlockGrads {
+    ln1_g: Tensor,
+    ln1_b: Tensor,
+    q_w: Tensor,
+    q_b: Tensor,
+    k_w: Tensor,
+    k_b: Tensor,
+    v_w: Tensor,
+    v_b: Tensor,
+    o_w: Tensor,
+    o_b: Tensor,
+    ln2_g: Tensor,
+    ln2_b: Tensor,
+    f1_w: Tensor,
+    f1_b: Tensor,
+    f2_w: Tensor,
+    f2_b: Tensor,
 }
 
 struct BlockCache {
@@ -388,7 +462,12 @@ struct BlockCache {
     xhat2: Tensor,
     inv_std2: Vec<f32>,
     norm2: Tensor,
-    h_relu: Tensor,   // FFN hidden after ReLU [M, hidden]
+    /// FFN-2 input [M, hidden]: ReLU(h) — or, when dropout is active, the
+    /// dropped-and-scaled hidden `ReLU(h) ⊙ mask`.
+    h_relu: Tensor,
+    /// Inverted-dropout mask×scale applied to `h_relu` (T7), present only when
+    /// dropout was active for this forward; `None` means no dropout.
+    ffn_dropout: Option<Vec<f32>>,
 }
 
 /// Opaque record of one forward pass, consumed by `backward`.
@@ -433,6 +512,29 @@ pub struct TransformerNet {
     /// runs forward/backward against int8-snapped weights while Adam updates
     /// full-precision master weights (straight-through estimator).
     qat: bool,
+    /// Global-norm gradient clipping threshold. When `Some(max_norm)`, every
+    /// training step rescales the gradients so their global L2 norm is at most
+    /// `max_norm` before the Adam update, preventing divergence at higher
+    /// learning rates / larger models. `None` (default) leaves gradients
+    /// untouched, so the optimizer step is bit-identical to before.
+    grad_clip: Option<f32>,
+    /// Optional learning-rate schedule (warmup + decay). When `Some`, each
+    /// [`TransformerNet::step`] overrides the Adam learning rate with
+    /// `schedule.lr_at(step_t)`; `None` (default) uses the optimizer's fixed
+    /// `lr`, so the step is unchanged.
+    lr_schedule: Option<crate::optim::LrSchedule>,
+    /// Weight tying (T9): when `true`, the LM head weight is kept equal to the
+    /// transpose of the token-embedding table (`head_w = tok_embᵀ`) and their
+    /// gradients are summed into the shared parameter, saving `vocab × embed`
+    /// independent parameters. `false` (default) trains them independently.
+    tie_weights: bool,
+    /// Decoupled (AdamW) weight-decay coefficient applied to weight matrices
+    /// each step (T7). `0.0` (default) disables it. Folded into the Adam used by
+    /// [`TransformerNet::step`].
+    weight_decay: f32,
+    /// FFN-hidden dropout probability used during training forward passes (T7).
+    /// `0.0` (default) disables it; inference is always dropout-free.
+    dropout: f32,
 }
 
 impl TransformerNet {
@@ -474,6 +576,11 @@ impl TransformerNet {
             head_b: Param::constant(vec![vocab_size], 0.0),
             step_t: 0,
             qat: false,
+            grad_clip: None,
+            lr_schedule: None,
+            tie_weights: false,
+            weight_decay: 0.0,
+            dropout: 0.0,
         })
     }
 
@@ -491,6 +598,208 @@ impl TransformerNet {
     }
     pub fn qat_enabled(&self) -> bool {
         self.qat
+    }
+
+    /// Set the global-norm gradient-clipping threshold (see the `grad_clip`
+    /// field docs). `Some(max_norm)` clips before each step; `None` disables.
+    pub fn set_grad_clip(&mut self, max_norm: Option<f32>) {
+        self.grad_clip = max_norm;
+    }
+    pub fn grad_clip(&self) -> Option<f32> {
+        self.grad_clip
+    }
+
+    /// Rescale all gradients so their global L2 norm is at most `max_norm`,
+    /// returning the pre-clip norm. Operates on the gradients currently held in
+    /// every parameter (i.e. after [`TransformerNet::backward`]). Exposed for
+    /// callers driving their own training loop; the built-in epoch helpers call
+    /// it automatically when [`TransformerNet::set_grad_clip`] is set.
+    pub fn clip_grad_norm(&mut self, max_norm: f32) -> f32 {
+        let mut grads = self.grad_tensors_mut();
+        crate::optim::clip_grad_norm(&mut grads, max_norm)
+    }
+
+    /// Set the learning-rate schedule (warmup + decay). When `Some`, it
+    /// overrides the Adam learning rate at every [`TransformerNet::step`] using
+    /// the network's internal 1-based step counter; `None` keeps the fixed `lr`.
+    pub fn set_lr_schedule(&mut self, schedule: Option<crate::optim::LrSchedule>) {
+        self.lr_schedule = schedule;
+    }
+    pub fn lr_schedule(&self) -> Option<crate::optim::LrSchedule> {
+        self.lr_schedule
+    }
+
+    /// The number of optimizer steps applied so far (the schedule's timestep).
+    pub fn step_count(&self) -> u64 {
+        self.step_t
+    }
+
+    /// Set the decoupled (AdamW) weight-decay coefficient applied to weight
+    /// matrices each step (T7). `0.0` disables it.
+    pub fn set_weight_decay(&mut self, weight_decay: f32) {
+        self.weight_decay = weight_decay;
+    }
+    pub fn weight_decay(&self) -> f32 {
+        self.weight_decay
+    }
+
+    /// Set the FFN-hidden dropout probability used in training forward passes
+    /// (T7), in `[0, 1)`. `0.0` disables it; values are clamped to `< 1`.
+    pub fn set_dropout(&mut self, p: f32) {
+        self.dropout = p.clamp(0.0, 0.95);
+    }
+    pub fn dropout(&self) -> f32 {
+        self.dropout
+    }
+
+    /// Enable or disable weight tying between the token embedding and the LM
+    /// head (T9). When enabled, [`TransformerNet::sync_tied_head`] mirrors the
+    /// embedding into the head before each step and
+    /// [`TransformerNet::fold_tied_head_grad`] sums the head gradient back into
+    /// the embedding, so the two share parameters.
+    pub fn set_weight_tying(&mut self, enabled: bool) {
+        self.tie_weights = enabled;
+        if enabled {
+            self.sync_tied_head();
+        }
+    }
+    pub fn weight_tying(&self) -> bool {
+        self.tie_weights
+    }
+
+    /// Copy `tok_embᵀ` into the LM-head weight so the head mirrors the embedding
+    /// (no-op unless weight tying is enabled). Called before each forward.
+    pub fn sync_tied_head(&mut self) {
+        if !self.tie_weights {
+            return;
+        }
+        let (vocab, embed) = (self.vocab_size, self.embed_dim);
+        // head_w is [embed, vocab] = transpose of tok_emb [vocab, embed].
+        for e in 0..embed {
+            for v in 0..vocab {
+                self.head_w.data.data[e * vocab + v] = self.tok_emb.data.data[v * embed + e];
+            }
+        }
+    }
+
+    /// Fold the LM-head gradient into the token-embedding gradient
+    /// (`tok_emb.grad += head_w.gradᵀ`) so the shared parameter receives both
+    /// contributions, then zero the head gradient so the redundant head copy is
+    /// not stepped independently. No-op unless weight tying is enabled.
+    pub fn fold_tied_head_grad(&mut self) {
+        if !self.tie_weights {
+            return;
+        }
+        let (vocab, embed) = (self.vocab_size, self.embed_dim);
+        for e in 0..embed {
+            for v in 0..vocab {
+                self.tok_emb.grad.data[v * embed + e] += self.head_w.grad.data[e * vocab + v];
+                self.head_w.grad.data[e * vocab + v] = 0.0;
+            }
+        }
+    }
+
+    /// FFN hidden width (read from the first block's first FFN layer).
+    fn hidden_dim(&self) -> usize {
+        self.blocks[0].f1_b.data.numel()
+    }
+
+    /// Every `Param` (weights + Adam moments), in canonical order. Used by the
+    /// checkpoint codec (T6).
+    fn params_all(&self) -> Vec<&Param> {
+        let mut v: Vec<&Param> = vec![&self.tok_emb, &self.pos_emb];
+        for b in &self.blocks {
+            v.extend(b.params());
+        }
+        v.push(&self.lnf_g);
+        v.push(&self.lnf_b);
+        v.push(&self.head_w);
+        v.push(&self.head_b);
+        v
+    }
+
+    fn params_mut_all(&mut self) -> Vec<&mut Param> {
+        let mut v: Vec<&mut Param> = vec![&mut self.tok_emb, &mut self.pos_emb];
+        for b in &mut self.blocks {
+            v.extend(b.params_mut());
+        }
+        v.push(&mut self.lnf_g);
+        v.push(&mut self.lnf_b);
+        v.push(&mut self.head_w);
+        v.push(&mut self.head_b);
+        v
+    }
+
+    /// Serialize the **full training state** (T6): architecture, QAT/tying
+    /// flags, optimizer timestep, the supplied RNG's state, and every
+    /// parameter's weights *and* Adam moment buffers (`m`, `v`). Pair with
+    /// [`TransformerNet::load_checkpoint`] to resume an interrupted run exactly
+    /// where it stopped — unlike a finished-model save, this preserves the
+    /// optimizer state so momentum/adaptive scales are not lost.
+    ///
+    /// (The learning-rate schedule and grad-clip threshold are training-driver
+    /// settings, not weights; re-apply them on the resumed net.)
+    pub fn save_checkpoint(&self, rng: &Rng) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"FCKP");
+        out.extend_from_slice(&1u32.to_le_bytes());
+        for v in [
+            self.vocab_size, self.context_len, self.embed_dim,
+            self.num_heads, self.hidden_dim(), self.blocks.len(),
+        ] {
+            out.extend_from_slice(&(v as u32).to_le_bytes());
+        }
+        out.push(self.qat as u8);
+        out.push(self.tie_weights as u8);
+        out.extend_from_slice(&self.step_t.to_le_bytes());
+        out.extend_from_slice(&rng.state().to_le_bytes());
+        for p in self.params_all() {
+            for t in [&p.data, &p.m, &p.v] {
+                for &x in &t.data {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    /// Rebuild a net and RNG from [`TransformerNet::save_checkpoint`] bytes,
+    /// restoring weights, Adam moments, optimizer timestep, and RNG state so
+    /// training resumes deterministically.
+    pub fn load_checkpoint(bytes: &[u8]) -> Result<(Self, Rng)> {
+        let mut c = Cur { b: bytes, pos: 0 };
+        if c.take(4)? != b"FCKP" {
+            return Err(InferError::Format("bad checkpoint magic".into()));
+        }
+        let version = c.u32()?;
+        if version != 1 {
+            return Err(InferError::Format(format!("unsupported checkpoint version {version}")));
+        }
+        let vocab = c.u32()? as usize;
+        let ctx = c.u32()? as usize;
+        let embed = c.u32()? as usize;
+        let heads = c.u32()? as usize;
+        let hidden = c.u32()? as usize;
+        let blocks = c.u32()? as usize;
+        let qat = c.u8()? != 0;
+        let tie = c.u8()? != 0;
+        let step_t = c.u64()?;
+        let rng_state = c.u64()?;
+
+        let mut seed_rng = Rng::new(1); // throwaway: param data is overwritten
+        let mut net = TransformerNet::new(vocab, ctx, embed, heads, hidden, blocks, &mut seed_rng)?;
+        net.qat = qat;
+        net.tie_weights = tie;
+        net.step_t = step_t;
+        for p in net.params_mut_all() {
+            // m and v share the parameter's shape, so each is the same length.
+            let n = p.data.data.len();
+            c.fill_f32(&mut p.data.data)?;
+            debug_assert_eq!(p.m.data.len(), n);
+            c.fill_f32(&mut p.m.data)?;
+            c.fill_f32(&mut p.v.data)?;
+        }
+        Ok((net, Rng::from_state(rng_state)))
     }
 
     /// Every parameter tensor, in a fixed order (used by the QAT snapshot /
@@ -539,32 +848,10 @@ impl TransformerNet {
         v
     }
 
-    /// Flatten every gradient tensor into one contiguous vector, in canonical
-    /// parameter order. The inverse of [`TransformerNet::load_grads`].
-    pub(crate) fn collect_grads(&self) -> Vec<f32> {
-        let mut out = Vec::with_capacity(self.num_params());
-        let push = |out: &mut Vec<f32>, p: &Param| out.extend_from_slice(&p.grad.data);
-        push(&mut out, &self.tok_emb);
-        push(&mut out, &self.pos_emb);
-        for b in &self.blocks {
-            for p in [
-                &b.ln1_g, &b.ln1_b, &b.q_w, &b.q_b, &b.k_w, &b.k_b, &b.v_w, &b.v_b,
-                &b.o_w, &b.o_b, &b.ln2_g, &b.ln2_b, &b.f1_w, &b.f1_b, &b.f2_w, &b.f2_b,
-            ] {
-                push(&mut out, p);
-            }
-        }
-        push(&mut out, &self.lnf_g);
-        push(&mut out, &self.lnf_b);
-        push(&mut out, &self.head_w);
-        push(&mut out, &self.head_b);
-        out
-    }
-
-    /// Overwrite every gradient tensor from a flat vector produced by
-    /// [`TransformerNet::collect_grads`] (e.g. a summed cross-shard gradient),
-    /// so a subsequent [`TransformerNet::step`] applies it. Panics if `flat`
-    /// has the wrong length.
+    /// Overwrite every gradient tensor from a flat vector in canonical
+    /// parameter order (as produced by [`TransformerNet::backward_grads`], e.g.
+    /// a summed cross-shard gradient), so a subsequent [`TransformerNet::step`]
+    /// applies it. Panics if `flat` has the wrong length.
     pub(crate) fn load_grads(&mut self, flat: &[f32]) {
         let mut offset = 0usize;
         for g in self.grad_tensors_mut() {
@@ -583,10 +870,13 @@ impl TransformerNet {
             .collect()
     }
 
-    /// Snap every (large-enough) parameter tensor onto the int8 grid in place.
+    /// Snap every (large-enough) parameter tensor onto the int8 grid in place,
+    /// per output-row (§7) so QAT matches the per-channel quantization the FINF
+    /// v5 writer uses. 1-D parameters fall back to a single scale.
     pub(crate) fn fake_quantize_weights(&mut self) {
         for t in self.param_tensors_mut() {
-            crate::quant::fake_quantize_int8(&mut t.data);
+            let channels = if t.shape.len() >= 2 { t.shape[0].max(1) } else { 1 };
+            crate::quant::fake_quantize_int8_per_channel(&mut t.data, channels);
         }
     }
 
@@ -619,7 +909,19 @@ impl TransformerNet {
     /// Forward pass over `tokens` (length must be a multiple of `context_len`;
     /// each `context_len` chunk is one sequence in the batch). Returns logits
     /// of shape [B·T, vocab] plus the activation cache for `backward`.
+    ///
+    /// Dropout-free — equivalent to [`TransformerNet::forward_train`] with
+    /// `dropout = 0`. Used by inference, evaluation, and gradient checks.
     pub fn forward(&self, tokens: &[usize]) -> Result<(Tensor, FwdCache)> {
+        self.forward_train(tokens, 0.0, 0)
+    }
+
+    /// Forward pass with optional FFN-hidden dropout (T7). When `dropout > 0`,
+    /// each block's post-ReLU hidden activations are inverted-dropout masked
+    /// using a local generator seeded by `seed` (so the masks are deterministic
+    /// for a given seed and a worker can reproduce them in `backward` from the
+    /// cache). `dropout = 0` is the plain, deterministic forward.
+    pub fn forward_train(&self, tokens: &[usize], dropout: f32, seed: u64) -> Result<(Tensor, FwdCache)> {
         let t = self.context_len;
         if tokens.is_empty() || tokens.len() % t != 0 {
             return Err(InferError::DimMismatch(format!(
@@ -630,6 +932,8 @@ impl TransformerNet {
         let batch = tokens.len() / t;
         let m = tokens.len();
         let c = self.embed_dim;
+        let dropout = dropout.clamp(0.0, 0.95);
+        let mut drng = Rng::from_state(seed | 1); // local mask generator
 
         // Embedding: token + positional lookup.
         let mut x = vec![0.0f32; m * c];
@@ -661,7 +965,20 @@ impl TransformerNet {
             let (norm2, xhat2, inv_std2) = ln_fwd(&x_attn, &blk.ln2_g.data, &blk.ln2_b.data)?;
             let h_pre = linear_fwd(&norm2, &blk.f1_w.data, &blk.f1_b.data)?;
             let h_relu = h_pre.map(|v| v.max(0.0));
-            let ff2 = linear_fwd(&h_relu, &blk.f2_w.data, &blk.f2_b.data)?;
+            // Inverted FFN dropout: zero each hidden unit with prob `dropout`,
+            // scale survivors by 1/(1-dropout) so the expectation is unchanged
+            // and inference needs no rescaling.
+            let (h_ffn, ffn_dropout) = if dropout > 0.0 {
+                let scale = 1.0 / (1.0 - dropout);
+                let mask: Vec<f32> = (0..h_relu.data.len())
+                    .map(|_| if drng.next_f32() < dropout { 0.0 } else { scale })
+                    .collect();
+                let dropped: Vec<f32> = h_relu.data.iter().zip(&mask).map(|(&h, &m)| h * m).collect();
+                (Tensor::new(h_relu.shape.clone(), dropped)?, Some(mask))
+            } else {
+                (h_relu, None)
+            };
+            let ff2 = linear_fwd(&h_ffn, &blk.f2_w.data, &blk.f2_b.data)?;
             cur = ops::add(&x_attn, &ff2)?;
             block_caches.push(BlockCache {
                 xhat1,
@@ -675,7 +992,8 @@ impl TransformerNet {
                 xhat2,
                 inv_std2,
                 norm2,
-                h_relu,
+                h_relu: h_ffn,
+                ffn_dropout,
             });
         }
 
@@ -696,82 +1014,128 @@ impl TransformerNet {
     }
 
     /// Backprop `dlogits` (e.g. from `softmax_cross_entropy`) through the
-    /// whole network, accumulating into every parameter's `.grad`.
+    /// whole network, storing the result in every parameter's `.grad`.
+    ///
+    /// (Each training step calls [`TransformerNet::zero_grad`] then a single
+    /// `backward`, so storing is equivalent to the previous accumulate.)
     pub fn backward(&mut self, dlogits: &Tensor, cache: &FwdCache) -> Result<()> {
+        let flat = self.backward_grads(dlogits, cache)?;
+        self.load_grads(&flat);
+        Ok(())
+    }
+
+    /// Backprop `dlogits` against the (read-only) weights and return the flat
+    /// gradient vector in canonical parameter order — the same layout
+    /// [`TransformerNet::load_grads`] consumes.
+    ///
+    /// Takes `&self` and allocates only the gradient buffer (≈4 B/param), so the
+    /// data-parallel workers in [`train_transformer_epoch_threaded`] can share
+    /// the master weights instead of deep-cloning the whole network
+    /// (weights+grad+Adam moments ≈16 B/param per worker). `backward` is the
+    /// in-place wrapper that stores the result into the owned parameters.
+    pub(crate) fn backward_grads(&self, dlogits: &Tensor, cache: &FwdCache) -> Result<Vec<f32>> {
         let t = self.context_len;
         let batch = cache.batch;
+        let c = self.embed_dim;
 
-        // LM head
-        let (dw, db, d_normf) = linear_bwd(&cache.norm_f, &self.head_w.data, dlogits)?;
-        self.head_w.accumulate(&dw);
-        self.head_b.accumulate(&db);
+        // LM head + final LayerNorm (each produced exactly once).
+        let (g_head_w, g_head_b, d_normf) = linear_bwd(&cache.norm_f, &self.head_w.data, dlogits)?;
+        let (mut dx, g_lnf_g, g_lnf_b) =
+            ln_bwd(&d_normf, &cache.xhat_f, &cache.inv_std_f, &self.lnf_g.data)?;
 
-        // Final LayerNorm
-        let (mut dx, dg, dbeta) = ln_bwd(&d_normf, &cache.xhat_f, &cache.inv_std_f, &self.lnf_g.data)?;
-        self.lnf_g.accumulate(&dg);
-        self.lnf_b.accumulate(&dbeta);
-
-        // Blocks, in reverse
-        for (blk, bc) in self.blocks.iter_mut().zip(&cache.blocks).rev() {
+        // Per-block grads, computed in reverse but stored by block index so they
+        // can be emitted in forward (canonical) order.
+        let mut block_grads: Vec<Option<BlockGrads>> =
+            (0..self.blocks.len()).map(|_| None).collect();
+        for (bi, (blk, bc)) in self.blocks.iter().zip(&cache.blocks).enumerate().rev() {
             // out = x_attn + ffn2(relu(ffn1(norm2)))
             let d_out = dx;
-            let (dw2, db2, dh) = linear_bwd(&bc.h_relu, &blk.f2_w.data, &d_out)?;
-            blk.f2_w.accumulate(&dw2);
-            blk.f2_b.accumulate(&db2);
-            // ReLU backward via the cached post-activation values
+            let (g_f2_w, g_f2_b, dh) = linear_bwd(&bc.h_relu, &blk.f2_w.data, &d_out)?;
+            // Backward through (optional) dropout then ReLU. `bc.h_relu` is the
+            // FFN-2 input — post-dropout when active — so `h > 0` flags units
+            // that were both kept and ReLU-active; the dropout mask×scale then
+            // carries the inverted-dropout scaling into the gradient.
             let dh_pre = Tensor::new(
                 dh.shape.clone(),
-                dh.data
-                    .iter()
-                    .zip(&bc.h_relu.data)
-                    .map(|(&g, &h)| if h > 0.0 { g } else { 0.0 })
-                    .collect(),
+                match &bc.ffn_dropout {
+                    Some(mask) => dh
+                        .data
+                        .iter()
+                        .zip(&bc.h_relu.data)
+                        .zip(mask)
+                        .map(|((&g, &h), &m)| if h > 0.0 { g * m } else { 0.0 })
+                        .collect(),
+                    None => dh
+                        .data
+                        .iter()
+                        .zip(&bc.h_relu.data)
+                        .map(|(&g, &h)| if h > 0.0 { g } else { 0.0 })
+                        .collect(),
+                },
             )?;
-            let (dw1, db1, d_norm2) = linear_bwd(&bc.norm2, &blk.f1_w.data, &dh_pre)?;
-            blk.f1_w.accumulate(&dw1);
-            blk.f1_b.accumulate(&db1);
-            let (d_xattn_ln, dg2, dbeta2) = ln_bwd(&d_norm2, &bc.xhat2, &bc.inv_std2, &blk.ln2_g.data)?;
-            blk.ln2_g.accumulate(&dg2);
-            blk.ln2_b.accumulate(&dbeta2);
+            let (g_f1_w, g_f1_b, d_norm2) = linear_bwd(&bc.norm2, &blk.f1_w.data, &dh_pre)?;
+            let (d_xattn_ln, g_ln2_g, g_ln2_b) =
+                ln_bwd(&d_norm2, &bc.xhat2, &bc.inv_std2, &blk.ln2_g.data)?;
             // residual 2: gradient flows both into the FFN branch and straight through
             let d_xattn = ops::add(&d_out, &d_xattn_ln)?;
 
             // x_attn = x + out_proj(concat)
-            let (dwo, dbo, d_concat) = linear_bwd(&bc.concat, &blk.o_w.data, &d_xattn)?;
-            blk.o_w.accumulate(&dwo);
-            blk.o_b.accumulate(&dbo);
+            let (g_o_w, g_o_b, d_concat) = linear_bwd(&bc.concat, &blk.o_w.data, &d_xattn)?;
             let (dq, dk, dv) = attn_bwd(
                 &d_concat, &bc.q, &bc.k, &bc.v, &bc.probs, batch, t, self.num_heads,
             )?;
-            let (dwq, dbq, d_n1a) = linear_bwd(&bc.norm1, &blk.q_w.data, &dq)?;
-            let (dwk, dbk, d_n1b) = linear_bwd(&bc.norm1, &blk.k_w.data, &dk)?;
-            let (dwv, dbv, d_n1c) = linear_bwd(&bc.norm1, &blk.v_w.data, &dv)?;
-            blk.q_w.accumulate(&dwq);
-            blk.q_b.accumulate(&dbq);
-            blk.k_w.accumulate(&dwk);
-            blk.k_b.accumulate(&dbk);
-            blk.v_w.accumulate(&dwv);
-            blk.v_b.accumulate(&dbv);
+            let (g_q_w, g_q_b, d_n1a) = linear_bwd(&bc.norm1, &blk.q_w.data, &dq)?;
+            let (g_k_w, g_k_b, d_n1b) = linear_bwd(&bc.norm1, &blk.k_w.data, &dk)?;
+            let (g_v_w, g_v_b, d_n1c) = linear_bwd(&bc.norm1, &blk.v_w.data, &dv)?;
             let d_norm1 = ops::add(&ops::add(&d_n1a, &d_n1b)?, &d_n1c)?;
-            let (d_x_ln, dg1, dbeta1) = ln_bwd(&d_norm1, &bc.xhat1, &bc.inv_std1, &blk.ln1_g.data)?;
-            blk.ln1_g.accumulate(&dg1);
-            blk.ln1_b.accumulate(&dbeta1);
+            let (d_x_ln, g_ln1_g, g_ln1_b) =
+                ln_bwd(&d_norm1, &bc.xhat1, &bc.inv_std1, &blk.ln1_g.data)?;
             // residual 1
             dx = ops::add(&d_xattn, &d_x_ln)?;
+
+            block_grads[bi] = Some(BlockGrads {
+                ln1_g: g_ln1_g, ln1_b: g_ln1_b,
+                q_w: g_q_w, q_b: g_q_b,
+                k_w: g_k_w, k_b: g_k_b,
+                v_w: g_v_w, v_b: g_v_b,
+                o_w: g_o_w, o_b: g_o_b,
+                ln2_g: g_ln2_g, ln2_b: g_ln2_b,
+                f1_w: g_f1_w, f1_b: g_f1_b,
+                f2_w: g_f2_w, f2_b: g_f2_b,
+            });
         }
 
-        // Embedding: scatter-add row gradients into the tables.
-        let c = self.embed_dim;
+        // Embedding: scatter-add row gradients into local tables.
+        let mut g_tok = vec![0.0f32; self.tok_emb.data.data.len()];
+        let mut g_pos = vec![0.0f32; self.pos_emb.data.data.len()];
         for (r, &tok) in cache.tokens.iter().enumerate() {
             let xb = r * c;
             let tb = tok * c;
             let pb = (r % t) * c;
             for d in 0..c {
-                self.tok_emb.grad.data[tb + d] += dx.data[xb + d];
-                self.pos_emb.grad.data[pb + d] += dx.data[xb + d];
+                g_tok[tb + d] += dx.data[xb + d];
+                g_pos[pb + d] += dx.data[xb + d];
             }
         }
-        Ok(())
+
+        // Assemble the flat gradient in canonical parameter order.
+        let mut out = Vec::with_capacity(self.num_params());
+        out.extend_from_slice(&g_tok);
+        out.extend_from_slice(&g_pos);
+        for bg in block_grads {
+            let bg = bg.expect("every block's gradient was computed");
+            for g in [
+                &bg.ln1_g, &bg.ln1_b, &bg.q_w, &bg.q_b, &bg.k_w, &bg.k_b, &bg.v_w, &bg.v_b,
+                &bg.o_w, &bg.o_b, &bg.ln2_g, &bg.ln2_b, &bg.f1_w, &bg.f1_b, &bg.f2_w, &bg.f2_b,
+            ] {
+                out.extend_from_slice(&g.data);
+            }
+        }
+        out.extend_from_slice(&g_lnf_g.data);
+        out.extend_from_slice(&g_lnf_b.data);
+        out.extend_from_slice(&g_head_w.data);
+        out.extend_from_slice(&g_head_b.data);
+        Ok(out)
     }
 
     pub fn zero_grad(&mut self) {
@@ -788,10 +1152,24 @@ impl TransformerNet {
         self.head_b.zero_grad();
     }
 
-    /// Apply one Adam update to every parameter.
+    /// Apply one Adam update to every parameter. When a learning-rate schedule
+    /// is set ([`TransformerNet::set_lr_schedule`]), the Adam learning rate for
+    /// this step is taken from `schedule.lr_at(step_t)` instead of the fixed
+    /// `adam.lr`.
     pub fn step(&mut self, adam: &Adam) -> Result<()> {
         self.step_t += 1;
         let t = self.step_t;
+        // Adam is `Copy`; override the learning rate when scheduled and fold in
+        // the net's decoupled weight decay (AdamW).
+        let mut adam = *adam;
+        if let Some(sched) = self.lr_schedule {
+            adam.lr = sched.lr_at(t);
+            vprintln!("[train_transformer::step] step {t}: scheduled lr={:.6e}", adam.lr);
+        }
+        if self.weight_decay != 0.0 {
+            adam.weight_decay = self.weight_decay;
+        }
+        let adam = &adam;
         self.tok_emb.step(adam, t)?;
         self.pos_emb.step(adam, t)?;
         for b in &mut self.blocks {
@@ -838,10 +1216,24 @@ impl TransformerNet {
             self.lnf_g.data.data.clone(),
             self.lnf_b.data.data.clone(),
         )?));
+        // With weight tying the shipped head is the (current) transpose of the
+        // token embedding; otherwise it is the independently trained head.
+        let head_w_data = if self.tie_weights {
+            let (vocab, embed) = (self.vocab_size, self.embed_dim);
+            let mut w = vec![0.0f32; embed * vocab];
+            for e in 0..embed {
+                for v in 0..vocab {
+                    w[e * vocab + v] = self.tok_emb.data.data[v * embed + e];
+                }
+            }
+            w
+        } else {
+            self.head_w.data.data.clone()
+        };
         m.push(Box::new(Linear::new(
             self.embed_dim,
             self.vocab_size,
-            self.head_w.data.data.clone(),
+            head_w_data,
             self.head_b.data.data.clone(),
         )?));
         m.push(Box::new(ActivationLayer::new(crate::activation::Activation::Softmax)));
@@ -875,15 +1267,21 @@ pub fn train_transformer_epoch(
     }
     let num_windows = tokens.len() - t;
     let steps = num_windows.div_ceil(batch_size);
+    // Shuffle a permutation of every window once per epoch and draw minibatches
+    // without replacement (T4), so an "epoch" covers the whole corpus exactly
+    // once instead of ≈63% in expectation under sampling with replacement.
+    let perm = rng.shuffled_indices(num_windows);
     let mut total = 0.0f32;
-    for _ in 0..steps {
-        let mut input = Vec::with_capacity(batch_size * t);
-        let mut targets = Vec::with_capacity(batch_size * t);
-        for _ in 0..batch_size {
-            let start = (rng.next_u64() as usize) % num_windows;
+    for step in 0..steps {
+        let batch = &perm[step * batch_size..((step + 1) * batch_size).min(num_windows)];
+        let mut input = Vec::with_capacity(batch.len() * t);
+        let mut targets = Vec::with_capacity(batch.len() * t);
+        for &start in batch {
             input.extend_from_slice(&tokens[start..start + t]);
             targets.extend_from_slice(&tokens[start + 1..start + t + 1]);
         }
+        // Weight tying: mirror tok_embᵀ into the head before the forward (T9).
+        net.sync_tied_head();
         // QAT: gradients are computed at the int8-snapped weights, but the
         // optimizer updates the fp32 masters (straight-through estimator).
         let masters = if net.qat_enabled() {
@@ -893,12 +1291,21 @@ pub fn train_transformer_epoch(
         } else {
             None
         };
-        let (logits, cache) = net.forward(&input)?;
+        // FFN dropout (T7): draw a per-step mask seed only when enabled, so the
+        // RNG stream (and thus reproducibility) is untouched when dropout is off.
+        let dropout = net.dropout;
+        let drop_seed = if dropout > 0.0 { rng.next_u64() } else { 0 };
+        let (logits, cache) = net.forward_train(&input, dropout, drop_seed)?;
         let (loss, dlogits) = softmax_cross_entropy(&logits, &targets)?;
         net.zero_grad();
         net.backward(&dlogits, &cache)?;
         if let Some(snapshot) = &masters {
             net.restore_weights(snapshot);
+        }
+        // Sum the head gradient back into the shared embedding (T9).
+        net.fold_tied_head_grad();
+        if let Some(max_norm) = net.grad_clip {
+            net.clip_grad_norm(max_norm);
         }
         net.step(adam)?;
         total += loss;
@@ -964,19 +1371,27 @@ pub fn train_transformer_epoch_threaded(
         }
         let num_windows = tokens.len() - t;
         let steps = num_windows.div_ceil(batch_size);
-        let total_rows = (batch_size * t) as f32;
+        // Same per-epoch shuffle as the serial path (T4): identical RNG use, so
+        // a fixed seed gives the same minibatches regardless of thread count.
+        let perm = rng.shuffled_indices(num_windows);
         let mut total = 0.0f32;
 
-        for _ in 0..steps {
-            // Draw the whole minibatch up front — identical RNG use to serial.
-            let mut input = Vec::with_capacity(batch_size * t);
-            let mut targets = Vec::with_capacity(batch_size * t);
-            for _ in 0..batch_size {
-                let start = (rng.next_u64() as usize) % num_windows;
+        for step in 0..steps {
+            // The step's minibatch is the next slice of the permutation (the
+            // final batch may be smaller than `batch_size`).
+            let batch = &perm[step * batch_size..((step + 1) * batch_size).min(num_windows)];
+            let cur_bs = batch.len();
+            let total_rows = (cur_bs * t) as f32;
+            let mut input = Vec::with_capacity(cur_bs * t);
+            let mut targets = Vec::with_capacity(cur_bs * t);
+            for &start in batch {
                 input.extend_from_slice(&tokens[start..start + t]);
                 targets.extend_from_slice(&tokens[start + 1..start + t + 1]);
             }
 
+            // Weight tying: mirror tok_embᵀ into the shared head before forking,
+            // so every shard's forward sees the tied head (T9).
+            net.sync_tied_head();
             // QAT: snap the shared master weights before forking the shards, so
             // every shard's forward/backward runs at the int8 grid.
             let masters = if net.qat_enabled() {
@@ -987,7 +1402,12 @@ pub fn train_transformer_epoch_threaded(
                 None
             };
 
-            let per = batch_size.div_ceil(nshards);
+            // FFN dropout (T7): one base mask seed per step, offset per shard so
+            // each shard's examples get independent masks. RNG is untouched off.
+            let dropout = net.dropout;
+            let base_seed = if dropout > 0.0 { rng.next_u64() } else { 0 };
+
+            let per = cur_bs.div_ceil(nshards);
             let net_ref: &TransformerNet = net;
             let input_ref = &input;
             let targets_ref = &targets;
@@ -998,19 +1418,21 @@ pub fn train_transformer_epoch_threaded(
             let results: Vec<Result<(f32, Vec<f32>)>> = std::thread::scope(|scope| {
                 let mut handles = Vec::new();
                 let mut w0 = 0usize;
-                while w0 < batch_size {
-                    let w1 = (w0 + per).min(batch_size);
+                while w0 < cur_bs {
+                    let w1 = (w0 + per).min(cur_bs);
                     handles.push(scope.spawn(move || -> Result<(f32, Vec<f32>)> {
-                        let mut worker = net_ref.clone();
-                        worker.zero_grad();
+                        // Share the master weights read-only (no clone): forward
+                        // and backward_grads borrow `net_ref` and allocate only a
+                        // flat gradient buffer (≈4 B/param) instead of a full
+                        // network copy (weights+grad+Adam moments ≈16 B/param).
                         let sub_in = &input_ref[w0 * t..w1 * t];
                         let sub_tg = &targets_ref[w0 * t..w1 * t];
-                        let (logits, cache) = worker.forward(sub_in)?;
+                        let (logits, cache) =
+                            net_ref.forward_train(sub_in, dropout, base_seed.wrapping_add(w0 as u64 + 1))?;
                         let (loss, dlogits) = softmax_cross_entropy(&logits, sub_tg)?;
-                        worker.backward(&dlogits, &cache)?;
                         let shard_rows = ((w1 - w0) * t) as f32;
                         let weight = shard_rows / total_rows;
-                        let mut g = worker.collect_grads();
+                        let mut g = net_ref.backward_grads(&dlogits, &cache)?;
                         for x in &mut g {
                             *x *= weight;
                         }
@@ -1045,6 +1467,11 @@ pub fn train_transformer_epoch_threaded(
                 net.restore_weights(snapshot);
             }
             net.load_grads(&summed);
+            // Sum the head gradient back into the shared embedding (T9).
+            net.fold_tied_head_grad();
+            if let Some(max_norm) = net.grad_clip {
+                net.clip_grad_norm(max_norm);
+            }
             net.step(adam)?;
             total += step_loss;
         }
@@ -1208,24 +1635,14 @@ mod tests {
         let mut net = TransformerNet::new(8, 4, 8, 2, 16, 1, &mut rng).unwrap();
         let masters = net.snapshot_weights();
         net.fake_quantize_weights();
-        // Large tensors (≥ QUANT_MIN_LEN) must now sit on the int8 grid.
         let quantized = net.snapshot_weights();
-        let mut any_changed = false;
-        for (m, q) in masters.iter().zip(&quantized) {
-            if q.len() >= crate::quant::QUANT_MIN_LEN {
-                let scale = crate::quant::int8_scale(q);
-                if scale > 0.0 {
-                    for &v in q {
-                        let steps = v / scale;
-                        assert!((steps - steps.round()).abs() < 1e-3, "{v} off the int8 grid");
-                    }
-                }
-            }
-            if m != q {
-                any_changed = true;
-            }
-        }
-        assert!(any_changed, "fake quantization changed no weights");
+        // Quantization actually moved (large) weights off their fp32 values.
+        assert!(masters.iter().zip(&quantized).any(|(m, q)| m != q),
+            "fake quantization changed no weights");
+        // Per-channel snapping is idempotent — re-quantizing lands on the same
+        // grid (so every value already sits on its channel's int8 grid).
+        net.fake_quantize_weights();
+        assert_eq!(net.snapshot_weights(), quantized, "fake quantization is not idempotent");
         // Restore must bring back the fp32 masters exactly.
         net.restore_weights(&masters);
         assert_eq!(net.snapshot_weights(), masters);
@@ -1428,6 +1845,545 @@ mod tests {
             last = train_transformer_epoch_threaded(&mut net, &tokens, 16, &adam, &mut rng, 4).unwrap();
         }
         assert!(last < first * 0.5, "threaded loss did not halve: {first:.4} → {last:.4}");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // AdamW weight decay + FFN dropout (T7)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Decoupled weight decay shrinks weight matrices but never biases or
+    /// LayerNorm parameters (rank-1).
+    #[test]
+    fn weight_decay_decays_matrices_only() {
+        let mut rng = Rng::new(1);
+        let mut net = TransformerNet::new(6, 4, 8, 2, 16, 1, &mut rng).unwrap();
+        net.set_weight_decay(0.1);
+        assert!((net.weight_decay() - 0.1).abs() < 1e-9);
+        // Known values; zero gradients so only weight decay acts.
+        for v in net.tok_emb.data.data.iter_mut() { *v = 2.0; } // 2-D weight
+        for v in net.head_b.data.data.iter_mut() { *v = 2.0; }  // 1-D bias
+        for v in net.lnf_g.data.data.iter_mut() { *v = 2.0; }   // 1-D LN gain
+        net.zero_grad();
+        let adam = Adam::new(0.5); // lr; decay coefficient comes from the net
+        net.step(&adam).unwrap();
+        // Weight matrix: 2 − 0.5·0.1·2 = 1.9
+        assert!((net.tok_emb.data.data[0] - 1.9).abs() < 1e-5, "tok_emb not decayed");
+        // Bias and LN gain untouched.
+        assert!((net.head_b.data.data[0] - 2.0).abs() < 1e-6, "bias was decayed");
+        assert!((net.lnf_g.data.data[0] - 2.0).abs() < 1e-6, "LN gain was decayed");
+    }
+
+    #[test]
+    fn weight_decay_trains_and_shrinks_weight_matrices() {
+        let base = {
+            let mut r = Rng::new(7);
+            TransformerNet::new(6, 4, 8, 2, 16, 1, &mut r).unwrap()
+        };
+        let tokens: Vec<usize> = (0..200).map(|i| (i * 7) % 6).collect();
+        let adam = Adam::new(0.01);
+        // L2 norm over the actual weight matrices (where decay applies), not the
+        // un-decayed LayerNorm gains/biases.
+        let matrix_norm = |net: &TransformerNet| -> f32 {
+            let b = &net.blocks[0];
+            [&b.q_w, &b.k_w, &b.v_w, &b.o_w, &b.f1_w, &b.f2_w, &net.head_w, &net.tok_emb]
+                .iter()
+                .flat_map(|p| p.data.data.iter())
+                .map(|x| x * x)
+                .sum::<f32>()
+                .sqrt()
+        };
+
+        let mut plain = base.clone();
+        let mut rp = Rng::new(3);
+        let mut decayed = base.clone();
+        decayed.set_weight_decay(0.3);
+        let mut rd = Rng::new(3);
+
+        let mut first = f32::NAN;
+        let mut last = 0.0;
+        for e in 0..30 {
+            train_transformer_epoch(&mut plain, &tokens, 8, &adam, &mut rp).unwrap();
+            let l = train_transformer_epoch(&mut decayed, &tokens, 8, &adam, &mut rd).unwrap();
+            if e == 0 { first = l; }
+            last = l;
+        }
+        assert!(last < first, "decayed run should still reduce loss: {first:.4} → {last:.4}");
+        assert!(
+            matrix_norm(&decayed) < matrix_norm(&plain),
+            "weight decay should shrink the weight matrices: {} vs {}",
+            matrix_norm(&decayed), matrix_norm(&plain)
+        );
+    }
+
+    #[test]
+    fn dropout_forward_is_deterministic_per_seed_and_off_matches_plain() {
+        let mut rng = Rng::new(1);
+        let net = TransformerNet::new(6, 4, 8, 2, 32, 1, &mut rng).unwrap();
+        let tokens = [1usize, 2, 3, 4];
+        let (a, _) = net.forward_train(&tokens, 0.5, 123).unwrap();
+        let (b, _) = net.forward_train(&tokens, 0.5, 123).unwrap();
+        assert_eq!(a.data, b.data, "same seed must reproduce the dropout mask");
+        let (c, _) = net.forward_train(&tokens, 0.5, 999).unwrap();
+        assert_ne!(a.data, c.data, "a different seed must change the dropout pattern");
+        // dropout = 0 is exactly the plain forward.
+        let (d, _) = net.forward_train(&tokens, 0.0, 123).unwrap();
+        let (e, _) = net.forward(&tokens).unwrap();
+        assert_eq!(d.data, e.data);
+    }
+
+    /// The dropout backward is correct: against a fixed mask (fixed seed), the
+    /// analytic gradient matches central differences both for the FFN-2 weight
+    /// (directly downstream of dropout) and the FFN-1 weight (upstream, so the
+    /// mask must propagate back through ReLU).
+    #[test]
+    fn dropout_gradient_is_correct_for_fixed_mask() {
+        let mut rng = Rng::new(3);
+        let mut net = TransformerNet::new(5, 3, 4, 2, 8, 1, &mut rng).unwrap();
+        let tokens = [1usize, 2, 3];
+        let targets = [2usize, 3, 4];
+        let (seed, p) = (77u64, 0.5f32);
+
+        let (logits, cache) = net.forward_train(&tokens, p, seed).unwrap();
+        let (_, dl) = softmax_cross_entropy(&logits, &targets).unwrap();
+        net.zero_grad();
+        net.backward(&dl, &cache).unwrap();
+
+        let eps = 1e-2f32;
+        macro_rules! check {
+            ($field:ident, $idx:expr) => {
+                for &i in $idx {
+                    let analytic = net.blocks[0].$field.grad.data[i];
+                    net.blocks[0].$field.data.data[i] += eps;
+                    let lp = softmax_cross_entropy(&net.forward_train(&tokens, p, seed).unwrap().0, &targets).unwrap().0;
+                    net.blocks[0].$field.data.data[i] -= 2.0 * eps;
+                    let lm = softmax_cross_entropy(&net.forward_train(&tokens, p, seed).unwrap().0, &targets).unwrap().0;
+                    net.blocks[0].$field.data.data[i] += eps;
+                    let numeric = (lp - lm) / (2.0 * eps);
+                    assert!(
+                        (numeric - analytic).abs() < 6e-3 + 0.03 * analytic.abs(),
+                        "{}[{i}]: analytic={analytic:.6} numeric={numeric:.6}", stringify!($field)
+                    );
+                }
+            };
+        }
+        check!(f2_w, &[0usize, 5, 11]);
+        check!(f1_w, &[0usize, 7, 15]);
+    }
+
+    #[test]
+    fn training_with_dropout_reduces_loss() {
+        let mut rng = Rng::new(7);
+        let mut net = TransformerNet::new(4, 4, 8, 2, 16, 1, &mut rng).unwrap();
+        net.set_dropout(0.2);
+        assert!((net.dropout() - 0.2).abs() < 1e-6);
+        let tokens: Vec<usize> = (0..200).map(|i| i % 4).collect();
+        let adam = Adam::new(0.01);
+        let first = train_transformer_epoch(&mut net, &tokens, 8, &adam, &mut rng).unwrap();
+        let mut last = first;
+        for _ in 0..40 {
+            last = train_transformer_epoch(&mut net, &tokens, 8, &adam, &mut rng).unwrap();
+        }
+        assert!(last < first * 0.7, "dropout training did not reduce loss: {first:.4} → {last:.4}");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Checkpoint / resume mid-training (T6)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Resuming from a mid-training checkpoint reproduces uninterrupted training
+    /// bit-for-bit — proving weights, Adam moments, step counter, and RNG state
+    /// are all preserved.
+    #[test]
+    fn checkpoint_resume_matches_uninterrupted_training() {
+        let base = {
+            let mut r = Rng::new(7);
+            let mut n = TransformerNet::new(6, 4, 8, 2, 16, 2, &mut r).unwrap();
+            n.set_qat(true); // exercise the QAT path through the checkpoint
+            n
+        };
+        let tokens: Vec<usize> = (0..300).map(|i| (i * 7) % 6).collect();
+        let adam = Adam::new(0.02);
+
+        // Uninterrupted: 6 epochs straight through.
+        let mut net_a = base.clone();
+        let mut rng_a = Rng::new(123);
+        for _ in 0..6 {
+            train_transformer_epoch(&mut net_a, &tokens, 16, &adam, &mut rng_a).unwrap();
+        }
+
+        // Interrupted: 3 epochs, checkpoint, reload, 3 more.
+        let mut net_b = base.clone();
+        let mut rng_b = Rng::new(123);
+        for _ in 0..3 {
+            train_transformer_epoch(&mut net_b, &tokens, 16, &adam, &mut rng_b).unwrap();
+        }
+        let bytes = net_b.save_checkpoint(&rng_b);
+        drop(net_b);
+        let (mut net_c, mut rng_c) = TransformerNet::load_checkpoint(&bytes).unwrap();
+        assert!(net_c.qat_enabled(), "QAT flag must survive the checkpoint");
+        for _ in 0..3 {
+            train_transformer_epoch(&mut net_c, &tokens, 16, &adam, &mut rng_c).unwrap();
+        }
+
+        assert_eq!(net_a.step_count(), net_c.step_count());
+        assert_eq!(
+            net_a.snapshot_weights(),
+            net_c.snapshot_weights(),
+            "resumed training diverged from the uninterrupted run"
+        );
+    }
+
+    #[test]
+    fn checkpoint_roundtrip_preserves_flags_and_rng() {
+        let mut r = Rng::new(1);
+        let mut net = TransformerNet::new(6, 4, 8, 2, 16, 2, &mut r).unwrap();
+        net.set_qat(true);
+        net.set_weight_tying(true);
+        let tokens: Vec<usize> = (0..100).map(|i| i % 6).collect();
+        let adam = Adam::new(0.01);
+        let mut rng = Rng::new(5);
+        train_transformer_epoch(&mut net, &tokens, 8, &adam, &mut rng).unwrap();
+
+        let bytes = net.save_checkpoint(&rng);
+        let (mut net2, rng2) = TransformerNet::load_checkpoint(&bytes).unwrap();
+        assert_eq!(net.snapshot_weights(), net2.snapshot_weights());
+        assert_eq!(net.step_count(), net2.step_count());
+        assert!(net2.qat_enabled());
+        assert!(net2.weight_tying());
+        assert_eq!(rng.state(), rng2.state(), "RNG state must round-trip");
+    }
+
+    #[test]
+    fn load_checkpoint_rejects_corrupt_data() {
+        assert!(TransformerNet::load_checkpoint(b"").is_err());
+        assert!(TransformerNet::load_checkpoint(b"XXXXjunkdata").is_err());
+        let mut r = Rng::new(1);
+        let net = TransformerNet::new(6, 4, 8, 2, 16, 1, &mut r).unwrap();
+        let bytes = net.save_checkpoint(&r);
+        // Truncated payload is rejected, not silently zero-filled.
+        assert!(TransformerNet::load_checkpoint(&bytes[..bytes.len() / 2]).is_err());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Weight tying (T9)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sync_tied_head_mirrors_embedding_transpose() {
+        let mut rng = Rng::new(5);
+        let mut net = TransformerNet::new(6, 4, 8, 2, 16, 1, &mut rng).unwrap();
+        net.set_weight_tying(true); // enabling syncs immediately
+        assert!(net.weight_tying());
+        let (vocab, embed) = (6usize, 8usize);
+        for v in 0..vocab {
+            for e in 0..embed {
+                assert_eq!(
+                    net.head_w.data.data[e * vocab + v],
+                    net.tok_emb.data.data[v * embed + e],
+                    "head is not tok_embᵀ at ({v},{e})"
+                );
+            }
+        }
+    }
+
+    /// The folded gradient must be the true gradient of the loss w.r.t. the
+    /// shared embedding — accounting for the embedding affecting BOTH the input
+    /// lookup and the (tied) output head. Verified by central differences that
+    /// re-sync the head after each perturbation.
+    #[test]
+    fn weight_tying_gradient_is_correct() {
+        let mut rng = Rng::new(3);
+        let mut net = TransformerNet::new(5, 3, 4, 2, 6, 1, &mut rng).unwrap();
+        net.set_weight_tying(true);
+        let tokens = [1usize, 2, 3];
+        let targets = [2usize, 3, 4];
+
+        net.sync_tied_head();
+        let (logits, cache) = net.forward(&tokens).unwrap();
+        let (_, dl) = softmax_cross_entropy(&logits, &targets).unwrap();
+        net.zero_grad();
+        net.backward(&dl, &cache).unwrap();
+        net.fold_tied_head_grad();
+
+        let loss_at = |net: &mut TransformerNet, idx: usize, delta: f32| -> f32 {
+            net.tok_emb.data.data[idx] += delta;
+            net.sync_tied_head(); // the head tracks the embedding
+            let (logits, _) = net.forward(&tokens).unwrap();
+            let l = softmax_cross_entropy(&logits, &targets).unwrap().0;
+            net.tok_emb.data.data[idx] -= delta; // restore
+            net.sync_tied_head();
+            l
+        };
+
+        let eps = 1e-2f32;
+        for &i in &[4usize, 9, 13] {
+            let analytic = net.tok_emb.grad.data[i];
+            let lp = loss_at(&mut net, i, eps);
+            let lm = loss_at(&mut net, i, -eps);
+            let numeric = (lp - lm) / (2.0 * eps);
+            assert!(
+                (numeric - analytic).abs() < 6e-3 + 0.03 * analytic.abs(),
+                "tied grad[{i}]: analytic={analytic:.6} numeric={numeric:.6}"
+            );
+        }
+    }
+
+    #[test]
+    fn weight_tying_trains_and_exports_transposed_head() {
+        let mut rng = Rng::new(7);
+        let mut net = TransformerNet::new(6, 4, 8, 2, 16, 1, &mut rng).unwrap();
+        net.set_weight_tying(true);
+        let tokens: Vec<usize> = (0..200).map(|i| i % 6).collect();
+        let adam = Adam::new(0.01);
+        let first = train_transformer_epoch(&mut net, &tokens, 8, &adam, &mut rng).unwrap();
+        let mut last = first;
+        for _ in 0..30 {
+            last = train_transformer_epoch(&mut net, &tokens, 8, &adam, &mut rng).unwrap();
+        }
+        assert!(last < first * 0.6, "tied training did not reduce loss: {first:.4} → {last:.4}");
+
+        // The exported head must equal the final tok_embᵀ.
+        let model = net.to_inference().unwrap();
+        let head = model
+            .layers()
+            .iter()
+            .rev()
+            .find_map(|l| l.as_any().downcast_ref::<Linear>())
+            .expect("model has an LM head");
+        let (vocab, embed) = (6usize, 8usize);
+        for v in 0..vocab {
+            for e in 0..embed {
+                assert!(
+                    (head.weight.data[e * vocab + v] - net.tok_emb.data.data[v * embed + e]).abs() < 1e-6,
+                    "exported head ≠ tok_embᵀ at ({v},{e})"
+                );
+            }
+        }
+    }
+
+    /// Tied training is still bit-identical across the serial and single-shard
+    /// threaded paths (the sync/fold hooks run in both).
+    #[test]
+    fn tied_threaded_one_shard_matches_serial() {
+        let mut rng0 = Rng::new(7);
+        let mut base = TransformerNet::new(6, 4, 8, 2, 16, 1, &mut rng0).unwrap();
+        base.set_weight_tying(true);
+        let tokens: Vec<usize> = (0..200).map(|i| (i * 7) % 6).collect();
+        let adam = Adam::new(0.01);
+        let mut serial = base.clone();
+        let mut rs = Rng::new(9);
+        let mut threaded = base.clone();
+        let mut rt = Rng::new(9);
+        for _ in 0..3 {
+            train_transformer_epoch(&mut serial, &tokens, 8, &adam, &mut rs).unwrap();
+            train_transformer_epoch_threaded(&mut threaded, &tokens, 8, &adam, &mut rt, 1).unwrap();
+        }
+        assert_eq!(serial.snapshot_weights(), threaded.snapshot_weights());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Shuffle without replacement / true epochs (T4)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// A true epoch covers every window exactly once: with `batch_size = 1` it
+    /// takes exactly `num_windows` optimizer steps, and with a batch larger than
+    /// the corpus exactly one step — never sampling with replacement.
+    #[test]
+    fn epoch_makes_one_pass_over_all_windows() {
+        let mut rng0 = Rng::new(7);
+        let mut net = TransformerNet::new(5, 4, 8, 2, 16, 1, &mut rng0).unwrap();
+        let tokens: Vec<usize> = (0..50).map(|i| i % 5).collect();
+        let num_windows = (tokens.len() - 4) as u64;
+        let adam = Adam::new(0.01);
+        let mut rng = Rng::new(1);
+
+        let before = net.step_count();
+        train_transformer_epoch(&mut net, &tokens, 1, &adam, &mut rng).unwrap();
+        assert_eq!(net.step_count() - before, num_windows,
+            "batch_size=1 must take exactly num_windows steps");
+
+        let before = net.step_count();
+        train_transformer_epoch(&mut net, &tokens, 10_000, &adam, &mut rng).unwrap();
+        assert_eq!(net.step_count() - before, 1,
+            "an over-sized batch must take exactly one full-corpus step");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Learning-rate schedule (T2)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// A warmup+decay schedule is actually applied during training: it drives a
+    /// different trajectory than the same base LR held fixed, advances the step
+    /// counter, and still reduces loss.
+    #[test]
+    fn lr_schedule_is_applied_and_reduces_loss() {
+        use crate::optim::LrSchedule;
+        let mut rng0 = Rng::new(7);
+        let base = TransformerNet::new(4, 4, 8, 2, 16, 1, &mut rng0).unwrap();
+        let tokens: Vec<usize> = (0..200).map(|i| i % 4).collect();
+        let adam = Adam::new(0.02);
+
+        // Fixed-LR reference.
+        let mut fixed = base.clone();
+        let mut rf = Rng::new(5);
+        for _ in 0..10 {
+            train_transformer_epoch(&mut fixed, &tokens, 8, &adam, &mut rf).unwrap();
+        }
+
+        // Scheduled run: warmup then cosine decay over the same total steps.
+        let steps_per_epoch = (tokens.len() - 4).div_ceil(8) as u64;
+        let total = steps_per_epoch * 10;
+        let mut sched_net = base.clone();
+        sched_net.set_lr_schedule(Some(LrSchedule::warmup_cosine(0.02, steps_per_epoch * 2, total)));
+        assert!(sched_net.lr_schedule().is_some());
+        let mut rs = Rng::new(5);
+        let first = train_transformer_epoch(&mut sched_net, &tokens, 8, &adam, &mut rs).unwrap();
+        let mut last = first;
+        for _ in 0..9 {
+            last = train_transformer_epoch(&mut sched_net, &tokens, 8, &adam, &mut rs).unwrap();
+        }
+
+        assert_eq!(sched_net.step_count(), total, "step counter must drive the schedule");
+        assert!(last < first, "scheduled run should reduce loss: {first:.4} → {last:.4}");
+        // Warmup means the scheduled run takes a genuinely different path.
+        assert_ne!(
+            fixed.snapshot_weights(),
+            sched_net.snapshot_weights(),
+            "schedule had no effect on training"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Shared-weight data-parallel gradients (T3)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// `backward_grads(&self)` returns exactly the gradients the in-place
+    /// `backward` stores, and leaves the network unmodified. This purity is what
+    /// lets the data-parallel workers borrow the master weights read-only
+    /// instead of deep-cloning the whole network per shard.
+    #[test]
+    fn backward_grads_matches_inplace_backward_and_leaves_weights_intact() {
+        let mut rng = Rng::new(7);
+        let mut net = TransformerNet::new(6, 4, 8, 2, 16, 2, &mut rng).unwrap();
+        let tokens = [1usize, 2, 3, 4, 0, 5, 2, 1]; // two windows (T=4)
+        let targets = [2usize, 3, 4, 5, 1, 0, 3, 2];
+        let (logits, cache) = net.forward(&tokens).unwrap();
+        let (_, dl) = softmax_cross_entropy(&logits, &targets).unwrap();
+
+        // Pure: no weight or optimizer-moment mutation.
+        let weights_before = net.snapshot_weights();
+        let flat = net.backward_grads(&dl, &cache).unwrap();
+        assert_eq!(net.snapshot_weights(), weights_before, "backward_grads mutated weights");
+        assert_eq!(flat.len(), net.num_params());
+
+        // The in-place wrapper stores exactly those gradients (canonical order).
+        net.zero_grad();
+        net.backward(&dl, &cache).unwrap();
+        let mut stored = Vec::new();
+        for g in net.grad_tensors_mut() {
+            stored.extend_from_slice(&g.data);
+        }
+        assert_eq!(stored, flat, "in-place backward differs from backward_grads");
+    }
+
+    /// The shared-weight (no-clone) data-parallel path stays numerically in
+    /// step with the serial path across several epochs — the memory fix changes
+    /// only allocation, not the math.
+    #[test]
+    fn threaded_shared_weights_track_serial_over_epochs() {
+        let mut rng0 = Rng::new(7);
+        let base = TransformerNet::new(6, 4, 8, 2, 16, 2, &mut rng0).unwrap();
+        let tokens: Vec<usize> = (0..200).map(|i| (i * 7) % 6).collect();
+        let adam = Adam::new(0.02);
+        let batch = tokens.len() - 4; // one optimizer step per epoch (all windows)
+
+        let mut serial = base.clone();
+        let mut rs = Rng::new(3);
+        let mut par = base.clone();
+        let mut rp = Rng::new(3);
+        for _ in 0..5 {
+            train_transformer_epoch(&mut serial, &tokens, batch, &adam, &mut rs).unwrap();
+            train_transformer_epoch_threaded(&mut par, &tokens, batch, &adam, &mut rp, 4).unwrap();
+        }
+        let sw = serial.snapshot_weights();
+        let pw = par.snapshot_weights();
+        for (a, b) in sw.iter().zip(&pw) {
+            for (x, y) in a.iter().zip(b) {
+                assert!((x - y).abs() < 1e-3, "shared-weight path drifted from serial: {x} vs {y}");
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Gradient clipping (T1)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// `clip_grad_norm` caps the post-backward global gradient norm at the
+    /// requested budget and returns the (larger) pre-clip norm.
+    #[test]
+    fn clip_grad_norm_caps_global_norm() {
+        let mut rng = Rng::new(7);
+        let mut net = TransformerNet::new(6, 4, 8, 2, 16, 1, &mut rng).unwrap();
+        let tokens = [1usize, 2, 3, 4];
+        let targets = [2usize, 3, 4, 5];
+        let (logits, cache) = net.forward(&tokens).unwrap();
+        let (_, dl) = softmax_cross_entropy(&logits, &targets).unwrap();
+        net.zero_grad();
+        net.backward(&dl, &cache).unwrap();
+
+        let max_norm = 0.1f32;
+        let pre = net.clip_grad_norm(max_norm);
+        // Recompute the global norm from the (now clipped) gradients.
+        let mut sumsq = 0.0f64;
+        for g in net.grad_tensors_mut() {
+            for &x in &g.data {
+                sumsq += (x as f64) * (x as f64);
+            }
+        }
+        let post = sumsq.sqrt() as f32;
+        assert!(pre > max_norm, "test needs an exploding-enough grad: pre={pre}");
+        assert!(post <= max_norm + 1e-4, "post-clip norm {post} exceeds budget {max_norm}");
+    }
+
+    /// Gradient clipping is actually wired into the epoch: with the same seed,
+    /// a clipped run takes a different trajectory than an unclipped one (because
+    /// the early gradients exceed the budget), and stays finite while still
+    /// reducing loss.
+    #[test]
+    fn grad_clip_changes_trajectory_and_stays_finite() {
+        let mut rng0 = Rng::new(7);
+        let base = TransformerNet::new(6, 6, 12, 2, 24, 2, &mut rng0).unwrap();
+        let tokens: Vec<usize> = (0..300).map(|i| (i * 7) % 6).collect();
+        let adam = Adam::new(0.05);
+
+        let finite = |net: &mut TransformerNet| {
+            net.snapshot_weights().iter().all(|t| t.iter().all(|v| v.is_finite()))
+        };
+
+        let mut unclipped = base.clone();
+        let mut r1 = Rng::new(1);
+        for _ in 0..5 {
+            train_transformer_epoch(&mut unclipped, &tokens, 16, &adam, &mut r1).unwrap();
+        }
+
+        let mut clipped = base.clone();
+        clipped.set_grad_clip(Some(0.01)); // tiny budget → clips most steps
+        assert_eq!(clipped.grad_clip(), Some(0.01));
+        let mut r2 = Rng::new(1);
+        let first = train_transformer_epoch(&mut clipped, &tokens, 16, &adam, &mut r2).unwrap();
+        let mut last = first;
+        for _ in 0..4 {
+            last = train_transformer_epoch(&mut clipped, &tokens, 16, &adam, &mut r2).unwrap();
+        }
+
+        assert!(finite(&mut clipped), "clipped run must stay finite");
+        assert!(last < first, "clipped run should still reduce loss: {first:.4} → {last:.4}");
+        // The clip threshold changed the optimization path.
+        assert_ne!(
+            unclipped.snapshot_weights(),
+            clipped.snapshot_weights(),
+            "grad clipping had no effect on the weights"
+        );
     }
 
     /// For a fixed `threads` value, training is reproducible regardless of how
