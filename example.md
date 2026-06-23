@@ -1,8 +1,9 @@
 # Worked Examples
 
-Three end-to-end examples: a BPE transformer SLM, a character-level model for
-comparison, and a tabular classifier. Every example is self-contained and uses
-only `cargo`.
+End-to-end examples: a BPE transformer SLM, the same model character-level, a
+tabular classifier, the tokenizer on its own, and importing an external GGUF.
+Every example is self-contained and uses only `cargo`. Numbers shown are
+illustrative — yours vary with corpus, hyperparameters, and seed.
 
 ---
 
@@ -10,7 +11,7 @@ only `cargo`.
 
 ### Step 1: prepare a corpus
 
-Any UTF-8 text file works. For a quick demo:
+Any UTF-8 text file works:
 
 ```bash
 cat > corpus.txt <<'EOF'
@@ -27,8 +28,6 @@ EOF
 cargo run -p slm_cli -- train corpus.txt model.bin \
     --vocab 320 --context 8 --embed 16 --heads 2 --blocks 1 --epochs 30
 ```
-
-Output:
 
 ```text
 ╔══════════════════════════════════════════════════════════╗
@@ -74,14 +73,15 @@ the quick brown fox jumps over the lazy dog while the c
 ```
 
 The seed round-trips exactly through the tokenizer, and `--chars` counts
-characters even though the model generates BPE tokens internally.
+characters even though the model generates BPE tokens internally. Add `--stream`
+to watch the completion appear fragment by fragment.
 
 ---
 
 ## Example 2 — The same model, character-level
 
 To compare tokenization strategies, train an identical network with
-character-level tokenization by setting `--vocab 0`:
+character-level tokenization (`--vocab 0`):
 
 ```bash
 cargo run -p slm_cli -- train corpus.txt char_model.bin \
@@ -93,10 +93,11 @@ cargo run -p slm_cli -- info char_model.bin
 Tokenizer : character-level (… chars)
 ```
 
-The character model has a small vocabulary (one entry per distinct character)
-while the BPE model has at least 256 token IDs. On longer, more varied corpora
-the BPE model captures recurring multi-character patterns and typically needs a
-shorter context window to model the same span of text.
+The character model's vocabulary is one entry per distinct character; the BPE
+model has at least 256 token IDs. On longer, varied corpora the BPE model packs
+recurring multi-character patterns into single tokens, so a fixed context window
+covers more text — often the difference between a model that captures structure
+and one that runs out of view.
 
 ---
 
@@ -106,32 +107,21 @@ shorter context window to model the same span of text.
 use ferrum_core::{GenerativeSLM, Rng, TransformerConfig};
 
 fn main() -> Result<(), ferrum_core::InferError> {
-    let corpus = std::fs::read_to_string("corpus.txt")
-        .expect("read corpus");
+    let corpus = std::fs::read_to_string("corpus.txt").expect("read corpus");
     let mut rng = Rng::new(1337);
 
     let cfg = TransformerConfig {
-        context_len: 16,
-        embed_dim: 32,
-        num_heads: 4,
-        num_blocks: 2,
-        hidden_dim: 64,
-        epochs: 200,
-        lr: 0.01,
-        batch_size: 16,
+        context_len: 16, embed_dim: 32, num_heads: 4, num_blocks: 2,
+        hidden_dim: 64, epochs: 200, lr: 0.01, batch_size: 16,
         vocab_size: 512, // byte-level BPE
     };
 
     let slm = GenerativeSLM::train_transformer_config(&corpus, &cfg, &mut rng, |ep, loss| {
-        if ep % 20 == 0 {
-            println!("epoch {ep}: loss {loss:.4}");
-        }
+        if ep % 20 == 0 { println!("epoch {ep}: loss {loss:.4}"); }
     })?;
 
     slm.save("model.bin")?; // int8-quantized FINF v5
-
-    let text = slm.generate("Once upon a time", 200, 0.7, &mut rng)?;
-    println!("{text}");
+    println!("{}", slm.generate("Once upon a time", 200, 0.7, &mut rng)?);
     Ok(())
 }
 ```
@@ -140,7 +130,6 @@ Reloading and continuing later:
 
 ```rust
 use ferrum_core::{GenerativeSLM, Rng};
-
 let slm = GenerativeSLM::load("model.bin").unwrap();
 let mut rng = Rng::new(42);
 println!("{}", slm.generate("In the beginning", 120, 0.8, &mut rng).unwrap());
@@ -157,7 +146,7 @@ cargo run -p train_cli -- iris.csv iris_model.bin "Iris" 32 500
 `train_cli` auto-detects classification vs. regression from the CSV, fits a
 feature normalizer, trains an MLP, and writes a self-contained FINF model that
 embeds the feature names, ranges, and class labels — everything a UI needs to
-present the model.
+present the model with no sidecar files.
 
 ---
 
@@ -178,3 +167,34 @@ assert_eq!(tok.decode(&tok.encode("café 🌸 мир")), "café 🌸 мир");
 let restored = ByteBpeTokenizer::from_state(&tok.encode_state()).unwrap();
 assert_eq!(restored.encode("lowest"), tok.encode("lowest"));
 ```
+
+---
+
+## Example 6 — Importing and running an external GGUF (Llama/Qwen)
+
+From the command line, with the checkpoint's own tokenizer:
+
+```bash
+# int4 (smallest RAM, default), int8 (fastest decode), or f32 (no re-quantization).
+cargo run -p slm_cli -- run-gguf qwen2-0_5b.gguf "Once upon a time" \
+    --quant int4 --max 64 --temp 0.7
+```
+
+From the library:
+
+```rust
+use ferrum_core::{Gguf, GgufTokenizer, QKind, Rng};
+
+let gguf  = Gguf::open("qwen2-0_5b.gguf")?;     // streamed; not fully resident
+let tok   = GgufTokenizer::from_gguf(&gguf)?;
+let model = gguf.load_llama(QKind::Int4)?;      // RMSNorm/RoPE/GQA/SwiGLU, KV-cached
+let ids   = tok.encode("Once upon a time");
+let out   = model.generate(&ids, 64, 0.7, &mut Rng::new(1))?;
+println!("{}", tok.decode(&out));
+```
+
+Expect a few tokens per second for a ~1B model on a CPU, and tens of seconds to
+prefill a long prompt — decode streams every weight once per token, so it is
+bandwidth-bound (see [benchmarks.md](benchmarks.md) §4). Only `llama`/`qwen2`
+load; `Q2_K`/`Q3_K`/`IQ*` files are rejected. To fine-tune instead of run, import
+at f32 and wrap in `LlamaTrainer` (see [howtouse.md](howtouse.md) §4.4).

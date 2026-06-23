@@ -60,9 +60,10 @@ const ENC_INT8: u8 = 1;
 /// readers reject the unknown marker rather than misreading.
 const ENC_INT8_PER_CHANNEL: u8 = 2;
 /// Per-tensor int4 (§Opt#1): `f32` scale, then `rows·ceil(cols/2)` bytes of
-/// packed nibbles (low nibble = even column first, each row padded to a whole
-/// byte — the same packing as [`crate::quant::QWeight`], so the loader copies
-/// straight into one without re-quantizing). Symmetric, levels −7..=7.
+/// packed nibbles in [`crate::quant::QWeight`]'s **split-half** layout (per row,
+/// byte `b`'s low nibble = column `b`, high nibble = column `half + b`), so the
+/// loader copies straight into a `QWeight` without re-quantizing. Symmetric,
+/// levels −7..=7.
 const ENC_INT4: u8 = 3;
 /// Per-channel int4: `u32` channel count, one `f32` scale per channel, then the
 /// packed nibbles. Channels are the matrix's input rows (`= in_features`).

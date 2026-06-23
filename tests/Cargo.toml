@@ -40,5 +40,9 @@ path = "tests/test_qat_cache.rs"
 name = "integration"
 path = "tests/integration.rs"
 
+[[test]]
+name = "test_gguf_llm"
+path = "tests/test_gguf_llm.rs"
+
 [dependencies]
 ferrum_core = { path = "../ferrum_core" }

@@ -58,8 +58,10 @@ pub mod csv;
 pub mod dataset;
 pub mod error;
 pub mod gguf;
+pub mod gguf_tokenizer;
 pub mod layer;
 pub mod llm;
+pub mod llm_train;
 pub mod loader;
 pub mod loss;
 pub mod model;
@@ -81,6 +83,7 @@ pub use csv::{
 pub use dataset::{clean_corpus, corpus_stats, validate_for_training, CleanOptions, CorpusStats};
 pub use error::{InferError, Result};
 pub use gguf::{f16_to_f32, Gguf, MetaValue, TensorInfo};
+pub use gguf_tokenizer::{GgufTokenizer, TokModel};
 pub use layer::{
     ActivationLayer, Embedding, Flatten, KvCache, Layer, LayerNorm, Linear, TransformerBlock,
 };
@@ -88,6 +91,7 @@ pub use llm::{
     apply_rope, Attention, FeedForward, LlamaBlock, LlamaCache, LlamaConfig, LlamaModel, RmsNorm,
     RopeType,
 };
+pub use llm_train::LlamaTrainer;
 pub use loader::{
     from_bytes, load, save, save_quantized, save_quantized_int4, to_bytes, to_bytes_quantized,
     to_bytes_quantized_int4,

@@ -1,320 +1,377 @@
 # Ferrum — Project Review
 
-_Date: 2026-06-21 · Reviewer: automated deep review · Target machine: Intel
-i5-1135G7 (4 cores / 8 threads), 16 GB RAM._
+_Date: 2026-06-23 · Reviewer: automated deep review · Target ("current") hardware:
+Intel i5-1135G7 (4 cores / 8 threads), 16 GB RAM, no GPU._
 
-This document reviews the `ferrum` project as it now stands: a **zero-dependency,
-pure-Rust, CPU-only engine** for building, training, and running causal
-Transformers, Small Language Models (SLMs), and classical MLPs. It covers the
-architecture, the state of each subsystem, what was recently hardened, the gaps
-that remain, and a quantitative **Metrics** section including a code-coverage
-report.
+This reviews `ferrum` as a **zero-dependency, pure-Rust, CPU-only** engine for
+building, training, and running causal Transformers, Small Language Models (SLMs),
+and classical MLPs — now also with a std-only **GGUF reader** and a **Llama/Qwen
+decoder** (`llm.rs`) that imports and runs externally pretrained checkpoints in
+int4/int8/f32, plus a gradient-checked backward pass for that architecture
+(`llm_train.rs`).
+
+The engine has always been excellent at its core job. The consequential newer
+surface is GGUF/LLM, so this review leads with it and — as the project's brief
+demands — **pushes back hard on loading, training, or running 1B+ models on this
+hardware** (§4). The short version: the GGUF/LLM *primitives* are real, correct,
+and well-tested; importing is lossy and not bit-exact to llama.cpp; and the
+hardware makes 1B the painful upper edge of "runnable" and flatly outside
+"trainable."
+
+Severity legend: 🔴 blocks the stated use · 🟡 limits quality/scale/usability ·
+🟢 polish.
 
 ---
 
 ## 1. Bottom line
 
-Ferrum is a genuinely self-contained ML stack — tensors, hand-written backprop,
-attention, a byte-level BPE tokenizer, int8 quantization-aware training, a
-self-describing model file format (FINF), a multi-threaded matmul, a WASM build,
-two CLIs, and a Tauri GUI — built on **`std` only**, with an empty
-`[dependencies]` table for the core crate and `#![forbid(unsafe_code)]`.
+- **As an edge SLM engine for models you train yourself (≤ a few M params):**
+  correct, reproducible, well-tested, genuinely dependency-free. This is its real
+  job and it does it well (§5–6).
+- **As a GGUF runner:** the math is right and unit-covered. **Q4_K/Q5_K/Q6_K**
+  k-quants load (so the common `_K_M` downloads work), alongside legacy
+  `F32/F16/Q8_0/Q8_1/Q4_0/Q4_1`; `Q2_K/Q3_K` and `IQ*` are rejected. The
+  checkpoint's **own tokenizer is imported** (BPE exact, SPM encode greedy), so it
+  runs on text. `slm_cli run-gguf` and a GUI panel drive it, with a `/proc/meminfo`
+  memory guard and a `--quant f32` path that skips re-quantization. Import is still
+  **lossy by default** and **not bit-exact to llama.cpp** — the code says so.
+- **As a place to run a 1B model:** functional, marginal, and **measured**
+  (benchmarks.md §3): after the int4-kernel fix, **~7 tok/s decode at int4
+  (~4–5× the f32 rate)** at 8 threads, int8 marginally faster per call, with tens of
+  seconds of compute-bound prefill per real prompt. A patient demo, not a chatbot.
+- **As a place to train or fine-tune a 1B model:** the architecture is now
+  **trainable** — `llm_train.rs` adds a finite-difference-checked backward pass — but
+  training a *1B* model here is **still not feasible**: no RAM for the optimizer
+  state (~16 GB at f32) and no compute for the FLOPs (§4.3). The missing capability
+  (gradients) now exists; the hardware ceiling does not move.
 
-The engine is **correct, well-tested, and reproducible**. All three SLM training
-paths and the tabular MLP path train and reduce loss; quantization round-trips
-with small drift; generation (char-level + BPE), streaming, KV-cached inference,
-and held-out perplexity evaluation work from the library, the CLIs, the GUI, and
-WASM. Multi-threaded training is bit-for-bit reproducible and identical to serial
-at one shard.
-
-The binding constraint remains **compute, not features or memory**: this is a
-scalar CPU engine, so wall-clock time caps practical training at a few million
-parameters even though RAM would allow far more. That is a property of the design
-goal (edge / offline / dependency-free), not a defect.
-
-Severity legend: 🔴 will break/block at modest scale · 🟡 limits quality/scale ·
-🟢 polish/robustness.
+To its credit, the GGUF/LLM module documents its limits in its own doc-comments.
+This review's job is to keep them from getting lost behind the word
+"compatibility."
 
 ---
 
 ## 2. Architecture
 
 ```
-                ┌──────────────────────────────────────────────┐
-                │                 ferrum_core                  │
-                │  (zero-dep, std-only, #![forbid(unsafe)])    │
-                │                                              │
-   tensor ─ ops ─ activation ─ loss ─ rng ─ parallel          │
-        │                                                     │
-   layer (Linear, LayerNorm, Embedding, TransformerBlock,     │
-        │   KvCache, Flatten, Activation)                     │
-        │                                                     │
-   model (Sequential) ── quant (int8, per-channel) ── tokenizer (BPE)
-        │                                                     │
-   train (MLP/embedded) ── train_transformer (decoder-only)   │
-        │                                                     │
-   slm (GenerativeSLM: train / generate / evaluate / sample)  │
-        │                                                     │
-   csv ── dataset ── loader (FINF v4/v5) ── verbose ── error  │
-                └───────────────┬──────────────────────────────┘
+                ┌────────────────────────────────────────────────────┐
+                │                    ferrum_core                       │
+                │     (zero-dep, std-only, #![forbid(unsafe_code)])    │
+                │                                                      │
+   tensor ─ ops ─ activation ─ loss ─ rng ─ parallel                  │
+        │     (matmul/qlinear; persistent CPU worker pool; run_1d)     │
+   quant (int8 + int4 QWeight, per-tensor/per-channel, consumed packed)│
+        │                                                              │
+   layer (Linear[+QWeight], LayerNorm, Embedding, TransformerBlock,    │
+        │   KvCache)                                                   │
+        │                                                              │
+   ┌── train / train_transformer ──┐     ┌── llm ─────────────────────┐ │
+   │  Ferrum's OWN architecture:   │     │  Llama/Qwen architecture:  │ │
+   │  learned-pos + LayerNorm +    │     │  RMSNorm + RoPE + GQA +    │ │
+   │  ReLU FFN. Trainable (backprop)│     │  SwiGLU. Run + train       │ │
+   │                                │     │  (llm_train, grad-checked) │ │
+   └───────────────┬───────────────┘     └─────────────┬──────────────┘ │
+        │ slm (GenerativeSLM: train/generate/evaluate)  │ gguf:          │
+        │ tokenizer (byte-level BPE)                     │ std-only GGUF  │
+        │ loader (FINF v4/v5; f32/int8/int4 per-vector)  │ reader →       │
+        │                                                │ LlamaModel     │
+                └───────────────┬──────────────────────────────────────┘
         ┌───────────────────────┼───────────────────────┬───────────────┐
    slm_cli                 train_cli              tabular_wasm       ferrum_gui
- (transformer SLM)      (tabular MLP)         (wasm-bindgen)        (Tauri app,
-                                                                    excluded crate)
+ (transformer SLM        (tabular MLP)         (wasm-bindgen)        (Tauri app,
+  + run-gguf)            ── no GGUF ──          ── no GGUF ──        + GGUF panel)
 ```
 
-- **Data flow for an SLM:** corpus → `tokenize_for_lm` (char or BPE) →
-  `TransformerNet` (QAT, Adam, optional LR schedule / grad clip / weight tying) →
-  `to_inference()` → `Sequential` → FINF bytes → `GenerativeSLM::generate*`
-  (KV-cached, with top-k/top-p/repetition-penalty sampling).
-- **Determinism** is a first-class property: a seeded `Rng` (xorshift64\*),
-  fixed shard-reduction order, and a stable parameter-ordering convention make
-  training and generation reproducible and serial≡threaded-at-one-shard.
+There are **two distinct Transformer stacks** in the tree, and conflating them is
+the single biggest source of over-claiming:
+
+| | Ferrum's own (`train_transformer.rs`) | Imported (`llm.rs`) |
+|---|---|---|
+| Positions | learned absolute embedding | **RoPE** (rotary) |
+| Norm | LayerNorm (mean+var, bias) | **RMSNorm** (no mean, no bias) |
+| FFN | ReLU MLP | **SwiGLU** gated |
+| Attention | dense MHA | **grouped-query (GQA)** |
+| Training | ✅ full backprop, Adam/AdamW, QAT | ✅ **gradient-checked backprop** (`llm_train.rs`, f32) |
+| Source | trained from your text | imported from a GGUF |
+| Tokenizer | Ferrum byte-level BPE (in-file) | ✅ imported (`gguf_tokenizer.rs`; BPE exact, SPM approx) |
+
+They share the low-level kernels (`Linear`/`qlinear`, the worker pool, the quant
+grid) but nothing above that. You **can** now train an imported model (f32, via
+`llm_train.rs`) — though not at 1B scale — and you **can** run a downloaded Llama
+with its own tokenizer.
 
 ---
 
-## 3. What works today (verified)
+## 3. The GGUF / LLM subsystem — detailed
 
-- **All four training paths** (`GenerativeSLM::train` one-hot MLP,
-  `train_embedded`, `train_transformer`, and the multi-threaded transformer
-  variant) train and reduce loss.
-- **Quantization-aware training** + **per-channel** int8 FINF v5 serialization
-  round-trips with small drift.
-- **KV-cached generation** for native (CLI + GUI) and WASM, char-level and BPE,
-  matching a full forward within the context window.
-- **Validation-aware training** with held-out split, early stopping on
-  perplexity, and best-epoch checkpointing.
-- **Checkpoint / resume** of full training state (weights + Adam moments + step +
-  RNG), bit-identical to an uninterrupted run.
-- **Byte-level BPE** with whitespace pre-tokenization and rank-based encode,
-  round-tripping arbitrary UTF-8.
-- **FINF loader** is defensively coded: magic/version checks, bounds-checked
-  reads, `checked_mul` against overflow, graceful rejection of corrupt buffers.
+### 3a. What is genuinely there and correct
+
+- **`gguf.rs` (1,526 lines, 26 tests).** A pure-`std`, `unsafe`-free GGUF v2/v3
+  reader: magic/version check, the full typed metadata key/value table, the tensor
+  directory, alignment handling, and block-dequantizers for **F32, F16, Q8_0, Q8_1,
+  Q4_0, Q4_1** plus the **Q4_K/Q5_K/Q6_K** super-block k-quants. Defensively coded —
+  checked offset arithmetic, EOF guards, rejects nested arrays and absurd counts.
+  `Gguf::from_path` reads the whole file; **`Gguf::open` streams** tensor bytes from a
+  `Mutex<File>` on demand (a safe-Rust alternative to `mmap`, which would need
+  `unsafe`). A hand-rolled in-memory writer in the tests exercises the reader,
+  including a synthetic 2-layer llama/qwen2 file imported and run end-to-end.
+- **`gguf_tokenizer.rs` (505 lines, 6 tests).** Reconstructs a checkpoint's own
+  tokenizer from `tokenizer.ggml.*`: BPE encode/decode (exact), SPM decode (exact),
+  SPM encode (greedy longest-match approximation). This is what lets imported models
+  run on **text** rather than raw IDs.
+- **`llm.rs` (799 lines, 17 tests).** A real Llama/Qwen2 decoder: `RmsNorm`,
+  `apply_rope` (both `Norm` interleaved and `Neox` split-half conventions),
+  grouped-query `Attention` with a per-layer KV cache, the `SwiGLU` `FeedForward`,
+  the pre-norm `LlamaBlock`, and `LlamaModel` with a full-sequence forward and an
+  O(context)/token cached decode plus sampling `generate`. Correctness is checked two
+  ways: each primitive against its closed-form definition, and the **cached decode
+  path against an independent full-attention implementation, row-for-row**.
+- **`llm_train.rs` (821 lines, 6 tests).** A hand-derived backward pass for the
+  imported architecture — RMSNorm, RoPE, GQA+softmax, SwiGLU, embedding, LM head —
+  each **checked against finite differences**, with next-token cross-entropy and an
+  SGD `train_step`. `LlamaTrainer::new` rejects quantized models (there is no f32
+  master behind a packed `QWeight`).
+- **The int4/int8 path it rides on is real.** Projections are `Linear`s holding an
+  `Option<Arc<QWeight>>`; when quantized they dispatch to `ops::qlinear`, which
+  consumes packed weights **without expanding to f32**, folds the per-row scale into
+  the activations once, and — for single-token decode (`m == 1`) — splits the GEMV
+  across the worker pool **by output column** (`run_1d`). Deterministic across thread
+  counts, and unit-checked against an f32 reference.
+
+This is careful, honest work. None of the push-back below is about the math.
+
+### 3b. What still limits the importer
+
+- 🟡 **Lossy, coarser quantization.** A `Q4_0`/k-quant GGUF is already quantized;
+  Ferrum dequantizes to f32 and **re-quantizes** to its own grid (per-row scale).
+  That is a second lossy step *and* a coarser grid than GGML's per-block scales.
+  Expect measurably worse output than the same file in llama.cpp; the code does not
+  claim bit-exact parity. `--quant f32` avoids the *second* quantization (at full
+  RAM) but not the first dequant.
+- 🟡 **Remaining quant formats.** `Q2_K`, `Q3_K`, and the `IQ*` families reject.
+  Q4_K/Q5_K/Q6_K cover most `_K_M` downloads, but not all.
+- 🟡 **f32 token embedding stays resident.** `LlamaModel` keeps `tok_emb: Vec<f32>`,
+  so for a large-vocab model it is the single biggest resident array (§4.1) — the
+  packed-int4 weight figure does not include it.
+- 🟡 **SPM encode is approximate.** SentencePiece `encode` is greedy longest-match
+  (decode is exact); a unigram-Viterbi pass would make it token-for-token correct.
+  BPE encode is already exact.
+- 🟢 RoPE is hard-wired to `Norm` in `load_llama` (correct for llama.cpp's GGUF
+  permutation); `rope_type` is plumbed through config but ignored on import — a
+  latent foot-gun if a `Neox`-permuted GGUF ever appears.
+- 🟢 No RoPE scaling (YaRN / linear / NTK); long-context variants would use the base
+  frequency only.
 
 ---
 
-## 4. Subsystem review
+## 4. Pushing back hard: 1B+ models on this hardware
+
+> Numbers below derive from the project's **own** measurements in `benchmarks.md §3`
+> (scalar kernels, ~36 GFLOP/s peak across 8 cores at 2048², ~6–8 GB/s f32 decode
+> bandwidth, ~7 tok/s int4 decode) plus first-principles memory math. The machine is
+> 4c/8t, 16 GB, no GPU, no SIMD intrinsics in the kernels.
+
+Useful constants: forward ≈ **2·N FLOPs/token** (N = parameters); decode also
+**streams every weight once per token** (the bandwidth wall). A training step ≈
+**6·N·T FLOPs** and needs **~16 bytes/param** resident (f32 weight + grad + Adam m +
+v) before activations/KV/batch.
+
+### 4.1 Loading a 1B model — feasible at int4, but gated and lossy
+
+Memory is **not** the blocker at int4. A 1B model packs to ~0.5 GB int4; the f32
+token embedding adds ~0.26 GB (32k vocab) to ~1 GB (128k vocab); during import you
+transiently hold the source file (Q4_0 ≈ 0.55 GB, Q8_0 ≈ 1.05 GB, F16 ≈ 2 GB) plus
+per-tensor f32 dequant buffers plus, for a tied head, a transposed f32 copy of the
+embedding. Peak ≈ 2–3.5 GB. **That fits in 16 GB.** What gates loading is §3b: the
+file must be a supported quant (no `Q2_K`/`Q3_K`/`IQ*`) and a llama/qwen2
+architecture, and even then you get a doubly-quantized model.
+
+> The 7B story differs: an F16 source (~14 GB read) plus transients will not fit in
+> 16 GB. **1B/3B are the realistic ceiling** for this no-mmap import path.
+
+### 4.2 Running a 1B model — functional, marginal (measured)
+
+On the synthetic ~1B config (benchmarks.md §3, re-measured 2026-06-23):
+
+| Phase | Bound | Measured on this machine (1B) |
+|---|---|---|
+| **Prefill** a 512-tok prompt | compute, ~2·N·T ≈ 1.0×10¹² FLOP | **~30 s** at ~36 GFLOP/s (8 threads) |
+| Prefill a 2048-tok prompt | compute | **~2 min** |
+| **Decode** (per token), f32 | bandwidth, serial | ~3.5 GB/tok → **~1.6 tok/s** |
+| **Decode** (per token), int4 | bandwidth + nibble unpack, column-split | **~7 tok/s** (8 threads) — ~4–5× f32 |
+| **Decode** (per token), int8 | bandwidth, column-split | marginally faster per call, 2× the RAM |
+
+The **split-half int4 repack** restored int4 to ~4–5× the f32 rate, near the ⅛-byte
+bandwidth ideal (an interleaved nibble layout had defeated the autovectorizer).
+These figures *exclude* attention score·V, layernorm, softmax, RoPE, and sampling,
+and the bench replays one layer's weights (cache-warm), so a real model is somewhat
+slower; attention is also O(context)/token, so it degrades as the chat grows.
+
+**Verdict:** a 1B model loads and emits text (its tokenizer is imported), but expect
+~30 s before the first token and a ~7 tok/s stream after. A patient demo; not a
+chatbot.
+
+### 4.3 Training / fine-tuning a 1B model — gradients now exist, the hardware still doesn't
+
+The **backward pass now exists** (`llm_train.rs`): gradients for every primitive,
+finite-difference-checked, with an SGD `train_step` that demonstrably reduces loss.
+So the capability gap is closed — you can fine-tune a **small** imported model. But
+training a **1B** model remains blocked two independent ways, **either fatal**:
+
+1. 🔴 **Optimizer state does not fit.** At ~16 bytes/param, a 1B model needs **~16
+   GB** for f32 weights + gradients + Adam moments — the whole RAM budget, before a
+   single activation or minibatch. (`LlamaTrainer::new` requires f32 masters, for
+   exactly this reason.)
+2. 🔴 **Compute is off by orders of magnitude.** A *tiny-by-LLM-standards* 100M-token
+   pass over a 1B model is ~6×10¹⁷ FLOPs → **~200 days** at ~36 GFLOP/s. Real
+   pretraining (trillions of tokens) is astronomically further out.
+
+For Ferrum's **own** trainable architecture the practical ceiling is far below 1B:
+
+| Budget | `P × token-forwards` ≲ | Practical model |
+|---|---:|---|
+| ~15 min | ~10¹² | ~1 M params, small corpus |
+| Overnight (~8 h) | ~3×10¹³ | ~1–2 M params, ≤1 MB corpus |
+| Multi-day | ~10¹⁴ | ~5–8 M params, small corpus |
+
+**Aim for ≤ ~2 M trainable params on this machine; ~8 M is the patient upper bound.**
+"Train a 1B model" is outside the design by 3–5 orders of magnitude on every axis.
+
+### 4.4 One-line summary of §4
+
+> **Load:** yes for supported-quant 1–3B, with a lossy double-quant and an f32
+> embedding resident. **Run:** yes but slow (~30 s prefill, ~7 tok/s int4 decode).
+> **Train/fine-tune:** small models yes; **1B no** — not for RAM, not for compute.
+
+---
+
+## 5. What works today (verified this session)
+
+`cargo build --workspace` is clean and `cargo test --workspace` is **green and
+warning-free**: **342** `ferrum_core` unit tests, **95** integration tests, **4**
+WASM, **2** doc-tests — **443 tests, 0 failures, 0 warnings** (plus **14**
+`ferrum_gui` backend tests in the excluded crate → 457 total).
+
+- **All four training paths** (`train` one-hot MLP, `train_embedded`,
+  `train_transformer`, threaded transformer) train and reduce loss; threaded training
+  is bit-identical to serial at one shard.
+- **QAT + int8 (per-tensor and per-channel) + int4 (split-half)** round-trip through
+  FINF v4/v5 with bounded drift.
+- **KV-cached generation** (native + WASM, char + BPE) matches a full forward in the
+  context window; sampling has top-k / top-p / repetition-penalty controls.
+- **Determinism, re-verified:** generation output is byte-identical across thread
+  counts; training is byte-identical for a fixed configuration and when only the
+  matmul pool varies (the data-parallel shard count, being a different
+  floating-point summation grouping, may change the low bits — deterministic per
+  shard count, identical to serial at one shard).
+- **GGUF import + Llama/Qwen2 decode + a synthetic end-to-end generate** run, with the
+  cached path cross-checked against the full forward; the `llm_train` backward pass is
+  finite-difference-checked.
+
+---
+
+## 6. Subsystem review
 
 | Subsystem | File(s) | State | Notes |
 |---|---|---|---|
-| Tensors / ops | `tensor.rs`, `ops.rs` | ✅ Solid | Row-major f32, parallel matmul variants; high coverage. |
-| Activations / loss | `activation.rs`, `loss.rs` | ✅ Solid | Softmax-CE with stable log-sum-exp; MSE. |
-| Layers | `layer.rs` | ✅ Solid | Linear, LayerNorm, Embedding (+`embed_one`), causal MHA, `KvCache`, `forward_with_cache`. |
-| Optimizers | `optim.rs` | ✅ Strong | SGD+momentum, Adam, **global-norm grad clipping**, **warmup+cosine/linear LR schedule**. |
-| MLP trainer | `train.rs` | ✅ Solid | One-hot + embedded LM MLP, QAT, grad clip, shuffle-without-replacement. |
-| Transformer trainer | `train_transformer.rs` | ✅ Strong | Full backprop; **data-parallel sharing read-only weights** (no per-shard clone); **weight tying**; **checkpoint/resume**; per-channel QAT. Largest, best-covered module. |
-| SLM API | `slm.rs` | ✅ Strong | Train/generate/evaluate; **KV-cached** generation; **top-k/top-p/repetition penalty**; **validation+early-stop**. |
-| Quantization | `quant.rs` | ✅ Strong | Per-tensor **and per-channel** int8 (outlier isolation). |
-| Tokenizer | `tokenizer.rs` | ✅ Strong | Byte-level BPE, **whitespace pre-tokenization**, **rank-based encode**. |
-| Serialization | `loader.rs` | ✅ Strong | FINF v4/v5; per-vector encoding markers incl. **per-channel int8**. |
-| CSV / dataset | `csv.rs`, `dataset.rs` | ✅ Solid | Parsing, normalization, corpus cleaning. |
-| Concurrency | `parallel.rs` | ✅ Solid | std-thread pool; dynamic core detection; deterministic. |
-| WASM | `tabular_wasm` | ✅ Works | KV-cached `TransformerSLMModel`; now CI-built for `wasm32`. |
-| CLIs | `slm_cli`, `train_cli` | ✅ Works | Not exercised by automated tests (0% coverage — see Metrics). |
-| GUI | `ferrum_gui` | ✅ Works | Tauri + vanilla JS; backend command tests + a Node UI test; CI job added. |
+| Tensors / ops | `tensor.rs`, `ops.rs` | ✅ Solid | f32 row-major; fused+cache-tiled `linear_forward`; `qlinear` (int4/int8, column-split GEMV). |
+| Quantization | `quant.rs` | ✅ Strong | per-tensor & per-channel int8 QAT; `QWeight` in-memory int4/int8 consumed packed; int4 split-half. |
+| Parallelism | `parallel.rs` | ✅ Solid | persistent std worker pool; row split + column split (`run_1d`); deterministic; serial on wasm. |
+| Layers | `layer.rs` | ✅ Solid | `Linear` carries optional `Arc<QWeight>`; LayerNorm, Embedding, causal MHA, `KvCache`. |
+| Optimizers | `optim.rs` | ✅ Strong | SGD+momentum, Adam, **AdamW** decay, global-norm clip, warmup+cosine/linear schedule. |
+| MLP / Transformer trainers | `train.rs`, `train_transformer.rs` | ✅ Strong | full backprop; data-parallel epoch; FFN dropout; weight tying; checkpoint/resume; per-channel QAT. |
+| SLM API | `slm.rs` | ✅ Strong | train/generate/evaluate; KV-cached; sampling controls; validation+early-stop; streaming. |
+| Tokenizer | `tokenizer.rs` | ✅ Strong | byte-level BPE, whitespace pre-tok, rank-based encode, special tokens. |
+| Serialization | `loader.rs` | ✅ Strong | FINF v4/v5; per-vector f32 / int8 / int4 (per-tensor & per-channel); bounds-checked. |
+| **GGUF reader** | `gguf.rs` | ✅ Real, partial coverage | legacy + **Q4_K/Q5_K/Q6_K**; streamed `open`; tokenizer-adjacent metadata parsed; **no Q2_K/Q3_K/IQ**. (§3) |
+| **GGUF tokenizer** | `gguf_tokenizer.rs` | ✅ Solid | BPE exact, SPM decode exact / encode greedy. |
+| **Llama/Qwen runner** | `llm.rs` | ✅ Correct | RMSNorm/RoPE/GQA/SwiGLU, cached decode == full forward; lossy import. |
+| **LLM training** | `llm_train.rs` | ✅ New | gradient-checked backprop + SGD `train_step`; rejects quantized. |
+| CSV / dataset | `csv.rs`, `dataset.rs` | ✅ Solid | parsing, normalization, corpus cleaning. |
+| WASM | `tabular_wasm` | ✅ Works | KV-cached SLM; CI-built for wasm32; no GGUF. |
+| CLIs | `slm_cli`, `train_cli` | ✅ Works | `slm_cli` has **`run-gguf`** + `--weight_decay`/`--dropout`/`--stream`; binaries not unit-tested. |
+| GUI | `ferrum_gui` | ✅ Backend checks | Tauri + vanilla JS; **GGUF panel** (`gguf_info`/`run_gguf`); windowed build needs WebView libs. |
 
 ---
 
-## 5. Recently hardened (closed gaps)
+## 7. Remaining gaps & recommendations
 
-The following items from the prior review have been implemented and tested:
+**GGUF/LLM — finish the runner:**
 
-- **T1 — gradient clipping** (global-norm) in all training loops.
-- **T2 — LR schedule** (linear warmup + cosine/linear decay).
-- **T3 — data-parallel memory fix:** workers borrow read-only weights and
-  allocate only a flat gradient buffer instead of deep-cloning the whole net.
-- **T4 — true epochs:** per-epoch Fisher–Yates shuffle, minibatches drawn
-  without replacement.
-- **T5 — validation split + early stopping + best-epoch checkpoint.**
-- **T6 — checkpoint/resume** of full training state (weights, Adam moments, step,
-  RNG); bit-identical resume.
-- **T9 — weight tying** (embedding ↔ LM head) with a verified folded gradient.
-- **I1 — KV cache wired into native generation** (char + BPE), O(context)/token.
-- **I2 — sampling controls:** top-k, top-p (nucleus), repetition penalty.
-- **§7 — per-channel int8 quantization** end-to-end (QAT + FINF v5 marker).
-- **K1 — rank-based BPE encode**; **K2 — whitespace pre-tokenization.**
-- **G1 — streamed-generation tail reconciliation; G2 — HTTP download timeouts.**
-- **X1 — GUI backend + UI tests and a dedicated CI job; X2 — wasm32 CI build.**
+- 🟡 **Close the last int4↔int8 decode gap.** int4 is now ~4–5× f32 and within ~1.5×
+  of int8's per-call time at half the RAM; a SIMD/LUT nibble unpack could make int4
+  strictly fastest (the kernels carry no explicit SIMD at all — see §3a / benchmarks
+  §3a, the broader headroom).
+- 🟡 **Remaining quant formats** (`Q2_K`, `Q3_K`, `IQ*`) and **exact SPM encode**
+  (unigram Viterbi) — widen the set of files that load and tokenize correctly.
+- 🟡 **Finer import quantization** (per-block scales in `QWeight`) — reduce the
+  double-quant quality loss without paying full f32 RAM.
+- 🟢 **A training CLI/loop + AdamW for `llm_train`.** The backward pass + SGD step
+  exist and are gradient-checked; batching, an AdamW path, and a `fine-tune` command
+  would make small-model fine-tuning ergonomic.
 
----
+**Engine quality:**
 
-## 6. Remaining gaps & recommendations
-
-**Quality / training:**
-
-- 🟡 **T7 — no weight decay (AdamW) / dropout / regularization.** With small
-  corpora the model memorizes (train-perplexity ≈ 1.0 vs held-out ≈ 3.7). Adding
-  AdamW-style decoupled weight decay and optional dropout would improve
-  generalization. _Recommended next._
-- 🟢 **T8 — embedded & one-hot paths are single-threaded** (only the transformer
-  has the data-parallel epoch).
-- 🟢 **T10 — whole corpus tokenized into RAM**; no streaming/chunked dataset.
-
-**Inference:**
-
-- 🟡 **I3 — no EOS / stop criterion** (and **K3 — no BOS/EOS/PAD/UNK special
-  tokens**). Generation always runs the full character budget; multi-document
-  corpora have no separator. These two are best done together.
-- 🟢 **I4 — probabilities are softmaxed in-model then `ln()`-ed back** for
-  temperature; exposing raw logits from the head would avoid the `1e-12` floor.
-- 🟢 **I5 — no batched generation** (one sequence at a time).
-
-**Tokenization:**
-
-- 🟢 Pre-tokenization splits on whitespace only; GPT-2 additionally splits
-  punctuation and attaches leading spaces to words. A small refinement.
-
-**Testing / CI / GUI:**
-
-- 🟢 **X3 — no fuzz/adversarial tests** for the loader & tokenizer `from_state`
-  beyond the existing negative cases.
-- 🟢 **X4 — integration tests are slow** (the BPE suite trains in debug, ~50 s).
-  Consider tinier configs or a `--release` test profile.
-- 🟢 **CLIs are untested** (`slm_cli`, `train_cli` at 0% coverage); a couple of
-  end-to-end smoke tests would catch argument/wiring regressions.
-- 🟢 Minor GUI items remain (process-wide verbose flag, basic embedded shell
-  semantics, CSP disabled for local use).
-
-None of these block the current, working workflow; they are the path to larger,
-higher-quality local models and tighter CI.
-
----
-
-## 7. Maximum SLM size on this machine
-
-Unchanged by the recent work (these are compute-bound limits):
-
-| Budget | `P × token-forwards` ≤ | Example |
-|-------|-----------------------:|---------|
-| ~15 min | ~1 × 10¹² | 1 M params × (small corpus, few epochs) |
-| Overnight (~8 h) | ~3 × 10¹³ | ~1–2 M params on a ≤1 MB corpus, tens of epochs |
-| Multi-day | ~10¹⁴ | ~5–8 M params, small corpus only |
-
-**Practical answer:** aim for **≤ ~2 M parameters** for comfortable local
-training and responsive generation; **~8 M is the upper bound** for patient,
-small-corpus runs. The **T3 memory fix** removed the ~8× per-shard blow-up, so
-threaded training is no longer the memory ceiling it once was; the **I1 KV
-cache** makes generation O(context) per token.
+- 🟢 **CLI smoke tests + `wasm-bindgen-test`** — the two biggest coverage gaps;
+  `run-gguf` has an end-to-end library test but no binary-level test, and the GUI
+  GGUF commands have none.
+- 🟢 **Explicit SIMD** in the hot kernels would unlock the idle vector units (§3a).
 
 ---
 
 ## 8. Metrics
 
-_Generated 2026-06-21 from the working tree (excludes `target/`)._
+_Generated 2026-06-23 from the working tree (excludes `target/`)._
 
 ### 8a. Codebase size
 
 | Metric | Value |
 |---|---:|
 | Workspace crates | **6** (5 in-workspace + `ferrum_gui` excluded) |
-| Rust source files | **37** |
-| Rust lines of code (incl. tests) | **14,861** |
-| └ `ferrum_core` | 11,101 |
-| └ `tests` (integration) | 1,858 |
-| └ `ferrum_gui` (Rust) | 773 |
-| └ `slm_cli` / `train_cli` | 436 / 253 |
-| └ `tabular_wasm` | 440 |
-| `ferrum_core` library modules | **19** (+ `lib.rs`) |
-| JavaScript (GUI frontend) | 5 files, 1,081 lines |
-| HTML/CSS (GUI) | 4 files |
-| Markdown docs | 17 files |
+| `ferrum_core` source files | **24** |
+| `ferrum_core` lines (incl. unit tests) | **16,695** |
+| GGUF/LLM modules | `gguf.rs` 1,526 · `llm.rs` 799 · `gguf_tokenizer.rs` 505 · `llm_train.rs` 821 |
+| Markdown docs | 26 files |
 
 ### 8b. API surface & code health (`ferrum_core`)
 
 | Metric | Value |
 |---|---:|
-| `pub fn` | **198** |
-| `pub struct` / `pub enum` / `pub trait` | 32 / 4 / 1 |
-| Total `fn` (workspace) | 764 |
-| Doc-comment lines (`///`) | 845 |
+| `pub fn` | **279** |
+| `pub struct` / `pub enum` | 45 / 8 |
 | External dependencies | **0** (`std` only) |
-| `unsafe` blocks | **0** (`#![forbid(unsafe_code)]`) |
-| FINF format versions | v4 (f32), v5 (int8 per-tensor + per-channel) |
+| `unsafe` blocks | **0** (`#![forbid(unsafe_code)]` at `lib.rs:51`) |
+| Model formats | FINF v4/v5 (int8 & int4, per-tensor/per-channel); **reads** GGUF v2/v3 (F32/F16/Q8_0/Q8_1/Q4_0/Q4_1/**Q4_K/Q5_K/Q6_K**) |
 
 ### 8c. Tests
 
-| Suite | `#[test]` functions |
-|---|---:|
-| `ferrum_core` (unit) | **249** |
-| `tests` crate (integration) | **94** |
-| `tabular_wasm` | 4 |
-| `ferrum_gui` (backend) | 4 |
-| **Total Rust tests** | **351** |
-| Node UI test (`stream.test.js`) | 1 file, 9 assertions |
-
-All 351 Rust tests pass; native workspace build is warning-free.
-
----
-
-## 9. Code coverage (llvm-cov)
-
-Generated with `cargo llvm-cov --workspace --summary-only`. This is the
-Markdown translation of the llvm-cov HTML report. `ferrum_gui` is excluded (it is
-not part of the workspace and is covered by its own CI job); the CLI binaries
-show 0% because their `main()` entry points are not driven by automated tests.
-
-### 9a. Totals
-
-| Metric | Covered | Total | Coverage |
-|---|---:|---:|---:|
-| **Lines** | 7,017 | 8,151 | **86.09%** |
-| **Regions** | 14,602 | 17,131 | **85.24%** |
-| **Functions** | 811 | 943 | **86.00%** |
-
-### 9b. Per-file
-
-| File | Regions | Region cov. | Functions | Function cov. | Lines | Line cov. |
-|---|---:|---:|---:|---:|---:|---:|
-| `ferrum_core/src/activation.rs` | 124 | 92.74% | 13 | 100.00% | 73 | 94.52% |
-| `ferrum_core/src/csv.rs` | 1210 | 92.56% | 82 | 84.15% | 658 | 92.86% |
-| `ferrum_core/src/dataset.rs` | 319 | 98.43% | 26 | 100.00% | 201 | 98.01% |
-| `ferrum_core/src/error.rs` | 114 | 98.25% | 13 | 100.00% | 61 | 100.00% |
-| `ferrum_core/src/layer.rs` | 1861 | 89.90% | 106 | 94.34% | 859 | 92.67% |
-| `ferrum_core/src/loader.rs` | 1613 | 91.51% | 67 | 89.55% | 667 | 94.15% |
-| `ferrum_core/src/loss.rs` | 327 | 87.77% | 11 | 100.00% | 173 | 85.55% |
-| `ferrum_core/src/model.rs` | 182 | 88.46% | 19 | 100.00% | 89 | 95.51% |
-| `ferrum_core/src/ops.rs` | 536 | 97.20% | 32 | 100.00% | 236 | 97.03% |
-| `ferrum_core/src/optim.rs` | 502 | 95.02% | 25 | 100.00% | 241 | 96.68% |
-| `ferrum_core/src/parallel.rs` | 181 | 92.27% | 13 | 100.00% | 100 | 91.00% |
-| `ferrum_core/src/quant.rs` | 294 | 99.66% | 26 | 100.00% | 140 | 99.29% |
-| `ferrum_core/src/rng.rs` | 191 | 92.67% | 23 | 91.30% | 100 | 91.00% |
-| `ferrum_core/src/slm.rs` | 2236 | 88.77% | 107 | 90.65% | 1214 | 89.95% |
-| `ferrum_core/src/tensor.rs` | 161 | 96.27% | 20 | 95.00% | 93 | 96.77% |
-| `ferrum_core/src/tokenizer.rs` | 562 | 96.44% | 43 | 97.67% | 262 | 96.56% |
-| `ferrum_core/src/train.rs` | 1472 | 89.67% | 81 | 95.06% | 691 | 91.75% |
-| `ferrum_core/src/train_transformer.rs` | 3538 | 96.50% | 130 | 98.46% | 1485 | 97.98% |
-| `ferrum_core/src/verbose.rs` | 83 | 6.02% | 9 | 11.11% | 51 | 5.88% |
-| `slm_cli/src/main.rs` | 554 | 0.00% | 28 | 0.00% | 291 | 0.00% |
-| `tabular_wasm/src/lib.rs` | 648 | 44.44% | 57 | 33.33% | 297 | 37.71% |
-| `train_cli/src/main.rs` | 423 | 0.00% | 12 | 0.00% | 169 | 0.00% |
-| **TOTAL** | **17131** | **85.24%** | **943** | **86.00%** | **8151** | **86.09%** |
-
-### 9c. Coverage notes
-
-- The **engine modules** (`ferrum_core`) are well covered: the two largest and
-  most safety-critical — `train_transformer.rs` (97.98% lines) and `loader.rs`
-  (94.15% lines) — are among the best tested. `quant.rs` is at 99.29%.
-- `verbose.rs` (5.88%) is logging plumbing gated behind a runtime flag that tests
-  leave off — low value to cover.
-- The two **CLI binaries** (0%) and `tabular_wasm` (37.71%) drag the workspace
-  total down; their logic is thin wrappers over the well-covered core, but a few
-  end-to-end smoke tests (CLIs) and a `wasm-bindgen-test` pass (WASM) would lift
-  these and guard the integration seams.
+| Suite | `#[test]` functions | Result |
+|---|---:|---|
+| `ferrum_core` (unit) | **342** | ✅ pass |
+| └ `gguf` / `llm` / `gguf_tokenizer` / `llm_train` | 26 / 17 / 6 / 6 | ✅ pass |
+| `tests` crate (integration) | **95** (incl. `test_gguf_llm`) | ✅ pass |
+| `tabular_wasm` | 4 | ✅ pass |
+| doc-tests | 2 | ✅ pass |
+| **Workspace total** | **443** | **0 failures, 0 warnings** |
+| `ferrum_gui` (backend, excluded crate) | 14 | ✅ pass / `cargo check` clean |
 
 ---
 
-## 10. Prioritized recommendations
+## 9. Prioritized recommendations
 
-1. **AdamW weight decay + optional dropout (T7)** — the biggest remaining quality
-   lever for small-corpus generalization.
-2. **EOS / special tokens (I3 + K3)** — natural stopping and document boundaries.
-3. **CLI smoke tests + `wasm-bindgen-test`** — close the two biggest coverage
-   gaps and the untested integration seams.
-4. **Faster test profile (X4)** and **loader/tokenizer fuzzing (X3)** — CI
-   ergonomics and hardening.
-5. **Streaming dataset (T10)** and **threaded MLP epoch (T8)** — only if you push
-   toward larger corpora/models.
+1. **Explicit SIMD / LUT int4 unpack** — the single biggest speed lever left; the
+   kernels are scalar, and int4 decode would become strictly fastest.
+2. **Q2_K/Q3_K/IQ\* dequantizers** and **exact SPM encode** — widen the files that
+   load and tokenize correctly.
+3. **Finer import quantization** (per-block scales in `QWeight`) — cut the
+   double-quant quality loss.
+4. **CLI/WASM smoke tests** — close the remaining integration-seam coverage gap (the
+   engine and GGUF primitives are well covered; the binaries are not).
 
-The engine is in good shape: correct, dependency-free, reproducible, and
-well-tested. The path forward is generalization (regularization), generation
-ergonomics (stop tokens), and lifting coverage on the thin outer layers.
+The engine remains what it has always been at its core: correct, dependency-free,
+reproducible, and well-tested for **small models you train yourself**. The GGUF/LLM
+work is a genuinely usable importer — k-quants load, the tokenizer comes across,
+`run-gguf` and a GUI panel drive it, the int4 kernel is fixed (~7 tok/s, ~4–5× f32),
+and the architecture is now **trainable** (gradient-checked). On this hardware it is
+a few-tok/s inference path for 1–3B models and a fine-tuner for *small* ones — but
+training a 1B specifically is still out of reach (RAM + compute, §4.3).

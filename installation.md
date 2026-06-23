@@ -1,20 +1,25 @@
 # Installation
 
-Ferrum is a Cargo workspace of pure-Rust crates with **no external
-dependencies** in the core engine. If you can run `cargo`, you can build Ferrum.
+Ferrum is a Cargo workspace of pure-Rust crates with **no external dependencies**
+in the core engine. If you can run `cargo`, you can build Ferrum — there is no
+Python, no CUDA toolkit, no BLAS, and no system ML library to install. The
+practical upshot: a clean checkout resolves zero third-party crates for
+`ferrum_core` and both CLIs, so builds are fast and reproducible and there is
+nothing to vet for supply-chain risk.
 
 ## Requirements
 
-| Requirement | Version                | Notes                                            |
-|-------------|------------------------|--------------------------------------------------|
-| Rust        | 1.74+ (stable)         | Edition 2021; install via [rustup](https://rustup.rs) |
-| Cargo       | ships with Rust        | Used for all builds and tests                    |
-| OS          | Linux / macOS / Windows | Pure CPU; no platform-specific code             |
-| WASM target | `wasm32-unknown-unknown` | Only needed for the browser playground (`tabular_wasm`) |
+| Requirement | Version                  | Notes                                                  |
+|-------------|--------------------------|--------------------------------------------------------|
+| Rust        | 1.74+ (stable)           | Edition 2021; install via [rustup](https://rustup.rs)  |
+| Cargo       | ships with Rust          | Used for all builds, tests, and benchmarks             |
+| OS          | Linux / macOS / Windows  | Pure CPU; no platform-specific code                    |
+| WASM target | `wasm32-unknown-unknown` | Only for the browser playground (`tabular_wasm`)       |
 
-The only crate that pulls a third-party dependency is `tabular_wasm`, which uses
-`wasm-bindgen` for browser bindings. The engine itself (`ferrum_core`) and both
-command-line tools build with zero external crates.
+The only crate that pulls a third-party dependency is `tabular_wasm`
+(`wasm-bindgen`). The engine (`ferrum_core`) and both command-line tools build
+with zero external crates. The desktop GUI (`ferrum_gui`) is a separate Tauri app
+with its own, heavier prerequisites — see [ferrum_gui/README.md](ferrum_gui/README.md).
 
 ## Clone and build
 
@@ -25,7 +30,8 @@ cargo build --workspace --release
 ```
 
 The release profile enables LTO and a single codegen unit for the smallest,
-fastest binaries.
+fastest binaries. Use it for any real training or for running GGUF models —
+debug builds are several times slower.
 
 ## Verify the install
 
@@ -41,21 +47,26 @@ cargo run -p slm_cli -- train /tmp/corpus.txt /tmp/model.bin --epochs 50 --vocab
 cargo run -p slm_cli -- info /tmp/model.bin
 ```
 
-## Using `ferrum_core` as a dependency
+You can also run the std-only matmul/decode microbenchmark (no Criterion, no
+external deps):
 
-To use the engine from your own crate, add a path or git dependency:
+```bash
+cargo bench --bench gemm                       # auto-detected threads
+FERRUM_NUM_THREADS=1 cargo bench --bench gemm   # force serial
+```
+
+## Using `ferrum_core` as a dependency
 
 ```toml
 [dependencies]
 ferrum_core = { git = "https://github.com/thomascherickal/Ferrum" }
 ```
 
-`ferrum_core` is `#![forbid(unsafe_code)]` and `std`-only, so it imposes no
-transitive dependencies on your project.
+`ferrum_core` is `#![forbid(unsafe_code)]` and `std`-only, so it adds **no**
+transitive dependencies to your project — a rare property for an ML crate, and
+the main reason it drops cleanly into audited, embedded, or air-gapped builds.
 
 ## Building the WebAssembly playground
-
-Install the WASM target and `wasm-pack` (or use `cargo build --target`):
 
 ```bash
 rustup target add wasm32-unknown-unknown
@@ -64,7 +75,9 @@ cd tabular_wasm
 wasm-pack build --release --target web
 ```
 
-See [deployment.md](deployment.md) for how to host the resulting bundle.
+This emits a `pkg/` directory (the `.wasm` module + JS glue) that runs entirely
+client-side. See [deployment.md](deployment.md) for hosting it. (The WASM build
+runs serially — `wasm32` has no threads — but is otherwise the same engine.)
 
 ## Installing the CLIs
 
@@ -72,3 +85,6 @@ See [deployment.md](deployment.md) for how to host the resulting bundle.
 cargo install --path slm_cli    # installs the `train_transformer` binary
 cargo install --path train_cli  # installs the `train_cli` binary
 ```
+
+The `slm_cli` binary is named `train_transformer`; it also hosts the `run-gguf`
+subcommand for importing external Llama/Qwen GGUF checkpoints.

@@ -8,7 +8,8 @@
 
 use crate::AppState;
 use ferrum_core::{
-    clean_corpus, corpus_stats, validate_for_training, CleanOptions, GenerativeSLM, Rng, TaskType,
+    clean_corpus, corpus_stats, validate_for_training, CleanOptions, GenerativeSLM, Gguf,
+    GgufTokenizer, QKind, Rng, SamplingParams, TaskType,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read};
@@ -496,6 +497,223 @@ pub fn model_info(path: String) -> Result<ModelInfo, String> {
         tokenizer,
         merges,
         layers: slm.model.len(),
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5b. GGUF import & run (Llama/Qwen checkpoints)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Map a UI quant string to an import precision (`None` = keep f32).
+fn parse_quant(q: &str) -> Result<Option<QKind>, String> {
+    match q {
+        "int4" | "q4" => Ok(Some(QKind::Int4)),
+        "int8" | "q8" => Ok(Some(QKind::Int8)),
+        "f32" | "none" => Ok(None),
+        other => Err(format!("quant must be int4 | int8 | f32 (got '{other}')")),
+    }
+}
+
+/// Estimate resident bytes for a loaded model from the GGUF directory: the token
+/// embedding stays f32, everything else packs to the chosen precision.
+fn gguf_resident_bytes(g: &Gguf, prec: Option<QKind>) -> usize {
+    let mut total = 0usize;
+    for t in &g.tensors {
+        let n = t.num_elements();
+        let bytes = if t.name == "token_embd.weight" {
+            n * 4
+        } else {
+            match prec {
+                Some(QKind::Int4) => n.div_ceil(2),
+                Some(QKind::Int8) => n,
+                None => n * 4,
+            }
+        };
+        total = total.saturating_add(bytes);
+    }
+    total
+}
+
+/// Best-effort available RAM (Linux `/proc/meminfo`); `None` elsewhere.
+fn available_memory_bytes() -> Option<usize> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in info.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            return rest.split_whitespace().next()?.parse::<usize>().ok().map(|kb| kb * 1024);
+        }
+    }
+    None
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GgufInfo {
+    pub path: String,
+    pub bytes: u64,
+    pub version: u32,
+    pub architecture: String,
+    pub num_tensors: usize,
+    pub model_dim: usize,
+    pub n_layers: usize,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub vocab_size: usize,
+    pub tokenizer: String,
+    /// Whether `run_gguf` can execute this file (arch llama/qwen2).
+    pub runnable: bool,
+    pub note: String,
+    pub est_int4_mb: f64,
+    pub est_int8_mb: f64,
+    pub est_f32_mb: f64,
+    pub avail_mb: Option<f64>,
+}
+
+/// Inspect a GGUF file without loading its weights (streamed header parse).
+#[tauri::command]
+pub async fn gguf_info(path: String) -> Result<GgufInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let g = Gguf::open(&path).map_err(|e| format!("cannot open {path}: {e}"))?;
+        let arch = g.architecture().unwrap_or("?").to_string();
+        let meta_usize = |k: &str| g.meta(k).and_then(|v| v.as_usize()).unwrap_or(0);
+        let dim = meta_usize(&format!("{arch}.embedding_length"));
+        let n_layers = meta_usize(&format!("{arch}.block_count"));
+        let n_heads = meta_usize(&format!("{arch}.attention.head_count"));
+        let n_kv = g
+            .meta(&format!("{arch}.attention.head_count_kv"))
+            .and_then(|v| v.as_usize())
+            .unwrap_or(n_heads);
+        let vocab = g
+            .tensor("token_embd.weight")
+            .filter(|t| t.dims.len() == 2)
+            .map(|t| t.dims[1] as usize)
+            .unwrap_or_else(|| meta_usize(&format!("{arch}.vocab_size")));
+        let tokenizer = match GgufTokenizer::from_gguf(&g) {
+            Ok(t) => format!("{:?} ({} tokens)", t.model(), t.vocab_size()),
+            Err(_) => "none in file (use token IDs)".to_string(),
+        };
+        let runnable = arch == "llama" || arch == "qwen2";
+        let note = if !runnable {
+            format!("architecture '{arch}' is not runnable (llama / qwen2 only)")
+        } else {
+            "decode is a few tok/s on CPU; prefer int8 for speed, int4 for memory".to_string()
+        };
+        let mb = |b: usize| b as f64 / 1e6;
+        Ok(GgufInfo {
+            path: path.clone(),
+            bytes,
+            version: g.version,
+            architecture: arch,
+            num_tensors: g.tensors.len(),
+            model_dim: dim,
+            n_layers,
+            n_heads,
+            n_kv_heads: n_kv,
+            vocab_size: vocab,
+            tokenizer,
+            runnable,
+            note,
+            est_int4_mb: mb(gguf_resident_bytes(&g, Some(QKind::Int4))),
+            est_int8_mb: mb(gguf_resident_bytes(&g, Some(QKind::Int8))),
+            est_f32_mb: mb(gguf_resident_bytes(&g, None)),
+            avail_mb: available_memory_bytes().map(mb),
+        })
+    })
+    .await
+    .map_err(|e| format!("task error: {e}"))?
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GgufRunParams {
+    pub model_path: String,
+    pub prompt: String,
+    pub quant: String,
+    pub max_new: usize,
+    pub temp: f32,
+    pub gen_seed: Option<u64>,
+    /// Raw space-separated token IDs (used when the file has no tokenizer).
+    pub ids: Option<String>,
+    /// Load even if the memory estimate exceeds available RAM.
+    pub force: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GgufRunResult {
+    pub text: String,
+    pub prompt_tokens: usize,
+    pub generated: usize,
+    pub seconds: f32,
+    pub tokens_per_sec: f32,
+}
+
+/// Import a llama/qwen2 GGUF and generate from it (mirrors `slm_cli run-gguf`).
+#[tauri::command]
+pub async fn run_gguf(params: GgufRunParams) -> Result<GgufRunResult, String> {
+    tauri::async_runtime::spawn_blocking(move || gguf_run_inner(params))
+        .await
+        .map_err(|e| format!("task error: {e}"))?
+}
+
+fn gguf_run_inner(p: GgufRunParams) -> Result<GgufRunResult, String> {
+    if !(p.temp.is_finite() && p.temp > 0.0) {
+        return Err("temperature must be a positive number".into());
+    }
+    let prec = parse_quant(&p.quant)?;
+    let g = Gguf::open(&p.model_path).map_err(|e| format!("cannot open {}: {e}", p.model_path))?;
+
+    // Memory guard before the (potentially large) load.
+    let est = gguf_resident_bytes(&g, prec);
+    if let Some(avail) = available_memory_bytes() {
+        if (est as f64) > 0.9 * avail as f64 && !p.force {
+            return Err(format!(
+                "estimated resident memory ({:.2} GB) exceeds 90% of available ({:.2} GB) — \
+                 choose a smaller quant or enable 'load anyway'.",
+                est as f64 / 1e9,
+                avail as f64 / 1e9
+            ));
+        }
+    }
+
+    let tok = GgufTokenizer::from_gguf(&g).ok();
+    let model = g.load_llama_prec(prec).map_err(|e| format!("cannot load model: {e}"))?;
+
+    let prompt_ids: Vec<usize> = if let Some(ids) = p.ids.as_ref().filter(|s| !s.trim().is_empty()) {
+        ids.split_whitespace().filter_map(|s| s.parse().ok()).collect()
+    } else if let Some(t) = &tok {
+        let mut v = Vec::new();
+        if let Some(bos) = t.bos() {
+            v.push(bos);
+        }
+        v.extend(t.encode(&p.prompt));
+        v
+    } else {
+        return Err("this GGUF has no tokenizer; enter space-separated token IDs instead".into());
+    };
+    if prompt_ids.is_empty() {
+        return Err("empty prompt — enter text (with a tokenizer) or token IDs".into());
+    }
+
+    let mut rng = Rng::new(p.gen_seed.unwrap_or_else(time_seed));
+    let params = SamplingParams::with_temperature(p.temp);
+    let eos = tok.as_ref().and_then(GgufTokenizer::eos);
+    let t0 = std::time::Instant::now();
+    let out = model
+        .generate(&prompt_ids, p.max_new, &params, eos, &mut rng)
+        .map_err(|e| format!("generation failed: {e}"))?;
+    let seconds = t0.elapsed().as_secs_f32();
+
+    let text = match &tok {
+        Some(t) => format!("{}{}", p.prompt, t.decode(&out)),
+        None => out.iter().map(usize::to_string).collect::<Vec<_>>().join(" "),
+    };
+    Ok(GgufRunResult {
+        text,
+        prompt_tokens: prompt_ids.len(),
+        generated: out.len(),
+        tokens_per_sec: out.len() as f32 / seconds.max(1e-6),
+        seconds,
     })
 }
 

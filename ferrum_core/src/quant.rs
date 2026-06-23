@@ -134,7 +134,11 @@ pub struct QWeight {
     /// One scale per row (length `rows`).
     pub scales: Vec<f32>,
     /// Packed quantized values. Int8: `rows × cols` bytes (each an `i8`). Int4:
-    /// `rows × ceil(cols/2)` bytes, low nibble first within each byte.
+    /// `rows × ceil(cols/2)` bytes in a **split-half** layout — within each row,
+    /// byte `b`'s low nibble holds column `b` and its high nibble holds column
+    /// `half + b` (`half = ceil(cols/2)`). This maps the two nibble lanes onto two
+    /// *contiguous* column ranges, so int4 decode is unit-stride and vectorises
+    /// like int8 (the interleaved "even/odd in one byte" layout did not).
     pub q: Vec<u8>,
 }
 
@@ -174,7 +178,8 @@ impl QWeight {
                 q
             }
             QKind::Int4 => {
-                let row_bytes = cols.div_ceil(2);
+                let half = cols.div_ceil(2);
+                let row_bytes = half;
                 let mut q = vec![0u8; rows * row_bytes];
                 for r in 0..rows {
                     let row = &data[r * cols..(r + 1) * cols];
@@ -183,13 +188,16 @@ impl QWeight {
                     scales.push(scale);
                     let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
                     let dst = &mut q[r * row_bytes..(r + 1) * row_bytes];
+                    // Split-half: column c<half → byte c low nibble; column
+                    // c≥half → byte (c-half) high nibble. Keeps each nibble lane
+                    // on a contiguous column range (see the `q` field docs).
                     for (c, &v) in row.iter().enumerate() {
                         let qi = (v * inv).round().clamp(-INT4_MAX, INT4_MAX) as i32;
                         let nib = (qi & 0x0F) as u8;
-                        if c & 1 == 0 {
-                            dst[c >> 1] = (dst[c >> 1] & 0xF0) | nib;
+                        if c < half {
+                            dst[c] = (dst[c] & 0xF0) | nib;
                         } else {
-                            dst[c >> 1] = (dst[c >> 1] & 0x0F) | (nib << 4);
+                            dst[c - half] = (dst[c - half] & 0x0F) | (nib << 4);
                         }
                     }
                 }
@@ -217,11 +225,12 @@ impl QWeight {
                 }
             }
             QKind::Int4 => {
+                let half = self.cols.div_ceil(2);
                 let rb = self.row_bytes();
                 let src = &self.q[r * rb..(r + 1) * rb];
+                // Split-half layout (see the `q` field docs).
                 for c in 0..self.cols {
-                    let byte = src[c >> 1];
-                    let nib = if c & 1 == 0 { byte & 0x0F } else { byte >> 4 };
+                    let nib = if c < half { src[c] & 0x0F } else { src[c - half] >> 4 };
                     out[c] = Self::nibble_to_i8(nib) as f32 * scale;
                 }
             }

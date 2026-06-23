@@ -28,6 +28,7 @@
     <button class="tab" data-tab="generate">Generate</button>
     <button class="tab" data-tab="evaluate">Evaluate</button>
     <button class="tab" data-tab="models">Models</button>
+    <button class="tab" data-tab="gguf">GGUF</button>
     <button class="tab" data-tab="tabular">Tabular (CLI)</button>
     <button class="tab" data-tab="system">System</button>
   </nav>
@@ -252,6 +253,46 @@
       </div>
       <span class="err" id="errModel"></span>
       <div id="miInfo" class="infocards"></div>
+    </section>
+
+    <!-- ── GGUF (import & run Llama/Qwen checkpoints) ─────────────────────── -->
+    <section class="panel" id="panel-gguf">
+      <h2>GGUF — import &amp; run a Llama/Qwen checkpoint</h2>
+      <p class="hint">Load an external <code>.gguf</code> model (F32/F16/Q8_0/Q8_1/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K)
+        and generate from it. CPU-only: a 1B model decodes at only a few tokens/sec and a
+        real prompt takes tens of seconds to ingest. Prefer <strong>int8</strong> for speed,
+        <strong>int4</strong> for memory. Quantized import is lossy; <strong>f32</strong> avoids it.</p>
+      <div class="row">
+        <label>GGUF file <input type="text" id="ggPath" placeholder="/path/to/model.gguf" /></label>
+        <button class="ghost browse" data-target="ggPath">Browse…</button>
+        <button id="ggInspect" class="ghost">Inspect</button>
+      </div>
+      <div id="ggInfo" class="infocards"></div>
+      <label>Prompt
+        <textarea id="ggPrompt" rows="3" placeholder="Once upon a time"></textarea>
+      </label>
+      <div class="grid">
+        <label>Precision
+          <select id="ggQuant">
+            <option value="int8">int8 (fastest)</option>
+            <option value="int4">int4 (smallest)</option>
+            <option value="f32">f32 (no re-quant)</option>
+          </select>
+        </label>
+        <label>Max new tokens <input type="number" id="ggMax" value="64" min="1" /></label>
+        <label>Temperature <input type="number" id="ggTemp" value="0.8" step="0.05" min="0.01" /></label>
+        <label>Gen seed (blank=random) <input type="number" id="ggSeed" placeholder="random" /></label>
+      </div>
+      <label>Token IDs (only if the file has no tokenizer)
+        <input type="text" id="ggIds" placeholder="e.g. 1 234 56" />
+      </label>
+      <label class="chk"><input type="checkbox" id="ggForce" /> Load even if it may exceed available RAM</label>
+      <span class="err" id="errGguf"></span>
+      <div class="row">
+        <button id="ggRun" class="primary">Run</button>
+        <span id="ggStatus" class="muted"></span>
+      </div>
+      <div id="ggOut" class="output" placeholder="Generated text appears here…"></div>
     </section>
 
     <!-- ── Tabular (train_cli) ───────────────────────────────────────────── -->

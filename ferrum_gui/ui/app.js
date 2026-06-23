@@ -440,6 +440,63 @@ $("miInspect").addEventListener("click", async () => {
   } catch (e) { setErr("errModel", String(e)); toast("Inspect failed: " + e, "error"); }
 });
 
+// ── GGUF (import & run Llama/Qwen) ──────────────────────────────────────────────
+$("ggInspect").addEventListener("click", async () => {
+  clearErr("errGguf");
+  let path;
+  try { path = reqStr("ggPath", "GGUF file"); } catch (e) { setErr("errGguf", String(e)); return; }
+  $("ggStatus").textContent = "inspecting…";
+  try {
+    const i = await invoke("gguf_info", { path });
+    const card = (k, v) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`;
+    const avail = i.availMb == null ? "unknown" : (i.availMb / 1024).toFixed(2) + " GB";
+    $("ggInfo").innerHTML =
+      card("Architecture", i.architecture + (i.runnable ? " ✓" : " ✗ not runnable")) +
+      card("GGUF", "v" + i.version + " · " + i.numTensors + " tensors") +
+      card("Shape", `dim ${i.modelDim} · ${i.nLayers}L · ${i.nHeads}h/${i.nKvHeads}kv · vocab ${i.vocabSize}`) +
+      card("Tokenizer", i.tokenizer) +
+      card("Resident (int4/int8/f32)", `${(i.estInt4Mb/1024).toFixed(2)} / ${(i.estInt8Mb/1024).toFixed(2)} / ${(i.estF32Mb/1024).toFixed(2)} GB`) +
+      card("Available RAM", avail) +
+      card("Note", i.note);
+    $("ggStatus").textContent = "";
+    toast(i.runnable ? "GGUF inspected" : "Inspected — architecture not runnable", i.runnable ? "ok" : "error");
+  } catch (e) { $("ggStatus").textContent = "error"; setErr("errGguf", String(e)); toast("Inspect failed: " + e, "error"); }
+});
+
+$("ggRun").addEventListener("click", async () => {
+  clearErr("errGguf");
+  let params;
+  try {
+    const seed = $("ggSeed").value.trim();
+    const ids = $("ggIds").value.trim();
+    params = {
+      modelPath: reqStr("ggPath", "GGUF file"),
+      prompt: $("ggPrompt").value,
+      quant: $("ggQuant").value,
+      maxNew: reqInt("ggMax", "Max new tokens"),
+      temp: reqNum("ggTemp", "Temperature", 0),
+      genSeed: seed === "" ? null : parseInt(seed, 10),
+      ids: ids === "" ? null : ids,
+      force: $("ggForce").checked,
+    };
+    if (!params.prompt.trim() && !params.ids) throw new Error("Enter a prompt (or token IDs)");
+  } catch (e) { setErr("errGguf", String(e)); return; }
+
+  $("ggOut").textContent = "";
+  $("ggStatus").textContent = "loading & generating… (CPU: this can take a while)";
+  $("ggRun").disabled = true;
+  try {
+    const r = await invoke("run_gguf", { params });
+    $("ggOut").textContent = r.text;
+    $("ggStatus").textContent =
+      `done — ${r.generated} tokens in ${r.seconds.toFixed(1)}s (${r.tokensPerSec.toFixed(1)} tok/s, prompt ${r.promptTokens} tok)`;
+  } catch (e) {
+    $("ggStatus").textContent = "error";
+    setErr("errGguf", String(e));
+    toast("Run failed: " + e, "error");
+  } finally { $("ggRun").disabled = false; }
+});
+
 // ── Tabular (train_cli via shell) ──────────────────────────────────────────────
 $("tbRun").addEventListener("click", async () => {
   clearErr("errTab");

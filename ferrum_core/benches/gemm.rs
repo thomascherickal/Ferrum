@@ -22,10 +22,11 @@
 //!      caveats it prints).
 
 use std::hint::black_box;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ferrum_core::ops;
-use ferrum_core::Tensor;
+use ferrum_core::{QKind, QWeight, Tensor};
 
 /// Fill an `rows × cols` tensor with deterministic pseudo-random values in
 /// `[-1, 1)` (xorshift64 — no `rng` coupling, no all-equal data that could let
@@ -83,6 +84,21 @@ fn gemv_row(label: &str, k: usize, n: usize, best: Duration, iters: u64) {
     let gbps = bytes / s / 1e9;
     println!(
         "  {label:<20} W[{k:>5}×{n:<5}]  {:>9.1} µs/call  {:>6.1} GB/s   ({iters} iters)",
+        s * 1e6,
+        gbps,
+    );
+}
+
+/// One row of the quantized-decode table: time `qlinear` for an `m=1` GEMV and
+/// report the **packed** bytes streamed (the real bandwidth ceiling at this
+/// precision) — this is the Opt#1 (packed weights) + Opt#2 (column-split GEMV)
+/// path, which the f32 `matmul` rows above never exercise.
+fn qgemv_row(label: &str, kind: &str, packed_bytes: usize, best: Duration, iters: u64) {
+    let s = best.as_secs_f64();
+    let gbps = packed_bytes as f64 / s / 1e9;
+    println!(
+        "  {label:<16} {kind:<4} {:>6.2} MB packed  {:>9.1} µs/call  {:>6.1} GB/s   ({iters} iters)",
+        packed_bytes as f64 / 1e6,
         s * 1e6,
         gbps,
     );
@@ -192,6 +208,61 @@ fn main() {
     println!();
     println!("  NOTE: estimate. Excludes attention score·V matmuls, layernorm, softmax, and");
     println!("  sampling; one layer's weights are replayed, so they may stay warmer in cache");
-    println!("  than a true {LAYERS}-layer model. Re-run with FERRUM_NUM_THREADS=1 — the GEMV");
-    println!("  sections will not change, because m=1 never parallelizes.");
+    println!("  than a true {LAYERS}-layer model. The f32 §2 GEMV does not scale with threads");
+    println!("  (m=1, serial); the quantized §4 below does, via the column-split (Opt#2).");
+    println!();
+
+    // ── 4. Quantized decode: packed weights (Opt#1) + column-split GEMV (Opt#2) ─
+    // The f32 sections above never touch the int4/int8 kernel that the "runnable
+    // 1B" claim rests on; this measures it directly. Bandwidth is over the
+    // **packed** bytes — the quantity that actually bounds quantized decode.
+    println!("== Quantized decode GEMV   c[1×n] = a[1×k]·Wq[k×n]   (int8/int4 packed; m=1 column-split) ==");
+    for &(k, n, label) in &shapes {
+        let wf = rand_matrix(k, n, &mut seed);
+        let a = rand_matrix(1, k, &mut seed);
+        let bias = vec![0.0f32; n];
+        for kind in [QKind::Int8, QKind::Int4] {
+            let qw = Arc::new(QWeight::from_f32(&wf.data, k, n, kind));
+            let packed = qw.resident_bytes();
+            let (best, iters) = time_best(budget, || {
+                black_box(ops::qlinear(black_box(&a), black_box(&qw), &bias).unwrap());
+            });
+            qgemv_row(label, if kind == QKind::Int8 { "int8" } else { "int4" }, packed, best, iters);
+        }
+    }
+    println!();
+
+    // Synthesized int4 ~1B decode step — directly comparable to §3's f32 figure.
+    println!("== Synthesized int4 decode step   d_model={D_MODEL}, d_ff={D_FF}, layers={LAYERS}, vocab={VOCAB} ==");
+    let q_proj = Arc::new(QWeight::from_f32(&w_proj.data, D_MODEL, D_MODEL, QKind::Int4));
+    let q_up = Arc::new(QWeight::from_f32(&w_up.data, D_MODEL, D_FF, QKind::Int4));
+    let q_down = Arc::new(QWeight::from_f32(&w_down.data, D_FF, D_MODEL, QKind::Int4));
+    let q_logits = Arc::new(QWeight::from_f32(&w_logits.data, D_MODEL, VOCAB, QKind::Int4));
+    let b_dmodel = vec![0.0f32; D_MODEL];
+    let b_dff = vec![0.0f32; D_FF];
+    let b_vocab = vec![0.0f32; VOCAB];
+    let (best, iters) = time_best(Duration::from_millis(2000), || {
+        for _ in 0..LAYERS {
+            for _ in 0..4 {
+                black_box(ops::qlinear(black_box(&a_dmodel), black_box(&q_proj), &b_dmodel).unwrap());
+            }
+            black_box(ops::qlinear(black_box(&a_dmodel), black_box(&q_up), &b_dff).unwrap());
+            black_box(ops::qlinear(black_box(&a_dff), black_box(&q_down), &b_dmodel).unwrap());
+        }
+        black_box(ops::qlinear(black_box(&a_dmodel), black_box(&q_logits), &b_vocab).unwrap());
+    });
+    let s = best.as_secs_f64();
+    let packed_per_token =
+        (q_proj.resident_bytes() * 4 + q_up.resident_bytes() + q_down.resident_bytes()) * LAYERS
+            + q_logits.resident_bytes();
+    println!(
+        "  {:>8.1} ms/token   {:>6.2} tok/s   {:>6.1} GB/s effective   ({iters} iters)",
+        s * 1e3,
+        1.0 / s,
+        packed_per_token as f64 / s / 1e9,
+    );
+    println!(
+        "  weights streamed/token ≈ {:.2} GB int4  (vs the f32 figure in §3; same caveats apply)",
+        packed_per_token as f64 / 1e9,
+    );
 }

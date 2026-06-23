@@ -56,6 +56,8 @@ pub fn run() {
             commands::generate_slm,
             commands::evaluate_slm,
             commands::model_info,
+            commands::gguf_info,
+            commands::run_gguf,
             commands::run_terminal,
             commands::term_cwd,
             commands::system_stats,

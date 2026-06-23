@@ -3,8 +3,8 @@
 A cross-platform **Tauri 2** desktop/mobile GUI for the Ferrum engine, written in
 **plain HTML/CSS/vanilla JS** (no JS frameworks). It exposes the whole project —
 dataset preparation, all three SLM training paths, streaming generation,
-perplexity evaluation, model inspection, the tabular `train_cli`, an interactive
-terminal, and a live system monitor — in one window.
+perplexity evaluation, model inspection, **GGUF import & run**, the tabular
+`train_cli`, an interactive terminal, and a live system monitor — in one window.
 
 > This crate is intentionally **excluded from the parent Cargo workspace** (see
 > `../Cargo.toml`) because it pulls in heavy GUI system libraries. Build it from
@@ -17,16 +17,20 @@ terminal, and a live system monitor — in one window.
 | # | Requirement | Tab / area | Backend command |
 |---|-------------|-----------|-----------------|
 | 1 | Download datasets from the internet and clean them | **Datasets** | `download_text`, `clean_text`, `save_corpus` (cleaning is `ferrum_core::clean_corpus`) |
-| 2 | Clear error messages on bad input | every form (inline `.err` + toast); backend validates again and returns readable strings | all |
+| 2 | Clear error messages on bad input | every form (inline `.err` + toast); backend re-validates and returns readable strings | all |
 | 3 | Live terminal with `--verbose`, plus a real shell | docked **Terminal** at the bottom (always visible) | `run_terminal`, `term_cwd`, `engine-log`/`term-output` events |
-| 4 | A tab for every piece of functionality | Datasets / Train / Generate / Evaluate / Models / Tabular / System | — |
+| 4 | A tab for every piece of functionality | Datasets / Train / Generate / Evaluate / Models / **GGUF** / Tabular / System | — |
 | 5 | Evaluation shown in a table | **Evaluate** | `evaluate_slm` |
 | 6 | Train, test, reload, load-from-disk, run with streaming | **Train**, **Generate** (stream), **Models** (reload/inspect) | `train_slm`, `generate_slm`, `model_info` |
-| 7 | Monitor system load | **System** tab + the top-bar mini gauges | `system_stats` (sysinfo) |
-| 8 | Cross-platform via Tauri | one codebase; see **Platform support** below | — |
+| 7 | Import & run external Llama/Qwen GGUFs | **GGUF** (file picker, prompt, quant select, inspect + run) | `gguf_info`, `run_gguf` |
+| 8 | Monitor system load | **System** tab + the top-bar mini gauges | `system_stats` (sysinfo) |
+| 9 | Cross-platform via Tauri | one codebase; see **Platform support** | — |
 
 The three SLM training paths (`train_transformer` multi-threaded, `train_embedded`,
-one-hot `train`) are all selectable in **Train**. Verbose mode streams the engine's
+one-hot `train`) are all selectable in **Train**. The **GGUF** tab calls
+`gguf_info` (streamed header inspection + a memory-fit estimate) and `run_gguf`
+(streamed open → import the checkpoint's tokenizer → decode at `int4`/`int8`/`f32`),
+mirroring the `slm_cli run-gguf` subcommand. Verbose mode streams the engine's
 `vprintln!` trace into the terminal via a log sink added to `ferrum_core`.
 
 ---
@@ -36,15 +40,16 @@ one-hot `train`) are all selectable in **Train**. Verbose mode streams the engin
 1. **Rust** (stable) and **Cargo**.
 2. **Tauri CLI**: `cargo install tauri-cli --version "^2"` (gives `cargo tauri …`).
 3. **System WebView deps** (desktop):
-   - **Linux**: `libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev build-essential curl wget file libssl-dev`
-     (Debian/Ubuntu names; this is required — the build fails without it.)
+   - **Linux**: `libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev build-essential curl wget file libssl-dev` (Debian/Ubuntu names; the windowed build fails without it).
    - **macOS**: Xcode command-line tools.
    - **Windows**: WebView2 runtime (preinstalled on Win 11) + MSVC build tools.
 
-> ⚠️ This GUI was authored in an environment **without** the WebView libraries,
-> so it has not been compiled here. The `ferrum_core` additions it depends on
-> (`dataset`, the verbose log sink) are fully tested. After installing the deps
-> above, run `cargo tauri dev` and report any compile errors.
+> ⚠️ Build status, stated honestly: the **Rust backend type-checks**
+> (`cargo check` is clean, including the `gguf_info`/`run_gguf` commands), but the
+> full **windowed** app requires the system WebView libraries above and may be
+> first compiled on *your* machine. After installing the deps, run
+> `cargo tauri dev` and report any errors. The `ferrum_core` engine it calls is
+> fully unit-/integration-tested.
 
 ---
 
@@ -57,17 +62,17 @@ cargo tauri build        # produce installers/binaries for the current OS
 ```
 
 There is **no Node build step** — the frontend is static files in `ui/`, served
-directly (`build.frontendDist = "ui"` in `tauri.conf.json`, `withGlobalTauri`
-on so vanilla JS can call `window.__TAURI__`).
+directly (`build.frontendDist = "ui"` in `tauri.conf.json`, `withGlobalTauri` on
+so vanilla JS can call `window.__TAURI__`).
 
 ### Icons for release builds
 
-Placeholder icons are in `icons/` (generated by `icons/generate-icons.cjs`).
-For real release artifacts, replace them: `cargo tauri icon path/to/logo.png`.
+Placeholder icons are in `icons/` (generated by `icons/generate-icons.cjs`). For
+real release artifacts, replace them: `cargo tauri icon path/to/logo.png`.
 
 ---
 
-## Platform support (requirement #8, honestly)
+## Platform support (honestly)
 
 One codebase targets all six, but the OS sandboxes differ — features degrade
 rather than break:
@@ -75,15 +80,17 @@ rather than break:
 | Feature | Linux / macOS / Windows | Android / iOS | Web |
 |--------|:----------------------:|:-------------:|:---:|
 | Datasets, Train, Generate, Evaluate, Models | ✅ | ✅ | ❌¹ |
+| GGUF import & run | ✅ | ✅² | ❌¹ |
 | Dataset download (HTTP) | ✅ | ✅ | ❌¹ |
 | Interactive **shell** terminal | ✅ | ⛔ (no shell on mobile) | ⛔ |
 | Verbose engine log in terminal | ✅ | ✅ | ❌¹ |
-| **System monitor** | ✅ | partial² | ❌¹ |
+| **System monitor** | ✅ | partial³ | ❌¹ |
 
 ¹ *Web*: Tauri's Rust backend does not run in a plain browser, so the
 `invoke()`-backed features are unavailable. The frontend still loads and shows a
-banner; to ship a true web build you would add HTTP shims for the commands.
-² *Mobile* CPU/memory reporting is limited by `sysinfo`'s platform backends.
+banner; a true web build would need HTTP shims for the commands.
+² GGUF on mobile is gated by device RAM — even small checkpoints can exceed it.
+³ *Mobile* CPU/memory reporting is limited by `sysinfo`'s platform backends.
 
 The app detects these cases at runtime: the shell returns a clear "not available
 on this platform" message, and a banner appears when the backend is absent.
@@ -126,6 +133,7 @@ capabilities/       Tauri v2 permissions (core + dialog)
 icons/              app icons (+ generator script)
 ```
 
-Heavy commands run on a blocking task and stream progress/log/output as events
-(`engine-log`, `train-progress`, `train-done`, `gen-fragment`, `term-output`),
-which `ui/app.js` listens for.
+Heavy commands (train, generate, GGUF run) execute on a blocking task and stream
+progress/log/output as events (`engine-log`, `train-progress`, `train-done`,
+`gen-fragment`, `term-output`), which `ui/app.js` listens for — so the window
+stays responsive while the CPU works.

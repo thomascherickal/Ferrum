@@ -144,7 +144,10 @@ pub fn linear_forward(input: &Tensor, weight: &Tensor, bias: &[f32]) -> Result<T
 /// `a_row` is the activation row **already pre-multiplied by the per-row weight
 /// scale** (so the kernel only ever multiplies by raw integer levels). For int8
 /// each weight row is a contiguous `i8` slice (autovectorises cleanly); for int4
-/// two nibbles are unpacked per byte.
+/// the row is walked **one byte → two adjacent outputs**, branch-free, with the
+/// odd endpoints peeled out so the hot middle loop vectorises too (see the
+/// `qaccum_cols` rewrite in `benchmarks.md §4d` — this is what closes the old
+/// int4-slower-than-int8 gap).
 fn qaccum_cols(a_row: &[f32], w: &QWeight, j0: usize, j1: usize, out: &mut [f32]) {
     let k = a_row.len();
     match w.kind {
@@ -158,22 +161,25 @@ fn qaccum_cols(a_row: &[f32], w: &QWeight, j0: usize, j1: usize, out: &mut [f32]
             }
         }
         QKind::Int4 => {
+            // Split-half layout (see `QWeight.q`): low nibbles hold columns
+            // `[0, half)`, high nibbles hold `[half, cols)`. The requested chunk
+            // `[j0, j1)` therefore splits into at most two **unit-stride** ranges —
+            // a low-nibble pass over `[j0, lo_end)` and a high-nibble pass over
+            // `[hi_start, j1)` — each a contiguous `out[c] += ap·sext(nibble)`
+            // loop that the autovectoriser lowers to SIMD like the int8 path.
+            let half = w.cols.div_ceil(2);
             let rb = w.row_bytes();
+            let lo_end = j1.min(half);
+            let hi_start = j0.max(half);
             for (p, &ap) in a_row.iter().enumerate().take(k) {
                 let base = p * rb;
-                let mut j = j0;
-                while j < j1 {
-                    let byte = w.q[base + (j >> 1)];
-                    if j & 1 == 0 {
-                        out[j - j0] += ap * (QWeight::nibble_to_i8(byte & 0x0F) as f32);
-                        if j + 1 < j1 {
-                            out[j + 1 - j0] += ap * (QWeight::nibble_to_i8(byte >> 4) as f32);
-                        }
-                        j += 2;
-                    } else {
-                        out[j - j0] += ap * (QWeight::nibble_to_i8(byte >> 4) as f32);
-                        j += 1;
-                    }
+                for c in j0..lo_end {
+                    let byte = w.q[base + c];
+                    out[c - j0] += ap * ((byte << 4) as i8 >> 4) as f32; // low nibble
+                }
+                for c in hi_start..j1 {
+                    let byte = w.q[base + (c - half)];
+                    out[c - j0] += ap * ((byte as i8 >> 4) as f32); // high nibble
                 }
             }
         }

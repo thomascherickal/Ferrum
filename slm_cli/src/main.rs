@@ -64,6 +64,10 @@ impl Args {
         const VALUE_FLAGS: &[&str] = &[
             "context", "embed", "heads", "blocks", "hidden", "epochs",
             "lr", "batch", "seed", "chars", "temp", "gen-seed", "vocab", "threads",
+            // AdamW / regularization (exposing the engine's existing knobs).
+            "weight_decay", "dropout",
+            // run-gguf options.
+            "quant", "max", "ids",
         ];
         let mut i = 0;
         while i < raw.len() {
@@ -142,6 +146,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "train" => cmd_train(&args),
         "run" => cmd_run(&args),
         "generate" | "gen" => cmd_generate(&args),
+        "run-gguf" | "gguf" => cmd_run_gguf(&args),
         "eval" => cmd_eval(&args),
         "info" => cmd_info(&args),
         "-h" | "--help" | "help" => {
@@ -164,17 +169,26 @@ fn print_usage() {
          \x20 train_transformer train    <corpus.txt> <model.bin> [options]\n\
          \x20 train_transformer run      <corpus.txt> <model.bin> <seed text> [options]\n\
          \x20 train_transformer generate <model.bin>  <seed text> [options]\n\
+         \x20 train_transformer run-gguf <model.gguf> [prompt] [options]\n\
          \x20 train_transformer eval     <model.bin>  <heldout.txt>\n\
          \x20 train_transformer info     <model.bin>\n\n\
          TRAIN / RUN options:\n\
          \x20 --context N  --embed N  --heads N  --blocks N  --hidden N\n\
          \x20 --epochs N   --lr F     --batch N  --vocab N  --seed N\n\
+         \x20 --weight_decay F  --dropout F   (AdamW decay + FFN dropout; default 0)\n\
          \x20 --threads N  --force    --sample   --verbose|-v\n\
          \x20 (--vocab 0 = character-level; >=256 = byte-level BPE, default 512)\n\
          \x20 (--threads 0 = auto-detect cores [default]; 1 = serial training)\n\n\
          GENERATE / RUN options:\n\
          \x20 --chars N    --temp F   --gen-seed N   --stream\n\
          \x20 (--stream prints the completion live as it is generated)\n\n\
+         RUN-GGUF options (import & run a llama/qwen2 GGUF checkpoint):\n\
+         \x20 --quant int4|int8|f32  (in-memory precision; default int4)\n\
+         \x20 --max N      --temp F  --gen-seed N\n\
+         \x20 --ids \"1 2 3\"  (raw prompt token IDs; required if the file has no tokenizer)\n\
+         \x20 --force        (load even if the memory estimate exceeds available RAM)\n\
+         \x20 NOTE: only F32/F16/Q8_0/Q8_1/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K GGUFs; on CPU\n\
+         \x20 a 1B model decodes at only a few tokens/sec (see ferrum_review.md §4).\n\n\
          If <model.bin> already exists, train/run load the saved weights from\n\
          disk instead of retraining. Pass --force to retrain from scratch.\n\n\
          EXAMPLES:\n\
@@ -434,5 +448,151 @@ fn cmd_info(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         println!("Tokenizer : byte-level BPE ({} tokens, {} merges)", m.output_dim, merges);
     }
     println!("Layers    : {}", slm.model.len());
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// run-gguf: import & run an external llama/qwen2 GGUF checkpoint (G-CLI)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Estimate the resident memory a loaded model will need, from the GGUF tensor
+/// directory and the chosen in-memory precision. The token embedding is kept
+/// f32 (so it is the single largest array for big-vocab models); every other
+/// weight packs to int4/int8/f32. A pre-load guard, not an exact figure.
+fn estimate_resident_bytes(g: &ferrum_core::Gguf, prec: Option<ferrum_core::QKind>) -> usize {
+    use ferrum_core::QKind;
+    let mut total = 0usize;
+    for t in &g.tensors {
+        let n = t.num_elements();
+        let bytes = if t.name == "token_embd.weight" {
+            n * 4 // kept f32 in LlamaModel
+        } else {
+            match prec {
+                Some(QKind::Int4) => n.div_ceil(2),
+                Some(QKind::Int8) => n,
+                None => n * 4,
+            }
+        };
+        total = total.saturating_add(bytes);
+    }
+    total
+}
+
+/// Best-effort available RAM in bytes (Linux `/proc/meminfo` `MemAvailable`);
+/// `None` where it cannot be determined, in which case the guard is skipped.
+fn available_memory_bytes() -> Option<usize> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in info.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: usize = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+fn cmd_run_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    use ferrum_core::{Gguf, GgufTokenizer, QKind, Rng, SamplingParams};
+
+    if args.positional.is_empty() {
+        return Err("usage: train_transformer run-gguf <model.gguf> [prompt] \
+                    [--quant int4|int8|f32] [--max N] [--temp F] [--ids \"1 2 3\"]"
+            .into());
+    }
+    let path = &args.positional[0];
+    let prompt_text = args.positional[1..].join(" ");
+
+    let quant = args.flags.get("quant").map(String::as_str).unwrap_or("int4");
+    let prec = match quant {
+        "int4" | "q4" => Some(QKind::Int4),
+        "int8" | "q8" => Some(QKind::Int8),
+        "f32" | "none" => None,
+        other => return Err(format!("--quant must be int4|int8|f32 (got '{other}')").into()),
+    };
+
+    // Streamed open: parse the header without reading the whole file.
+    println!("Opening {path} (streamed)…");
+    let g = Gguf::open(path).map_err(|e| format!("cannot open GGUF {path}: {e}"))?;
+    println!("  GGUF v{}   architecture = {}", g.version, g.architecture().unwrap_or("?"));
+
+    // Memory guard before the (potentially multi-GB) load.
+    let est = estimate_resident_bytes(&g, prec);
+    println!("  estimated resident ≈ {:.2} GB  (--quant {quant})", est as f64 / 1e9);
+    if let Some(avail) = available_memory_bytes() {
+        println!("  available memory   ≈ {:.2} GB", avail as f64 / 1e9);
+        if (est as f64) > 0.9 * avail as f64 && !args.has("force") {
+            return Err(format!(
+                "estimated resident memory ({:.2} GB) exceeds 90% of available ({:.2} GB) — \
+                 try a smaller --quant, or pass --force to attempt it anyway.",
+                est as f64 / 1e9,
+                avail as f64 / 1e9
+            )
+            .into());
+        }
+    }
+
+    // Tokenizer is optional; without one, the prompt must be raw token IDs.
+    let tok = GgufTokenizer::from_gguf(&g).ok();
+    match &tok {
+        Some(t) => println!("  tokenizer = {:?}  (vocab {})", t.model(), t.vocab_size()),
+        None => println!("  tokenizer = none in file — supply --ids \"<token ids>\""),
+    }
+
+    println!("Loading weights…");
+    let t0 = Instant::now();
+    let model = g.load_llama_prec(prec).map_err(|e| format!("cannot load model: {e}"))?;
+    println!(
+        "  loaded in {:.2}s: {} layers, dim {}, vocab {}, ctx {}",
+        t0.elapsed().as_secs_f32(),
+        model.cfg.n_layers,
+        model.cfg.model_dim,
+        model.cfg.vocab_size,
+        model.cfg.context_len,
+    );
+
+    // Build the prompt token IDs (explicit --ids win; else encode the text).
+    let prompt_ids: Vec<usize> = if let Some(ids) = args.flags.get("ids") {
+        ids.split_whitespace().filter_map(|s| s.parse().ok()).collect()
+    } else if let Some(t) = &tok {
+        let mut ids = Vec::new();
+        if let Some(bos) = t.bos() {
+            ids.push(bos);
+        }
+        ids.extend(t.encode(&prompt_text));
+        ids
+    } else {
+        return Err("this GGUF has no tokenizer; pass --ids \"<space-separated token ids>\"".into());
+    };
+    if prompt_ids.is_empty() {
+        return Err("empty prompt — provide text (with a tokenizer) or --ids".into());
+    }
+
+    let max_new: usize = args.get("max", 64);
+    let temp: f32 = args.get("temp", 0.8);
+    let gen_seed: u64 = args.get("gen-seed", time_seed());
+    let eos = tok.as_ref().and_then(GgufTokenizer::eos);
+    let params = SamplingParams::with_temperature(temp);
+    let mut rng = Rng::new(gen_seed);
+
+    println!("\nPrefilling {} prompt tokens, generating up to {max_new} (temp {temp})…", prompt_ids.len());
+    let t1 = Instant::now();
+    let out_ids = model.generate(&prompt_ids, max_new, &params, eos, &mut rng)?;
+    let dt = t1.elapsed().as_secs_f32();
+
+    println!("\n── output ──");
+    match &tok {
+        Some(t) => println!("{prompt_text}{}", t.decode(&out_ids)),
+        None => {
+            let ids: Vec<String> = out_ids.iter().map(usize::to_string).collect();
+            println!("token ids: {}", ids.join(" "));
+        }
+    }
+    println!("────────────");
+    println!(
+        "[{} tokens in {:.2}s = {:.1} tok/s]",
+        out_ids.len(),
+        dt,
+        out_ids.len() as f32 / dt.max(1e-6)
+    );
     Ok(())
 }
