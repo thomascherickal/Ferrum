@@ -15,6 +15,7 @@
 
 mod commands;
 mod datasets;
+mod capable;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
