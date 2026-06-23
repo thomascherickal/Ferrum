@@ -70,6 +70,73 @@ pub fn test_max_params(gflops: f64) -> f64 {
     flop_budget(gflops) / (2.0 * EVAL_TOKENS)
 }
 
+// ── Live micro-benchmark ─────────────────────────────────────────────────────
+
+use std::hint::black_box;
+use std::time::Instant;
+
+/// Stream a ~256 MB buffer with a reduction to estimate usable memory
+/// bandwidth (bytes/sec). Bandwidth-bound CPU decode is governed by this.
+pub fn measure_mem_bandwidth() -> f64 {
+    const N: usize = 64 * 1024 * 1024; // 64M f32 = 256 MB
+    const REPS: usize = 4;
+    let buf = vec![1.0f32; N];
+
+    // Warm pages/caches so the timed loop measures steady-state bandwidth.
+    let mut warm = 0.0f32;
+    for &x in buf.iter().step_by(4096) {
+        warm += x;
+    }
+    black_box(warm);
+
+    let start = Instant::now();
+    let mut acc = 0.0f32;
+    for _ in 0..REPS {
+        let mut s = 0.0f32;
+        for &x in &buf {
+            s += x;
+        }
+        acc += s;
+    }
+    let secs = start.elapsed().as_secs_f64();
+    black_box(acc);
+
+    if secs > 0.0 {
+        (N * 4 * REPS) as f64 / secs
+    } else {
+        0.0
+    }
+}
+
+/// Time a single-threaded square matmul (cache-friendly i-k-j order) to
+/// estimate sustained GEMM throughput in GFLOP/s (FLOPs = 2*n^3).
+pub fn measure_gemm_gflops() -> f64 {
+    const N: usize = 512;
+    let a = vec![1.0f32; N * N];
+    let b = vec![1.0f32; N * N];
+    let mut c = vec![0.0f32; N * N];
+
+    let start = Instant::now();
+    for i in 0..N {
+        for k in 0..N {
+            let aik = a[i * N + k];
+            let brow = &b[k * N..k * N + N];
+            let crow = &mut c[i * N..i * N + N];
+            for j in 0..N {
+                crow[j] += aik * brow[j];
+            }
+        }
+    }
+    let secs = start.elapsed().as_secs_f64();
+    black_box(&c);
+
+    if secs > 0.0 {
+        (2.0 * (N as f64).powi(3)) / 1e9 / secs
+    } else {
+        0.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +191,18 @@ mod tests {
             assert_eq!(test_max_params(bad), 0.0);
         }
         assert_eq!(infer_max_params(10e9, 0.0), 0.0);
+    }
+
+    #[test]
+    fn mem_bandwidth_is_positive_and_sane() {
+        let bw = measure_mem_bandwidth();
+        // Any real machine streams between ~0.5 GB/s and ~2 TB/s.
+        assert!(bw > 5e8 && bw < 2e12, "implausible bandwidth: {bw} B/s");
+    }
+
+    #[test]
+    fn gemm_throughput_is_positive_and_sane() {
+        let g = measure_gemm_gflops();
+        assert!(g > 0.1 && g < 5000.0, "implausible GFLOP/s: {g}");
     }
 }
