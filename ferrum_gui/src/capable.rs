@@ -2,6 +2,12 @@
 //! upper-bound parameter counts for inference (>=3 tok/s), training (<24h),
 //! and evaluation (<24h). See docs/superpowers/specs/2026-06-23-capable-module-design.md.
 
+use crate::AppState;
+use serde::Serialize;
+use std::hint::black_box;
+use std::time::Instant;
+use tauri::State;
+
 // ── Modeling constants ───────────────────────────────────────────────────────
 
 /// Bytes per stored parameter at each precision (token-embedding nuance ignored
@@ -70,10 +76,101 @@ pub fn test_max_params(gflops: f64) -> f64 {
     flop_budget(gflops) / (2.0 * EVAL_TOKENS)
 }
 
-// ── Live micro-benchmark ─────────────────────────────────────────────────────
+// ── Report assembly + Tauri command ──────────────────────────────────────────
 
-use std::hint::black_box;
-use std::time::Instant;
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityReport {
+    pub cpu: String,
+    pub cores: usize,
+    pub threads: usize,
+    pub mem_total: u64,
+    pub mem_avail: u64,
+    /// Measured memory bandwidth (GB/s).
+    pub mem_bw_gbps: f64,
+    /// Aggregate GEMM throughput across all cores (GFLOP/s).
+    pub gemm_gflops: f64,
+    pub infer_int4: f64,
+    pub infer_int8: f64,
+    pub infer_f32: f64,
+    pub train_chinchilla: f64,
+    pub train_fixed1b: f64,
+    pub test_eval: f64,
+    // Assumptions echoed so the dialog can show its own workings.
+    pub target_toks: f64,
+    pub train_hours: f64,
+    pub eval_tokens: f64,
+    pub fixed_train_tokens: f64,
+    pub chinchilla_ratio: f64,
+}
+
+/// Build a report from measured numbers (pure; no Tauri runtime needed).
+/// `gemm_single` is single-thread GFLOP/s; aggregate = single * cores.
+fn assemble_report(
+    cpu: String,
+    cores: usize,
+    threads: usize,
+    mem_total: u64,
+    mem_avail: u64,
+    bw_bytes_per_s: f64,
+    gemm_single: f64,
+) -> CapabilityReport {
+    let gflops = gemm_single * cores as f64;
+    CapabilityReport {
+        cpu,
+        cores,
+        threads,
+        mem_total,
+        mem_avail,
+        mem_bw_gbps: bw_bytes_per_s / 1e9,
+        gemm_gflops: gflops,
+        infer_int4: infer_max_params(bw_bytes_per_s, BPP_INT4),
+        infer_int8: infer_max_params(bw_bytes_per_s, BPP_INT8),
+        infer_f32: infer_max_params(bw_bytes_per_s, BPP_F32),
+        train_chinchilla: train_max_chinchilla(gflops),
+        train_fixed1b: train_max_fixed(gflops),
+        test_eval: test_max_params(gflops),
+        target_toks: TARGET_TOKS,
+        train_hours: TRAIN_SECS / 3600.0,
+        eval_tokens: EVAL_TOKENS,
+        fixed_train_tokens: FIXED_TRAIN_TOKENS,
+        chinchilla_ratio: CHINCHILLA_RATIO,
+    }
+}
+
+/// Micro-benchmark the host and return capability bounds. Polled on demand by
+/// the "Capable" tab.
+#[tauri::command]
+pub async fn capability_report(state: State<'_, AppState>) -> Result<CapabilityReport, String> {
+    // Snapshot machine facts under the shared sysinfo lock, then release it.
+    let (cpu, cores, mem_total, mem_avail) = {
+        let mut sys = state.sys.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
+        // Ensure the CPU list is populated before reading it; otherwise `cpus()`
+        // can be empty (→ cores = 0 → all GFLOP-derived bounds collapse to 0).
+        sys.refresh_cpu_all();
+        sys.refresh_memory();
+        let cpu = sys
+            .cpus()
+            .first()
+            .map(|c| c.brand().trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown CPU".to_string());
+        (cpu, sys.cpus().len(), sys.total_memory(), sys.available_memory())
+    };
+    // `cores` is the live sysinfo hardware CPU count; `threads` is the engine's
+    // parallel pool size (`ferrum_core::num_threads()`) — the two can differ.
+    let threads = ferrum_core::num_threads();
+
+    // Run the blocking benchmark off the async runtime thread.
+    let (bw, gemm_single) =
+        tauri::async_runtime::spawn_blocking(|| (measure_mem_bandwidth(), measure_gemm_gflops()))
+            .await
+            .map_err(|e| format!("benchmark task error: {e}"))?;
+
+    Ok(assemble_report(cpu, cores, threads, mem_total, mem_avail, bw, gemm_single))
+}
+
+// ── Live micro-benchmark ─────────────────────────────────────────────────────
 
 /// Stream a ~256 MB buffer with a reduction to estimate usable memory
 /// bandwidth (bytes/sec). Bandwidth-bound CPU decode is governed by this.
@@ -204,5 +301,21 @@ mod tests {
     fn gemm_throughput_is_positive_and_sane() {
         let g = measure_gemm_gflops();
         assert!(g > 0.1 && g < 5000.0, "implausible GFLOP/s: {g}");
+    }
+
+    #[test]
+    fn report_assembles_consistent_bounds() {
+        // Bypass the command (needs a Tauri runtime) and check the assembly
+        // helper used by it directly.
+        let r = assemble_report(
+            "Test CPU".into(), 8, 8, 16_000_000_000, 8_000_000_000,
+            8e9,   // 8 GB/s
+            10.0,  // 10 GFLOP/s single-thread
+        );
+        assert_eq!(r.cores, 8);
+        assert!((r.gemm_gflops - 80.0).abs() < 1e-6, "aggregate = single*cores");
+        assert!(r.infer_int4 > r.infer_int8 && r.infer_int8 > r.infer_f32);
+        assert!(r.train_chinchilla > 0.0 && r.train_fixed1b > 0.0 && r.test_eval > 0.0);
+        assert_eq!(r.target_toks, TARGET_TOKS);
     }
 }

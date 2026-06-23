@@ -62,6 +62,7 @@ pub fn run() {
             commands::run_terminal,
             commands::term_cwd,
             commands::system_stats,
+            capable::capability_report,
             datasets::list_datasets,
             datasets::download_dataset,
             datasets::download_hf_file,
