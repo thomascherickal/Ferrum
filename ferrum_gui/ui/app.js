@@ -441,6 +441,46 @@ $("miInspect").addEventListener("click", async () => {
 });
 
 // ── GGUF (import & run Llama/Qwen) ──────────────────────────────────────────────
+
+// Compare a GGUF's parameter count against the cached capability bounds.
+// Returns a list of human-readable descriptions for every bound it exceeds.
+function checkGgufBudget(paramCount) {
+  if (!capBounds || !Number.isFinite(paramCount) || paramCount <= 0) return [];
+  const checks = [
+    ["inference at int4 (≥ 3 tok/s)", capBounds.inferInt4],
+    ["inference at int8 (≥ 3 tok/s)", capBounds.inferInt8],
+    ["inference at f32 (≥ 3 tok/s)", capBounds.inferF32],
+    ["training, compute-optimal (< 24 h)", capBounds.trainChinchilla],
+    ["training, fixed corpus (< 24 h)", capBounds.trainFixed1b],
+    ["evaluation pass (< 24 h)", capBounds.testEval],
+  ];
+  return checks
+    .filter(([, bound]) => Number.isFinite(bound) && bound > 0 && paramCount > bound)
+    .map(([label, bound]) => `${label}: limit ${fmtParams(bound)}`);
+}
+
+// Show the warning dialog; resolves true if the user chooses Proceed.
+function confirmGgufWarning(paramCount, crossed) {
+  return new Promise((resolve) => {
+    $("ggWarnBody").innerHTML =
+      `<p>This model has <strong>${fmtParams(paramCount)}</strong> parameters, which exceeds
+       the estimated limits of this machine:</p><ul>` +
+      crossed.map((c) => `<li>${c}</li>`).join("") +
+      `</ul><p class="muted">You can still proceed — expect slower than the targets above.</p>`;
+    const dlg = $("ggWarnDialog");
+    const onProceed = () => { cleanup(); resolve(true); };
+    const onCancel = () => { cleanup(); resolve(false); };
+    function cleanup() {
+      $("ggWarnProceed").removeEventListener("click", onProceed);
+      $("ggWarnCancel").removeEventListener("click", onCancel);
+      dlg.close();
+    }
+    $("ggWarnProceed").addEventListener("click", onProceed);
+    $("ggWarnCancel").addEventListener("click", onCancel);
+    dlg.showModal();
+  });
+}
+
 $("ggInspect").addEventListener("click", async () => {
   clearErr("errGguf");
   let path;
@@ -460,6 +500,12 @@ $("ggInspect").addEventListener("click", async () => {
       card("Note", i.note);
     $("ggStatus").textContent = "";
     toast(i.runnable ? "GGUF inspected" : "Inspected — architecture not runnable", i.runnable ? "ok" : "error");
+    const crossedI = checkGgufBudget(i.paramCount);
+    if (crossedI.length) {
+      await confirmGgufWarning(i.paramCount, crossedI); // advisory on inspect; result ignored
+    } else if (!capBounds) {
+      toast("Tip: run the Capable check to flag oversized models.", "info");
+    }
   } catch (e) { $("ggStatus").textContent = "error"; setErr("errGguf", String(e)); toast("Inspect failed: " + e, "error"); }
 });
 
@@ -481,6 +527,18 @@ $("ggRun").addEventListener("click", async () => {
     };
     if (!params.prompt.trim() && !params.ids) throw new Error("Enter a prompt (or token IDs)");
   } catch (e) { setErr("errGguf", String(e)); return; }
+
+  // Budget gate: if the model exceeds this machine's estimated limits, confirm.
+  if (capBounds) {
+    try {
+      const info = await invoke("gguf_info", { path: params.modelPath });
+      const crossed = checkGgufBudget(info.paramCount);
+      if (crossed.length) {
+        const ok = await confirmGgufWarning(info.paramCount, crossed);
+        if (!ok) { $("ggStatus").textContent = "cancelled"; return; }
+      }
+    } catch (_) { /* inspection failed; fall through to run, which will error clearly */ }
+  }
 
   $("ggOut").textContent = "";
   $("ggStatus").textContent = "loading & generating… (CPU: this can take a while)";
