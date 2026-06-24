@@ -553,6 +553,8 @@ pub struct GgufInfo {
     pub version: u32,
     pub architecture: String,
     pub num_tensors: usize,
+    /// Total parameters across all tensors (sum of element counts).
+    pub param_count: u64,
     pub model_dim: usize,
     pub n_layers: usize,
     pub n_heads: usize,
@@ -599,12 +601,14 @@ pub async fn gguf_info(path: String) -> Result<GgufInfo, String> {
             "decode is a few tok/s on CPU; prefer int8 for speed, int4 for memory".to_string()
         };
         let mb = |b: usize| b as f64 / 1e6;
+        let param_count: u64 = g.tensors.iter().map(|t| t.num_elements() as u64).sum();
         Ok(GgufInfo {
             path: path.clone(),
             bytes,
             version: g.version,
             architecture: arch,
             num_tensors: g.tensors.len(),
+            param_count,
             model_dim: dim,
             n_layers,
             n_heads,
