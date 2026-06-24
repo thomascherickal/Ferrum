@@ -177,4 +177,3 @@ dialog.capdlg .dlg-actions {
   margin: 16px 0 0; padding: 0;
 }
 dialog.capdlg .capfoot { color: var(--muted); font-size: 11px; margin-top: 12px; }
-dialog.capdlg table.data td.over { color: var(--accent); font-weight: 600; }

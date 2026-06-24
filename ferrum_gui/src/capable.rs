@@ -60,7 +60,7 @@ fn flop_budget(gflops: f64) -> f64 {
 }
 
 /// Max trainable params, compute-optimal: training FLOPs ~ `6*N*T` with
-/// `T = 20*N`, so `N = sqrt(B / 120)`.
+/// `T = 20*N`, so `N = sqrt(B / (6*ratio))`.
 pub fn train_max_chinchilla(gflops: f64) -> f64 {
     let b = flop_budget(gflops);
     (b / (6.0 * CHINCHILLA_RATIO)).sqrt()
@@ -209,9 +209,14 @@ pub fn measure_mem_bandwidth() -> f64 {
 /// estimate sustained GEMM throughput in GFLOP/s (FLOPs = 2*n^3).
 pub fn measure_gemm_gflops() -> f64 {
     const N: usize = 512;
-    let a = vec![1.0f32; N * N];
-    let b = vec![1.0f32; N * N];
+    // Non-uniform, deterministic inputs: all-ones data lets the optimizer
+    // simplify the products and overstate throughput, so seed varied values
+    // (and black_box them) to measure a realistic mixed-data matmul.
+    let a: Vec<f32> = (0..N * N).map(|i| (i % 7) as f32 * 0.5 + 0.1).collect();
+    let b: Vec<f32> = (0..N * N).map(|i| (i % 13) as f32 * 0.25 + 0.2).collect();
     let mut c = vec![0.0f32; N * N];
+    black_box(&a);
+    black_box(&b);
 
     let start = Instant::now();
     for i in 0..N {

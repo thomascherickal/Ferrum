@@ -459,7 +459,9 @@ function checkGgufBudget(paramCount) {
     .map(([label, bound]) => `${label}: limit ${fmtParams(bound)}`);
 }
 
-// Show the warning dialog; resolves true if the user chooses Proceed.
+// Show the warning dialog; resolves true if the user chooses Proceed, and
+// false on Cancel or any dismissal (Esc/backdrop close the native <dialog>,
+// which fires its "close" event — the single resolution point).
 function confirmGgufWarning(paramCount, crossed) {
   return new Promise((resolve) => {
     $("ggWarnBody").innerHTML =
@@ -468,15 +470,17 @@ function confirmGgufWarning(paramCount, crossed) {
       crossed.map((c) => `<li>${c}</li>`).join("") +
       `</ul><p class="muted">You can still proceed — expect slower than the targets above.</p>`;
     const dlg = $("ggWarnDialog");
-    const onProceed = () => { cleanup(); resolve(true); };
-    const onCancel = () => { cleanup(); resolve(false); };
-    function cleanup() {
+    let proceed = false; // default for Esc / backdrop dismissal
+    const onProceed = () => { proceed = true; dlg.close(); };
+    const onCancel = () => { proceed = false; dlg.close(); };
+    const onClose = () => {
       $("ggWarnProceed").removeEventListener("click", onProceed);
       $("ggWarnCancel").removeEventListener("click", onCancel);
-      dlg.close();
-    }
+      resolve(proceed);
+    };
     $("ggWarnProceed").addEventListener("click", onProceed);
     $("ggWarnCancel").addEventListener("click", onCancel);
+    dlg.addEventListener("close", onClose, { once: true });
     dlg.showModal();
   });
 }
