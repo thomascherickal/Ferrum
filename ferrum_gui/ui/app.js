@@ -551,6 +551,67 @@ function restartMonitor() {
 $("sysOn").addEventListener("change", restartMonitor);
 $("sysInterval").addEventListener("change", restartMonitor);
 
+// ── Capable (machine capability) ─────────────────────────────────────────────
+let capBounds = null; // {inferInt4, inferInt8, inferF32, trainChinchilla, trainFixed1b, testEval}
+
+function fmtParams(n) {
+  if (!Number.isFinite(n) || n <= 0) return "—";
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + " B";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + " M";
+  if (n >= 1e3) return (n / 1e3).toFixed(0) + " K";
+  return n.toFixed(0);
+}
+
+function renderCapReport(r) {
+  capBounds = {
+    inferInt4: r.inferInt4, inferInt8: r.inferInt8, inferF32: r.inferF32,
+    trainChinchilla: r.trainChinchilla, trainFixed1b: r.trainFixed1b, testEval: r.testEval,
+  };
+  // Summary cards on the panel.
+  const card = (k, v) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`;
+  $("capCards").innerHTML =
+    card("CPU", r.cpu) +
+    card("Cores / threads", `${r.cores} / ${r.threads}`) +
+    card("Memory", `${fmtBytes(r.memAvail)} free / ${fmtBytes(r.memTotal)}`) +
+    card("Mem bandwidth", r.memBwGbps.toFixed(1) + " GB/s") +
+    card("GEMM throughput", r.gemmGflops.toFixed(1) + " GFLOP/s") +
+    card("Infer @int8 ceiling", fmtParams(r.inferInt8));
+  // Detailed table inside the dialog.
+  const row = (label, val, note) =>
+    `<tr><td>${label}</td><td>${fmtParams(val)}</td><td class="muted">${note}</td></tr>`;
+  $("capDialogBody").innerHTML = `
+    <p class="muted">${r.cpu} · ${r.cores} cores · ${r.memBwGbps.toFixed(1)} GB/s · ${r.gemmGflops.toFixed(1)} GFLOP/s</p>
+    <table class="data">
+      <thead><tr><th>Workload</th><th>Max params</th><th>Basis</th></tr></thead>
+      <tbody>
+        ${row("Inference · int4", r.inferInt4, `≥ ${r.targetToks} tok/s`)}
+        ${row("Inference · int8", r.inferInt8, `≥ ${r.targetToks} tok/s`)}
+        ${row("Inference · f32", r.inferF32, `≥ ${r.targetToks} tok/s`)}
+        ${row("Train · compute-optimal", r.trainChinchilla, `${r.chinchillaRatio}× tokens, < ${r.trainHours} h`)}
+        ${row("Train · fixed corpus", r.trainFixed1b, `${fmtParams(r.fixedTrainTokens)} tokens, < ${r.trainHours} h`)}
+        ${row("Test · eval pass", r.testEval, `${fmtParams(r.evalTokens)} tokens, < ${r.trainHours} h`)}
+      </tbody>
+    </table>
+    <p class="capfoot">Upper bounds from a live micro-benchmark. Decode is bandwidth-bound;
+      training/eval are compute-bound (≈6·N·T train, 2·N·T eval). Real throughput depends on
+      architecture, context length, and other load.</p>`;
+}
+
+$("capCheck").addEventListener("click", async () => {
+  $("capStatus").textContent = "benchmarking…";
+  $("capCheck").disabled = true;
+  try {
+    const r = await invoke("capability_report");
+    renderCapReport(r);
+    $("capStatus").textContent = "";
+    $("capDialog").showModal();
+    toast("Capability check complete", "ok");
+  } catch (e) {
+    $("capStatus").textContent = "error";
+    toast("Capability check failed: " + e, "error");
+  } finally { $("capCheck").disabled = false; }
+});
+
 // ── Backend event wiring ──────────────────────────────────────────────────────
 async function wireEvents() {
   await listen("engine-log", (e) => termLine(e.payload, "log"));

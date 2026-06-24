@@ -31,6 +31,7 @@
     <button class="tab" data-tab="gguf">GGUF</button>
     <button class="tab" data-tab="tabular">Tabular (CLI)</button>
     <button class="tab" data-tab="system">System</button>
+    <button class="tab" data-tab="capable">Capable</button>
   </nav>
 
   <main id="content">
@@ -350,6 +351,21 @@
       <h3>Per-core load</h3>
       <div id="sysCores" class="cores"></div>
     </section>
+
+    <!-- ── Capable ───────────────────────────────────────────────────────── -->
+    <section class="panel" id="panel-capable">
+      <h2>Capable — what can this machine run?</h2>
+      <p class="hint">Runs a quick (~1–2 s) micro-benchmark of memory bandwidth and
+        matmul throughput on <em>this</em> CPU, then estimates the largest model you can
+        realistically <strong>infer</strong> (≥ 3 tok/s), <strong>train</strong> (&lt; 24 h),
+        and <strong>test</strong> (&lt; 24 h). Estimates are upper bounds — real models
+        vary with architecture and context length.</p>
+      <div class="row">
+        <button id="capCheck" class="primary">Check this machine</button>
+        <span id="capStatus" class="muted"></span>
+      </div>
+      <div id="capCards" class="infocards"></div>
+    </section>
   </main>
 
   <!-- ── Docked terminal ──────────────────────────────────────────────────── -->
@@ -366,6 +382,27 @@
       <input type="text" id="termCmd" placeholder="type a shell command and press Enter…" autocomplete="off" spellcheck="false" />
     </div>
   </section>
+
+  <!-- ── Capability report dialog ─────────────────────────────────────────── -->
+  <dialog id="capDialog" class="capdlg">
+    <form method="dialog">
+      <h2>Machine capability</h2>
+      <div id="capDialogBody"></div>
+      <menu class="dlg-actions">
+        <button class="primary" value="ok">Close</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <!-- ── GGUF over-budget warning dialog ──────────────────────────────────── -->
+  <dialog id="ggWarnDialog" class="capdlg">
+    <h2>⚠ Model exceeds this machine's estimated limits</h2>
+    <div id="ggWarnBody"></div>
+    <menu class="dlg-actions">
+      <button id="ggWarnCancel" class="ghost">Cancel</button>
+      <button id="ggWarnProceed" class="primary">Proceed anyway</button>
+    </menu>
+  </dialog>
 
   <div id="toasts"></div>
   <script src="stream.js"></script>

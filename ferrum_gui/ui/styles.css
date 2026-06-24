@@ -160,3 +160,21 @@ table.data td:first-child, table.data th:first-child { text-align: left; }
   font-size: 0.78em; background: var(--accent, #2d6); color: #04210f;
   text-transform: uppercase; letter-spacing: 0.03em;
 }
+
+/* Capability dialogs */
+dialog.capdlg {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg2);
+  color: var(--fg);
+  max-width: 640px;
+  padding: 18px 20px;
+}
+dialog.capdlg::backdrop { background: rgba(0, 0, 0, 0.55); }
+dialog.capdlg h2 { margin-top: 0; }
+dialog.capdlg .dlg-actions {
+  display: flex; justify-content: flex-end; gap: 8px;
+  margin: 16px 0 0; padding: 0;
+}
+dialog.capdlg .capfoot { color: var(--muted); font-size: 11px; margin-top: 12px; }
+dialog.capdlg table.data td.over { color: var(--accent); font-weight: 600; }
