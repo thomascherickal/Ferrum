@@ -85,6 +85,7 @@ pub use dataset::{clean_corpus, corpus_stats, validate_for_training, CleanOption
 pub use error::{InferError, Result};
 pub use gguf::{f16_to_f32, Gguf, MetaValue, TensorInfo};
 pub use gguf_tokenizer::{GgufTokenizer, TokModel};
+pub use gguf_write::{llama_gguf_bytes, write_llama_gguf, GgufBuilder, GgufQuant};
 pub use layer::{
     ActivationLayer, Embedding, Flatten, KvCache, Layer, LayerNorm, Linear, TransformerBlock,
 };

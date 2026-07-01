@@ -7,10 +7,12 @@
 
 use crate::error::{InferError, Result};
 use crate::gguf::{
-    MetaValue, DEFAULT_ALIGNMENT, GGML_F16, GGML_F32, GGML_Q4_0, GGML_Q4_1, GGML_Q4_K, GGML_Q5_K,
-    GGML_Q6_K, GGML_Q8_0, GGML_Q8_1, GGUF_MAGIC, QK, QK_K, VT_ARRAY, VT_BOOL, VT_F32, VT_F64,
-    VT_I16, VT_I32, VT_I64, VT_I8, VT_STRING, VT_U16, VT_U32, VT_U64, VT_U8,
+    Gguf, MetaValue, DEFAULT_ALIGNMENT, GGML_F16, GGML_F32, GGML_Q4_0, GGML_Q4_1, GGML_Q4_K,
+    GGML_Q5_K, GGML_Q6_K, GGML_Q8_0, GGML_Q8_1, GGUF_MAGIC, QK, QK_K, VT_ARRAY, VT_BOOL, VT_F32,
+    VT_F64, VT_I16, VT_I32, VT_I64, VT_I8, VT_STRING, VT_U16, VT_U32, VT_U64, VT_U8,
 };
+use crate::layer::Linear;
+use crate::llm::LlamaModel;
 
 /// The on-disk GGUF tensor type the writer should emit for weight matrices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -801,6 +803,176 @@ fn put_value_payload(o: &mut Vec<u8>, v: &MetaValue) {
     }
 }
 
+/// Serialize a `LlamaModel` to GGUF bytes, carrying the source GGUF's metadata
+/// (hyperparameters + tokenizer) forward verbatim. See module docs.
+pub fn llama_gguf_bytes(model: &LlamaModel, source: &Gguf, quant: GgufQuant) -> Result<Vec<u8>> {
+    let arch = source
+        .architecture()
+        .ok_or_else(|| InferError::Format("source GGUF missing general.architecture".into()))?
+        .to_string();
+    if arch != "llama" && arch != "qwen2" {
+        return Err(InferError::Format(format!(
+            "GGUF export supports llama/qwen2 only (source architecture = '{arch}')"
+        )));
+    }
+
+    let mut b = GgufBuilder::new();
+
+    // 1. Metadata: copy every source key verbatim, except the file-type hints we
+    //    refresh to match the new target.
+    for (k, v) in &source.metadata {
+        if k == "general.file_type" || k == "general.quantization_version" {
+            continue;
+        }
+        b.meta(k, v.clone());
+    }
+    b.meta("general.file_type", MetaValue::U32(quant.file_type()));
+    b.meta("general.quantization_version", MetaValue::U32(2));
+
+    // 2. Tensors.
+    let cfg = &model.cfg;
+    // token_embd: Ferrum [vocab, dim] is already raw order; dims [dim, vocab].
+    add_tensor(
+        &mut b,
+        "token_embd.weight",
+        &model.tok_emb,
+        cfg.model_dim, // block axis = fastest dim = model_dim
+        &[cfg.model_dim as u64, cfg.vocab_size as u64],
+        true,
+        quant,
+    )?;
+
+    for (i, blk) in model.blocks.iter().enumerate() {
+        let p = format!("blk.{i}");
+        add_norm(
+            &mut b,
+            &format!("{p}.attn_norm.weight"),
+            &blk.attn_norm.weight,
+        );
+        add_linear(&mut b, &p, "attn_q", &blk.attn.wq, source, quant)?;
+        add_linear(&mut b, &p, "attn_k", &blk.attn.wk, source, quant)?;
+        add_linear(&mut b, &p, "attn_v", &blk.attn.wv, source, quant)?;
+        add_linear(&mut b, &p, "attn_output", &blk.attn.wo, source, quant)?;
+        add_norm(
+            &mut b,
+            &format!("{p}.ffn_norm.weight"),
+            &blk.ffn_norm.weight,
+        );
+        add_linear(&mut b, &p, "ffn_gate", &blk.ffn.gate, source, quant)?;
+        add_linear(&mut b, &p, "ffn_up", &blk.ffn.up, source, quant)?;
+        add_linear(&mut b, &p, "ffn_down", &blk.ffn.down, source, quant)?;
+    }
+
+    add_norm(&mut b, "output_norm.weight", &model.final_norm.weight);
+    // Emit an explicit LM head only if the source had one (else tying is kept).
+    if source.tensor("output.weight").is_some() {
+        add_weight_2d(&mut b, "output.weight", &model.lm_head, quant)?;
+    }
+
+    Ok(b.into_bytes())
+}
+
+/// Write `llama_gguf_bytes` to a file.
+pub fn write_llama_gguf(
+    model: &LlamaModel,
+    source: &Gguf,
+    quant: GgufQuant,
+    path: &str,
+) -> Result<()> {
+    let bytes = llama_gguf_bytes(model, source, quant)?;
+    std::fs::write(path, bytes).map_err(InferError::from)
+}
+
+// ── tensor emission helpers ──────────────────────────────────────────────────
+
+/// f32 weights of a Linear in Ferrum `[n_in, n_out]` order (dequantizing if the
+/// model is stored quantized in memory).
+fn linear_f32(lin: &Linear) -> Vec<f32> {
+    match lin.qweight() {
+        Some(qw) => qw.to_f32(),
+        None => lin.weight.data.clone(),
+    }
+}
+
+/// Transpose row-major `[rows, cols]` → `[cols, rows]`.
+fn transpose(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = data[r * cols + c];
+        }
+    }
+    out
+}
+
+/// A 1-D norm weight — always F32.
+fn add_norm(b: &mut GgufBuilder, name: &str, weight: &[f32]) {
+    // encode_tensor(F32) is infallible for any length; unwrap is safe here.
+    let bytes = encode_tensor(weight, GGML_F32).unwrap();
+    b.tensor(name, &[weight.len() as u64], GGML_F32, bytes);
+}
+
+/// A projection weight (+ optional bias) named `{prefix}.{stem}.weight`.
+fn add_linear(
+    b: &mut GgufBuilder,
+    prefix: &str,
+    stem: &str,
+    lin: &Linear,
+    source: &Gguf,
+    quant: GgufQuant,
+) -> Result<()> {
+    let wname = format!("{prefix}.{stem}.weight");
+    add_weight_2d(b, &wname, lin, quant)?;
+    // Emit the bias only if the source carried it (Qwen2 q/k/v biases).
+    let bname = format!("{prefix}.{stem}.bias");
+    if source.tensor(&bname).is_some() {
+        let bias = &lin.bias.data;
+        let bytes = encode_tensor(bias, GGML_F32).unwrap();
+        b.tensor(&bname, &[bias.len() as u64], GGML_F32, bytes);
+    }
+    Ok(())
+}
+
+/// Emit a 2-D weight: Ferrum `[n_in, n_out]` → raw `[n_out, n_in]`, dims
+/// `[n_in, n_out]`, quantized per policy.
+fn add_weight_2d(b: &mut GgufBuilder, name: &str, lin: &Linear, quant: GgufQuant) -> Result<()> {
+    let (n_in, n_out) = (lin.in_features(), lin.out_features());
+    let w = linear_f32(lin); // [n_in, n_out]
+    let raw = transpose(&w, n_in, n_out); // [n_out, n_in]
+    add_tensor(
+        b,
+        name,
+        &raw,
+        n_in,
+        &[n_in as u64, n_out as u64],
+        true,
+        quant,
+    )
+}
+
+/// Encode `raw` (already in GGUF byte order) as a tensor of `dims`, choosing the
+/// type via `plan_tensor_type` on `block_axis` (= dims[0]).
+fn add_tensor(
+    b: &mut GgufBuilder,
+    name: &str,
+    raw: &[f32],
+    block_axis: usize,
+    dims: &[u64],
+    is_2d: bool,
+    quant: GgufQuant,
+) -> Result<()> {
+    let (ggml_type, fell_back) = plan_tensor_type(is_2d, block_axis, quant);
+    if fell_back {
+        eprintln!(
+            "note: tensor '{name}' (axis {block_axis}) is not block-aligned for the chosen \
+             quant; storing it as F16"
+        );
+    }
+    let bytes = encode_tensor(raw, ggml_type)?;
+    b.tensor(name, dims, ggml_type, bytes);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1098,6 +1270,151 @@ mod tests {
         assert_eq!(
             plan_tensor_type(true, 20, GgufQuant::F16),
             (GGML_F16, false)
+        );
+    }
+
+    // ── write_llama_gguf ─────────────────────────────────────────────────────
+
+    // Build a minimal but valid `llama` GGUF (2 layers, dim 8) as bytes, with all
+    // tensors F32 and a small gpt2 tokenizer block. Deterministic weights.
+    fn tiny_llama_gguf_bytes() -> Vec<u8> {
+        use crate::gguf::{MetaValue, GGML_F32};
+        let (dim, n_layers, n_heads, ffn, vocab, ctx) =
+            (8usize, 2usize, 2usize, 16usize, 32usize, 16usize);
+        let head_dim = dim / n_heads;
+
+        // Deterministic filler in [-0.1, 0.1].
+        let gen = |seed: usize, n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((seed * 131 + i * 17) % 101) as f32 / 500.0) - 0.1)
+                .collect()
+        };
+
+        let mut b = GgufBuilder::new();
+        b.meta("general.architecture", MetaValue::String("llama".into()));
+        b.meta("general.name", MetaValue::String("tiny".into()));
+        b.meta("llama.embedding_length", MetaValue::U32(dim as u32));
+        b.meta("llama.block_count", MetaValue::U32(n_layers as u32));
+        b.meta("llama.attention.head_count", MetaValue::U32(n_heads as u32));
+        b.meta(
+            "llama.attention.head_count_kv",
+            MetaValue::U32(n_heads as u32),
+        );
+        b.meta("llama.feed_forward_length", MetaValue::U32(ffn as u32));
+        b.meta("llama.context_length", MetaValue::U32(ctx as u32));
+        b.meta(
+            "llama.attention.layer_norm_rms_epsilon",
+            MetaValue::F32(1e-5),
+        );
+        // Minimal gpt2 tokenizer block (metadata only — round-trip target).
+        let toks: Vec<MetaValue> = (0..vocab)
+            .map(|i| MetaValue::String(format!("t{i}")))
+            .collect();
+        b.meta("tokenizer.ggml.model", MetaValue::String("gpt2".into()));
+        b.meta("tokenizer.ggml.tokens", MetaValue::Array(toks));
+
+        let f32t = |b: &mut GgufBuilder, name: &str, dims: &[u64], seed: usize| {
+            let n: usize = dims.iter().product::<u64>() as usize;
+            b.tensor(name, dims, GGML_F32, f32s_to_le_bytes(&gen(seed, n)));
+        };
+
+        // token_embd: dims [dim, vocab], data row-major [vocab, dim].
+        f32t(&mut b, "token_embd.weight", &[dim as u64, vocab as u64], 1);
+        for i in 0..n_layers {
+            let p = format!("blk.{i}");
+            f32t(
+                &mut b,
+                &format!("{p}.attn_norm.weight"),
+                &[dim as u64],
+                10 + i,
+            );
+            // Projections: GGUF dims [n_in, n_out].
+            f32t(
+                &mut b,
+                &format!("{p}.attn_q.weight"),
+                &[dim as u64, (n_heads * head_dim) as u64],
+                20 + i,
+            );
+            f32t(
+                &mut b,
+                &format!("{p}.attn_k.weight"),
+                &[dim as u64, (n_heads * head_dim) as u64],
+                30 + i,
+            );
+            f32t(
+                &mut b,
+                &format!("{p}.attn_v.weight"),
+                &[dim as u64, (n_heads * head_dim) as u64],
+                40 + i,
+            );
+            f32t(
+                &mut b,
+                &format!("{p}.attn_output.weight"),
+                &[(n_heads * head_dim) as u64, dim as u64],
+                50 + i,
+            );
+            f32t(
+                &mut b,
+                &format!("{p}.ffn_norm.weight"),
+                &[dim as u64],
+                60 + i,
+            );
+            f32t(
+                &mut b,
+                &format!("{p}.ffn_gate.weight"),
+                &[dim as u64, ffn as u64],
+                70 + i,
+            );
+            f32t(
+                &mut b,
+                &format!("{p}.ffn_up.weight"),
+                &[dim as u64, ffn as u64],
+                80 + i,
+            );
+            f32t(
+                &mut b,
+                &format!("{p}.ffn_down.weight"),
+                &[ffn as u64, dim as u64],
+                90 + i,
+            );
+        }
+        f32t(&mut b, "output_norm.weight", &[dim as u64], 200);
+        f32t(&mut b, "output.weight", &[dim as u64, vocab as u64], 201);
+        b.into_bytes()
+    }
+
+    #[test]
+    fn write_llama_gguf_f32_roundtrip_is_exact() {
+        use crate::gguf::Gguf;
+
+        let g0 = Gguf::parse(tiny_llama_gguf_bytes()).unwrap();
+        let model = g0.load_llama_prec(None).unwrap();
+
+        let out = llama_gguf_bytes(&model, &g0, GgufQuant::F32).unwrap();
+        let g1 = Gguf::parse(out).unwrap();
+        let model2 = g1.load_llama_prec(None).unwrap();
+
+        // Same logits for a fixed token sequence (F32 → bit-exact weights).
+        let toks = [1usize, 5, 2, 7];
+        let l0 = model.forward_tokens(&toks).unwrap();
+        let l1 = model2.forward_tokens(&toks).unwrap();
+        assert_eq!(l0.data, l1.data);
+    }
+
+    #[test]
+    fn write_llama_gguf_preserves_tokenizer_metadata() {
+        use crate::gguf::Gguf;
+        let g0 = Gguf::parse(tiny_llama_gguf_bytes()).unwrap();
+        let model = g0.load_llama_prec(None).unwrap();
+        let out = llama_gguf_bytes(&model, &g0, GgufQuant::Q8_0).unwrap();
+        let g1 = Gguf::parse(out).unwrap();
+        assert_eq!(
+            g1.meta("tokenizer.ggml.model").unwrap().as_str(),
+            Some("gpt2")
+        );
+        assert_eq!(
+            g0.meta("tokenizer.ggml.tokens"),
+            g1.meta("tokenizer.ggml.tokens")
         );
     }
 }

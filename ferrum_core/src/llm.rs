@@ -544,6 +544,17 @@ impl LlamaModel {
         }
         Ok(out)
     }
+
+    /// Serialize this model to a GGUF file, carrying `source`'s hyperparameters
+    /// and tokenizer forward. See [`crate::gguf_write::write_llama_gguf`].
+    pub fn write_gguf(
+        &self,
+        source: &crate::gguf::Gguf,
+        quant: crate::gguf_write::GgufQuant,
+        path: &str,
+    ) -> Result<()> {
+        crate::gguf_write::write_llama_gguf(self, source, quant, path)
+    }
 }
 
 #[cfg(test)]
