@@ -1,0 +1,4 @@
+# Rustfmt configuration (stable channel).
+# Applies to the workspace and to the excluded ferrum_gui crate (ancestor lookup).
+edition = "2021"
+newline_style = "Unix"
