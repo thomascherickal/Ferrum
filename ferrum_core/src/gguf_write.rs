@@ -292,6 +292,23 @@ fn enc_q4_1(data: &[f32]) -> Vec<u8> {
     o
 }
 
+/// Pack 8 six-bit sub-block scales and mins into the 12-byte layout that
+/// [`crate::gguf::get_scale_min_k4`] reads back. Exact inverse of that function.
+#[allow(dead_code)] // consumed by later tasks
+fn put_scale_min_k4(sc: &[u8; 8], m: &[u8; 8]) -> [u8; 12] {
+    let mut q = [0u8; 12];
+    for j in 0..4 {
+        q[j] = sc[j] & 63;
+        q[j + 4] = m[j] & 63;
+    }
+    for j in 4..8 {
+        q[j + 4] = (sc[j] & 0x0F) | ((m[j] & 0x0F) << 4);
+        q[j - 4] |= (sc[j] >> 4) << 6; // top 2 bits of the 6-bit scale
+        q[j] |= (m[j] >> 4) << 6; // top 2 bits of the 6-bit min
+    }
+    q
+}
+
 fn align_up(x: usize, a: usize) -> usize {
     if a == 0 {
         x
@@ -701,5 +718,19 @@ mod tests {
             hi = hi.max(v);
         }
         assert!(max_abs_err(&x, &back) <= (hi - lo) / 15.0 + 1e-4);
+    }
+
+    #[test]
+    fn put_scale_min_k4_inverts_get_scale_min_k4() {
+        use crate::gguf::get_scale_min_k4;
+        // Distinct 6-bit values per sub-block, exercising all bit positions.
+        let sc = [1u8, 2, 3, 62, 33, 40, 63, 17];
+        let m = [7u8, 8, 63, 4, 21, 60, 1, 34];
+        let packed = put_scale_min_k4(&sc, &m);
+        for j in 0..8 {
+            let (d, mn) = get_scale_min_k4(j, &packed);
+            assert_eq!(d, sc[j], "scale mismatch at sub-block {j}");
+            assert_eq!(mn, m[j], "min mismatch at sub-block {j}");
+        }
     }
 }
