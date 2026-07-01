@@ -544,6 +544,35 @@ fn enc_q6_k(data: &[f32]) -> Vec<u8> {
     o
 }
 
+/// Decide the on-disk type for one tensor. 1-D tensors (norms, biases) always
+/// stay F32. 2-D matrices take `quant`, unless their block axis is not divisible
+/// by the block size, in which case they fall back to F16. Returns
+/// `(ggml_type, fell_back)`.
+#[allow(dead_code)] // consumed by later tasks
+pub(crate) fn plan_tensor_type(is_2d: bool, block_axis: usize, quant: GgufQuant) -> (u32, bool) {
+    if !is_2d {
+        return (GGML_F32, false);
+    }
+    match quant {
+        GgufQuant::F32 => (GGML_F32, false),
+        GgufQuant::F16 => (GGML_F16, false),
+        q if q.is_kquant() => {
+            if block_axis.is_multiple_of(QK_K) {
+                (q.ggml_type(), false)
+            } else {
+                (GGML_F16, true)
+            }
+        }
+        q => {
+            if block_axis.is_multiple_of(QK) {
+                (q.ggml_type(), false)
+            } else {
+                (GGML_F16, true)
+            }
+        }
+    }
+}
+
 fn align_up(x: usize, a: usize) -> usize {
     if a == 0 {
         x
@@ -1035,5 +1064,40 @@ mod tests {
         let back = dequant_via_reader(&x, GGML_Q6_K, &[QK_K as u64]);
         let amax = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         assert!(max_abs_err(&x, &back) <= amax * 0.05, "q6_k error too high");
+    }
+
+    #[test]
+    fn plan_tensor_type_applies_policy() {
+        use crate::gguf::{GGML_F16, GGML_F32, GGML_Q4_K, GGML_Q8_0};
+        // 1-D tensors (norms/biases) are always F32.
+        assert_eq!(
+            plan_tensor_type(false, 8, GgufQuant::Q4K),
+            (GGML_F32, false)
+        );
+        // 2-D, divisible by 256 → k-quant target.
+        assert_eq!(
+            plan_tensor_type(true, 256, GgufQuant::Q4K),
+            (GGML_Q4_K, false)
+        );
+        // 2-D, NOT divisible by 256 → k-quant falls back to F16.
+        assert_eq!(
+            plan_tensor_type(true, 100, GgufQuant::Q4K),
+            (GGML_F16, true)
+        );
+        // 2-D, divisible by 32 → legacy target.
+        assert_eq!(
+            plan_tensor_type(true, 64, GgufQuant::Q8_0),
+            (GGML_Q8_0, false)
+        );
+        // 2-D, NOT divisible by 32 → legacy falls back to F16.
+        assert_eq!(
+            plan_tensor_type(true, 20, GgufQuant::Q8_0),
+            (GGML_F16, true)
+        );
+        // F16/F32 targets have no divisibility requirement.
+        assert_eq!(
+            plan_tensor_type(true, 20, GgufQuant::F16),
+            (GGML_F16, false)
+        );
     }
 }
