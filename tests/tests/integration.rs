@@ -489,7 +489,7 @@ fn batch_inference_matches_individual() {
 
 #[test]
 fn heart_dataset_parses() {
-    let csv = std::fs::read_to_string("heart.csv").unwrap_or_default();
+    let csv = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../datasets/tabular/heart.csv")).unwrap_or_default();
     if csv.is_empty() {
         return;
     }
@@ -502,7 +502,7 @@ fn heart_dataset_parses() {
 
 #[test]
 fn cancer_dataset_parses() {
-    let csv = std::fs::read_to_string("cancer.csv").unwrap_or_default();
+    let csv = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../datasets/tabular/cancer.csv")).unwrap_or_default();
     if csv.is_empty() {
         return;
     }
@@ -514,7 +514,7 @@ fn cancer_dataset_parses() {
 
 #[test]
 fn penguins_dataset_parses() {
-    let csv = std::fs::read_to_string("penguins.csv").unwrap_or_default();
+    let csv = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../datasets/tabular/penguins.csv")).unwrap_or_default();
     if csv.is_empty() {
         return;
     }
@@ -528,7 +528,7 @@ fn penguins_dataset_parses() {
 
 #[test]
 fn mpg_dataset_parses_as_regression() {
-    let csv = std::fs::read_to_string("mpg.csv").unwrap_or_default();
+    let csv = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../datasets/tabular/mpg.csv")).unwrap_or_default();
     if csv.is_empty() {
         return;
     }
@@ -540,7 +540,7 @@ fn mpg_dataset_parses_as_regression() {
 
 #[test]
 fn seeds_dataset_parses() {
-    let csv = std::fs::read_to_string("seeds.csv").unwrap_or_default();
+    let csv = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../datasets/tabular/seeds.csv")).unwrap_or_default();
     if csv.is_empty() {
         return;
     }

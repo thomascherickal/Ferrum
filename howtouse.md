@@ -137,8 +137,8 @@ train_cli <csv_path> <model_output.bin> [dataset_name] [hidden_size] [epochs] [-
 ```
 
 ```bash
-cargo run -p train_cli -- iris.csv    model.bin "Iris"    32 500
-cargo run -p train_cli -- housing.csv model.bin "Housing" 64 400
+cargo run -p train_cli -- datasets/tabular/iris.data    model.bin "Iris"    32 500
+cargo run -p train_cli -- datasets/tabular/housing.csv  model.bin "Housing" 64 400
 ```
 
 ---

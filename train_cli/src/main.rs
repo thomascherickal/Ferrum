@@ -4,11 +4,11 @@
 //!   train_cli <csv_path> <model_output.bin> [dataset_name] [hidden_size] [epochs]
 //!
 //! Examples:
-//!   train_cli iris.data          web/datasets/iris/model.bin      "Iris"        32  500
-//!   train_cli wine.csv           web/datasets/wine/model.bin      "Wine"        64  600
-//!   train_cli diabetes.csv       web/datasets/diabetes/model.bin  "Diabetes"    48  600
-//!   train_cli titanic.csv        web/datasets/titanic/model.bin   "Titanic"     32  500
-//!   train_cli housing.csv        web/datasets/housing/model.bin   "Housing"     64  400
+//!   train_cli datasets/tabular/iris.data     web/datasets/iris/model.bin      "Iris"        32  500
+//!   train_cli datasets/tabular/wine.csv      web/datasets/wine/model.bin      "Wine"        64  600
+//!   train_cli datasets/tabular/diabetes.csv  web/datasets/diabetes/model.bin  "Diabetes"    48  600
+//!   train_cli datasets/tabular/titanic.csv   web/datasets/titanic/model.bin   "Titanic"     32  500
+//!   train_cli datasets/tabular/housing.csv   web/datasets/housing/model.bin   "Housing"     64  400
 
 use ferrum_core::{
     accuracy, argmax_rows, fit_normalizer_with_target, mse, softmax_cross_entropy, to_bytes,

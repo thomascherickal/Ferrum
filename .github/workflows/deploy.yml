@@ -62,20 +62,27 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # ── Ensure the 10 source datasets are present ───────────────────────────
+      # They are committed to the repo, so this is normally a no-op that makes no
+      # network calls; it only re-downloads a dataset that is somehow missing
+      # (idempotent — see scripts/download_datasets.sh).
+      - name: Fetch datasets (if missing)
+        run: bash scripts/download_datasets.sh
+
       # ── Train all 10 dataset models ─────────────────────────────────────────
       - name: Train models
         run: |
           cargo build --release -p train_cli
-          cargo run -p train_cli --release -- iris.data      web/datasets/iris/model.bin      "Iris"               32 500
-          cargo run -p train_cli --release -- wine.csv       web/datasets/wine/model.bin      "Wine Quality"       64 600
-          cargo run -p train_cli --release -- diabetes.csv   web/datasets/diabetes/model.bin  "Pima Diabetes"      48 600
-          cargo run -p train_cli --release -- titanic.csv    web/datasets/titanic/model.bin   "Titanic"            32 500
-          cargo run -p train_cli --release -- housing.csv    web/datasets/housing/model.bin   "California Housing" 64 400
-          cargo run -p train_cli --release -- heart.csv      web/datasets/heart/model.bin     "Heart Disease"      32 600
-          cargo run -p train_cli --release -- cancer.csv     web/datasets/cancer/model.bin    "Breast Cancer"      64 600
-          cargo run -p train_cli --release -- penguins.csv   web/datasets/penguins/model.bin  "Palmer Penguins"    32 500
-          cargo run -p train_cli --release -- mpg.csv        web/datasets/mpg/model.bin       "Auto MPG"           48 500
-          cargo run -p train_cli --release -- seeds.csv      web/datasets/seeds/model.bin     "Wheat Seeds"        24 500
+          cargo run -p train_cli --release -- datasets/tabular/iris.data     web/datasets/iris/model.bin      "Iris"               32 500
+          cargo run -p train_cli --release -- datasets/tabular/wine.csv      web/datasets/wine/model.bin      "Wine Quality"       64 600
+          cargo run -p train_cli --release -- datasets/tabular/diabetes.csv  web/datasets/diabetes/model.bin  "Pima Diabetes"      48 600
+          cargo run -p train_cli --release -- datasets/tabular/titanic.csv   web/datasets/titanic/model.bin   "Titanic"            32 500
+          cargo run -p train_cli --release -- datasets/tabular/housing.csv   web/datasets/housing/model.bin   "California Housing" 64 400
+          cargo run -p train_cli --release -- datasets/tabular/heart.csv     web/datasets/heart/model.bin     "Heart Disease"      32 600
+          cargo run -p train_cli --release -- datasets/tabular/cancer.csv    web/datasets/cancer/model.bin    "Breast Cancer"      64 600
+          cargo run -p train_cli --release -- datasets/tabular/penguins.csv  web/datasets/penguins/model.bin  "Palmer Penguins"    32 500
+          cargo run -p train_cli --release -- datasets/tabular/mpg.csv       web/datasets/mpg/model.bin       "Auto MPG"           48 500
+          cargo run -p train_cli --release -- datasets/tabular/seeds.csv     web/datasets/seeds/model.bin     "Wheat Seeds"        24 500
 
       # ── Compile to WebAssembly ───────────────────────────────────────────────
       - name: Build WASM
