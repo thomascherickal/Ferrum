@@ -16,6 +16,7 @@
 //! train_transformer generate <model.bin>  <seed text> [options]
 //! train_transformer run-gguf  <model.gguf> [prompt] [--resume ckpt.flck] [options]
 //! train_transformer finetune-gguf <model.gguf> <corpus.txt> <out.flck> [options]
+//! train_transformer export-gguf <in.gguf> <out.gguf> [--quant q8_0|q4_0|q4_k|…] [--resume ckpt.flck]
 //! train_transformer info     <model.bin>
 //! ```
 //!
@@ -178,6 +179,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "generate" | "gen" => cmd_generate(&args),
         "run-gguf" | "gguf" => cmd_run_gguf(&args),
         "finetune-gguf" | "finetune" => cmd_finetune_gguf(&args),
+        "export-gguf" | "export" => cmd_export_gguf(&args),
         "eval" => cmd_eval(&args),
         "info" => cmd_info(&args),
         "-h" | "--help" | "help" => {
@@ -202,6 +204,7 @@ fn print_usage() {
          \x20 train_transformer generate <model.bin>  <seed text> [options]\n\
          \x20 train_transformer run-gguf <model.gguf> [prompt] [options]\n\
          \x20 train_transformer finetune-gguf <model.gguf> <corpus.txt> <out.flck> [options]\n\
+         \x20 train_transformer export-gguf <in.gguf> <out.gguf> [options]\n\
          \x20 train_transformer eval     <model.bin>  <heldout.txt>\n\
          \x20 train_transformer info     <model.bin>\n\n\
          TRAIN / RUN options:\n\
@@ -228,6 +231,10 @@ fn print_usage() {
          \x20 --qat          (int8 quantization-aware fine-tuning)\n\
          \x20 --threads N  --seed N  --resume ckpt.flck  --sample\n\
          \x20 writes a .flck checkpoint; apply it with  run-gguf ... --resume out.flck\n\n\
+         EXPORT-GGUF options (re-quantize / export an imported GGUF to disk):\n\
+         \x20 --quant q8_0|q4_0|q4_1|q8_1|q4_k|q5_k|q6_k|f16|f32  (output precision; default q8_0)\n\
+         \x20 --resume ckpt.flck  (apply a fine-tune checkpoint's f32 masters before export)\n\
+         \x20 --force        (write even if the memory estimate exceeds available RAM)\n\n\
          If <model.bin> already exists, train/run load the saved weights from\n\
          disk instead of retraining. Pass --force to retrain from scratch.\n\n\
          EXAMPLES:\n\
@@ -909,5 +916,73 @@ fn cmd_finetune_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             .generate(&prompt, args.get("max", 48), &params, eos, &mut grng)?;
         println!("\n── sample ──\n{}\n────────────", tok.decode(&out));
     }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// export-gguf: re-quantize / export an imported llama/qwen2 GGUF checkpoint
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn cmd_export_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    use ferrum_core::{Gguf, GgufQuant, LlamaTrainer};
+
+    if args.positional.len() < 2 {
+        return Err("usage: train_transformer export-gguf <in.gguf> <out.gguf> \
+                    [--quant q8_0|q4_0|q4_1|q8_1|q4_k|q5_k|q6_k|f16|f32] \
+                    [--resume tuned.flck] [--force]"
+            .into());
+    }
+    let in_path = &args.positional[0];
+    let out_path = &args.positional[1];
+    let quant_name = args
+        .flags
+        .get("quant")
+        .map(String::as_str)
+        .unwrap_or("q8_0");
+    let quant =
+        GgufQuant::from_str(quant_name).ok_or_else(|| format!("unknown --quant '{quant_name}'"))?;
+
+    println!("Opening {in_path} (streamed)…");
+    let g = Gguf::open(in_path).map_err(|e| format!("cannot open GGUF {in_path}: {e}"))?;
+    println!(
+        "  GGUF v{}   architecture = {}",
+        g.version,
+        g.architecture().unwrap_or("?")
+    );
+
+    // Export re-quantizes from f32, so guard for an f32-sized load.
+    let est = estimate_resident_bytes(&g, None);
+    println!("  estimated resident (f32) ≈ {:.2} GB", est as f64 / 1e9);
+    if let Some(avail) = available_memory_bytes() {
+        if (est as f64) > 0.9 * avail as f64 && !args.has("force") {
+            return Err(format!(
+                "estimated resident memory ({:.2} GB) exceeds 90% of available ({:.2} GB) — \
+                 pass --force to attempt it anyway.",
+                est as f64 / 1e9,
+                avail as f64 / 1e9
+            )
+            .into());
+        }
+    }
+
+    println!("Loading weights (f32)…");
+    let mut model = g
+        .load_llama_prec(None)
+        .map_err(|e| format!("cannot load model: {e}"))?;
+
+    // Optional: apply a fine-tune checkpoint's f32 masters before export.
+    if let Some(ckpt) = args.flags.get("resume") {
+        println!("Applying fine-tune checkpoint {ckpt}…");
+        let bytes = std::fs::read(ckpt)?;
+        let mut trainer = LlamaTrainer::new(model)?;
+        trainer.load_checkpoint_into(&bytes)?;
+        model = trainer.model;
+    }
+
+    println!("Writing {out_path}  (--quant {quant_name})…");
+    ferrum_core::write_llama_gguf(&model, &g, quant, out_path)
+        .map_err(|e| format!("export failed: {e}"))?;
+    let sz = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
+    println!("Done: {out_path}  ({:.2} MB)", sz as f64 / 1e6);
     Ok(())
 }
