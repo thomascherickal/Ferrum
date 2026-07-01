@@ -160,6 +160,14 @@ pub(crate) fn encode_tensor(data: &[f32], ggml_type: u32) -> Result<Vec<u8>> {
             need_mult(QK)?;
             enc_q8_1(data)
         }
+        GGML_Q4_0 => {
+            need_mult(QK)?;
+            enc_q4_0(data)
+        }
+        GGML_Q4_1 => {
+            need_mult(QK)?;
+            enc_q4_1(data)
+        }
         other => {
             return Err(InferError::Format(format!(
                 "encode_tensor: unsupported ggml type {other}"
@@ -224,6 +232,61 @@ fn enc_q8_1(data: &[f32]) -> Vec<u8> {
         o.extend_from_slice(&f32_to_f16(d * sum as f32).to_le_bytes());
         for &q in &qs {
             o.push(q as u8);
+        }
+    }
+    o
+}
+
+/// Q4_0: per 32-element block, `d = max/-8` where `max` is the value of largest
+/// magnitude; `q = round(x/d)+8` clamped to 0..15. Elements `j` and `j+16` share
+/// byte `j` (low/high nibble). Decode is `d * (q - 8)`.
+#[allow(dead_code)] // consumed by later tasks
+fn enc_q4_0(data: &[f32]) -> Vec<u8> {
+    let half = QK / 2;
+    let mut o = Vec::with_capacity(data.len() / QK * (2 + half));
+    for blk in data.chunks_exact(QK) {
+        // Pick the extreme value (largest |x|) to anchor the scale, as ggml does.
+        let mut max = 0.0f32;
+        let mut amax = 0.0f32;
+        for &x in blk {
+            if x.abs() > amax {
+                amax = x.abs();
+                max = x;
+            }
+        }
+        let d = max / -8.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        o.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+        for j in 0..half {
+            let q0 = ((blk[j] * id + 8.5) as i32).clamp(0, 15) as u8;
+            let q1 = ((blk[j + half] * id + 8.5) as i32).clamp(0, 15) as u8;
+            o.push(q0 | (q1 << 4));
+        }
+    }
+    o
+}
+
+/// Q4_1: per 32-element block, `d = (max-min)/15`, `q = round((x-min)/d)` in
+/// 0..15, storing `d` and `min` (both f16). Decode is `d * q + min`.
+#[allow(dead_code)] // consumed by later tasks
+fn enc_q4_1(data: &[f32]) -> Vec<u8> {
+    let half = QK / 2;
+    let mut o = Vec::with_capacity(data.len() / QK * (2 + 2 + half));
+    for blk in data.chunks_exact(QK) {
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for &x in blk {
+            lo = lo.min(x);
+            hi = hi.max(x);
+        }
+        let d = (hi - lo) / 15.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        o.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+        o.extend_from_slice(&f32_to_f16(lo).to_le_bytes());
+        for j in 0..half {
+            let q0 = (((blk[j] - lo) * id + 0.5) as i32).clamp(0, 15) as u8;
+            let q1 = (((blk[j + half] - lo) * id + 0.5) as i32).clamp(0, 15) as u8;
+            o.push(q0 | (q1 << 4));
         }
     }
     o
@@ -615,5 +678,28 @@ mod tests {
         // 20 is not a multiple of QK=32.
         let x = vec![0.0f32; 20];
         assert!(encode_tensor(&x, GGML_Q8_0).is_err());
+    }
+
+    #[test]
+    fn enc_q4_0_within_block_bound() {
+        use crate::gguf::GGML_Q4_0;
+        let x: Vec<f32> = (0..64).map(|i| ((i * 3) % 17) as f32 - 8.0).collect();
+        let back = dequant_via_reader(&x, GGML_Q4_0, &[64]);
+        // Symmetric 4-bit: 15 levels across [-amax, amax] → step ≈ amax/7.5.
+        let amax = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(max_abs_err(&x, &back) <= amax / 7.0 + 1e-4);
+    }
+
+    #[test]
+    fn enc_q4_1_within_block_bound() {
+        use crate::gguf::GGML_Q4_1;
+        let x: Vec<f32> = (0..64).map(|i| (i as f32) * 0.25 - 3.0).collect();
+        let back = dequant_via_reader(&x, GGML_Q4_1, &[64]);
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &v in &x {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        assert!(max_abs_err(&x, &back) <= (hi - lo) / 15.0 + 1e-4);
     }
 }
