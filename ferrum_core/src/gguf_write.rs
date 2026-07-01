@@ -176,6 +176,10 @@ pub(crate) fn encode_tensor(data: &[f32], ggml_type: u32) -> Result<Vec<u8>> {
             need_mult(QK_K)?;
             enc_q5_k(data)
         }
+        GGML_Q6_K => {
+            need_mult(QK_K)?;
+            enc_q6_k(data)
+        }
         other => {
             return Err(InferError::Format(format!(
                 "encode_tensor: unsupported ggml type {other}"
@@ -307,6 +311,10 @@ const Q4_K_BLOCK_LEN: usize = 2 + 2 + 12 + QK_K / 2; // 144
 /// Q5_K super-block length in encoded bytes.
 #[allow(dead_code)] // consumed by later tasks
 const Q5_K_BLOCK_LEN: usize = 2 + 2 + 12 + QK_K / 8 + QK_K / 2; // 176
+
+/// Q6_K super-block length in encoded bytes.
+#[allow(dead_code)] // consumed by later tasks
+const Q6_K_BLOCK_LEN: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2; // 210
 
 /// Pack 8 six-bit sub-block scales and mins into the 12-byte layout that
 /// [`crate::gguf::get_scale_min_k4`] reads back. Exact inverse of that function.
@@ -464,6 +472,74 @@ fn enc_q5_k(data: &[f32]) -> Vec<u8> {
         o.extend_from_slice(&put_scale_min_k4(&sc, &m));
         o.extend_from_slice(&qh);
         o.extend_from_slice(&qs);
+    }
+    o
+}
+
+/// Q6_K: per 256-element super-block, 16 groups of 16 with signed 6-bit quants
+/// (`q ∈ -32..31`) and an `i8` scale per group, all multiplied by a super-block
+/// `d` (f16). Decode: `d * scale_g * q`.
+#[allow(dead_code)] // consumed by later tasks
+fn enc_q6_k(data: &[f32]) -> Vec<u8> {
+    let mut o = Vec::with_capacity(data.len() / QK_K * Q6_K_BLOCK_LEN);
+    for sblk in data.chunks_exact(QK_K) {
+        // 1. Per 16-element group, a real scale mapping amax → q = 31.
+        let mut gscale = [0.0f32; 16];
+        for g in 0..16 {
+            let seg = &sblk[g * 16..g * 16 + 16];
+            let amax = seg.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            gscale[g] = amax / 31.0;
+        }
+        // 2. Super-block d and i8 group scales.
+        let dmax = gscale.iter().cloned().fold(0.0f32, f32::max);
+        let d = dmax / 127.0;
+        let mut scales = [0i8; 16];
+        for g in 0..16 {
+            scales[g] = if d > 0.0 {
+                ((gscale[g] / d).round() as i32).clamp(-127, 127) as i8
+            } else {
+                0
+            };
+        }
+        // 3. Quantize each element to a signed 6-bit code, stored as u = q + 32.
+        let mut u = [0u8; QK_K];
+        for g in 0..16 {
+            let a = d * scales[g] as f32;
+            for l in 0..16 {
+                let x = sblk[g * 16 + l];
+                let q = if a != 0.0 {
+                    ((x / a).round() as i32).clamp(-32, 31)
+                } else {
+                    0
+                };
+                u[g * 16 + l] = (q + 32) as u8; // 0..63
+            }
+        }
+        // 4. Pack ql/qh per the reader's two-half layout.
+        let mut ql = [0u8; QK_K / 2]; // 128
+        let mut qh = [0u8; QK_K / 4]; // 64
+        for half in 0..2 {
+            let (oo, qlo, qho) = (half * 128, half * 64, half * 32);
+            for l in 0..32 {
+                let ua = u[oo + l];
+                let ub = u[oo + l + 32];
+                let uc = u[oo + l + 64];
+                let ud = u[oo + l + 96];
+                ql[qlo + l] = (ua & 0x0F) | ((uc & 0x0F) << 4);
+                ql[qlo + l + 32] = (ub & 0x0F) | ((ud & 0x0F) << 4);
+                qh[qho + l] = ((ua >> 4) & 3)
+                    | (((ub >> 4) & 3) << 2)
+                    | (((uc >> 4) & 3) << 4)
+                    | (((ud >> 4) & 3) << 6);
+            }
+        }
+        // 5. Emit: ql, qh, 16 i8 scales, d (f16) — matching the reader's order.
+        o.extend_from_slice(&ql);
+        o.extend_from_slice(&qh);
+        for &s in &scales {
+            o.push(s as u8);
+        }
+        o.extend_from_slice(&f32_to_f16(d).to_le_bytes());
     }
     o
 }
@@ -937,5 +1013,27 @@ mod tests {
         let back = dequant_via_reader(&x, GGML_Q5_K, &[QK_K as u64]);
         let amax = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         assert!(max_abs_err(&x, &back) <= amax * 0.10, "q5_k error too high");
+    }
+
+    #[test]
+    fn enc_q6_k_constant_block_is_near_exact() {
+        use crate::gguf::GGML_Q6_K;
+        for &c in &[0.5f32, -0.75] {
+            let x = vec![c; QK_K];
+            let back = dequant_via_reader(&x, GGML_Q6_K, &[QK_K as u64]);
+            assert!(max_abs_err(&x, &back) <= c.abs() * 0.02 + 1e-3, "c={c}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)]
+    fn enc_q6_k_within_bound() {
+        use crate::gguf::GGML_Q6_K;
+        let x: Vec<f32> = (0..QK_K)
+            .map(|i| ((i as f32 * 3.7).cos() * 987.65).fract() * 2.0 - 1.0)
+            .collect();
+        let back = dequant_via_reader(&x, GGML_Q6_K, &[QK_K as u64]);
+        let amax = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(max_abs_err(&x, &back) <= amax * 0.05, "q6_k error too high");
     }
 }
