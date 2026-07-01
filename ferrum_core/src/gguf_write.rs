@@ -172,6 +172,10 @@ pub(crate) fn encode_tensor(data: &[f32], ggml_type: u32) -> Result<Vec<u8>> {
             need_mult(QK_K)?;
             enc_q4_k(data)
         }
+        GGML_Q5_K => {
+            need_mult(QK_K)?;
+            enc_q5_k(data)
+        }
         other => {
             return Err(InferError::Format(format!(
                 "encode_tensor: unsupported ggml type {other}"
@@ -300,6 +304,10 @@ fn enc_q4_1(data: &[f32]) -> Vec<u8> {
 #[allow(dead_code)] // consumed by later tasks
 const Q4_K_BLOCK_LEN: usize = 2 + 2 + 12 + QK_K / 2; // 144
 
+/// Q5_K super-block length in encoded bytes.
+#[allow(dead_code)] // consumed by later tasks
+const Q5_K_BLOCK_LEN: usize = 2 + 2 + 12 + QK_K / 8 + QK_K / 2; // 176
+
 /// Pack 8 six-bit sub-block scales and mins into the 12-byte layout that
 /// [`crate::gguf::get_scale_min_k4`] reads back. Exact inverse of that function.
 #[allow(dead_code)] // consumed by later tasks
@@ -383,6 +391,78 @@ fn enc_q4_k(data: &[f32]) -> Vec<u8> {
         o.extend_from_slice(&f32_to_f16(d).to_le_bytes());
         o.extend_from_slice(&f32_to_f16(dmin).to_le_bytes());
         o.extend_from_slice(&put_scale_min_k4(&sc, &m));
+        o.extend_from_slice(&qs);
+    }
+    o
+}
+
+/// Q5_K: like Q4_K but 5-bit quants (`qv ∈ 0..31`). The low nibble is packed as
+/// in Q4_K; the 5th bit rides in `qh` (bit `s` of `qh[l]`). Decode:
+/// `d*sc_s*qv - dmin*m_s`.
+#[allow(dead_code)] // consumed by later tasks
+fn enc_q5_k(data: &[f32]) -> Vec<u8> {
+    let mut o = Vec::with_capacity(data.len() / QK_K * Q5_K_BLOCK_LEN);
+    for sblk in data.chunks_exact(QK_K) {
+        let mut scale_r = [0.0f32; 8];
+        let mut min_r = [0.0f32; 8];
+        for s in 0..8 {
+            let seg = &sblk[s * 32..s * 32 + 32];
+            let mut lo = f32::INFINITY;
+            let mut hi = f32::NEG_INFINITY;
+            for &v in seg {
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+            let min = if lo < 0.0 { -lo } else { 0.0 };
+            let base = -min;
+            let scale = (hi - base) / 31.0; // 5-bit → 31 levels
+            scale_r[s] = if scale > 0.0 { scale } else { 0.0 };
+            min_r[s] = min;
+        }
+        let d = scale_r.iter().cloned().fold(0.0f32, f32::max) / 63.0;
+        let dmin = min_r.iter().cloned().fold(0.0f32, f32::max) / 63.0;
+        let (mut sc, mut m) = ([0u8; 8], [0u8; 8]);
+        for s in 0..8 {
+            sc[s] = if d > 0.0 {
+                ((scale_r[s] / d).round() as i32).clamp(0, 63) as u8
+            } else {
+                0
+            };
+            m[s] = if dmin > 0.0 {
+                ((min_r[s] / dmin).round() as i32).clamp(0, 63) as u8
+            } else {
+                0
+            };
+        }
+        let mut qs = [0u8; QK_K / 2];
+        let mut qh = [0u8; QK_K / 8]; // 32 bytes, one bit per sub-block
+        for s in 0..8 {
+            let a_scale = d * sc[s] as f32;
+            let a_min = dmin * m[s] as f32;
+            for l in 0..32 {
+                let x = sblk[s * 32 + l];
+                let qv = if a_scale > 0.0 {
+                    (((x + a_min) / a_scale).round() as i32).clamp(0, 31) as u8
+                } else {
+                    0
+                };
+                let low = qv & 0x0F;
+                let high = (qv >> 4) & 1;
+                let byte = 32 * (s / 2) + l;
+                if s % 2 == 0 {
+                    qs[byte] |= low;
+                } else {
+                    qs[byte] |= low << 4;
+                }
+                if high != 0 {
+                    qh[l] |= 1 << s;
+                }
+            }
+        }
+        o.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+        o.extend_from_slice(&f32_to_f16(dmin).to_le_bytes());
+        o.extend_from_slice(&put_scale_min_k4(&sc, &m));
+        o.extend_from_slice(&qh);
         o.extend_from_slice(&qs);
     }
     o
@@ -835,5 +915,27 @@ mod tests {
         let back = dequant_via_reader(&x, GGML_Q4_K, &[QK_K as u64]);
         let amax = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         assert!(max_abs_err(&x, &back) <= amax * 0.15, "q4_k error too high");
+    }
+
+    #[test]
+    fn enc_q5_k_constant_block_is_near_exact() {
+        use crate::gguf::GGML_Q5_K;
+        for &c in &[0.5f32, -0.75] {
+            let x = vec![c; QK_K];
+            let back = dequant_via_reader(&x, GGML_Q5_K, &[QK_K as u64]);
+            assert!(max_abs_err(&x, &back) <= c.abs() * 0.02 + 1e-3, "c={c}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)]
+    fn enc_q5_k_within_bound() {
+        use crate::gguf::GGML_Q5_K;
+        let x: Vec<f32> = (0..QK_K)
+            .map(|i| ((i as f32 * 7.13).sin() * 1234.5).fract() * 2.0 - 1.0)
+            .collect();
+        let back = dequant_via_reader(&x, GGML_Q5_K, &[QK_K as u64]);
+        let amax = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(max_abs_err(&x, &back) <= amax * 0.10, "q5_k error too high");
     }
 }
