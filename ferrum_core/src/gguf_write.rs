@@ -5,11 +5,11 @@
 //! is the exact inverse of the matching `dequant_*` decoder, and is verified by
 //! round-tripping through [`crate::gguf::Gguf`].
 
-use crate::error::InferError;
+use crate::error::{InferError, Result};
 use crate::gguf::{
     MetaValue, DEFAULT_ALIGNMENT, GGML_F16, GGML_F32, GGML_Q4_0, GGML_Q4_1, GGML_Q4_K, GGML_Q5_K,
-    GGML_Q6_K, GGML_Q8_0, GGML_Q8_1, GGUF_MAGIC, VT_ARRAY, VT_BOOL, VT_F32, VT_F64, VT_I16, VT_I32,
-    VT_I64, VT_I8, VT_STRING, VT_U16, VT_U32, VT_U64, VT_U8,
+    GGML_Q6_K, GGML_Q8_0, GGML_Q8_1, GGUF_MAGIC, QK, VT_ARRAY, VT_BOOL, VT_F32, VT_F64, VT_I16,
+    VT_I32, VT_I64, VT_I8, VT_STRING, VT_U16, VT_U32, VT_U64, VT_U8,
 };
 
 /// The on-disk GGUF tensor type the writer should emit for weight matrices.
@@ -134,6 +134,99 @@ pub fn f32_to_f16(value: f32) -> u16 {
         }
     }
     sign | ((exp16 as u16) << 10) | mant16
+}
+
+/// Encode a whole tensor's f32 values into GGUF on-disk bytes for `ggml_type`.
+/// Quantized types require the length to be a multiple of their block size.
+#[allow(dead_code)] // consumed by later tasks
+pub(crate) fn encode_tensor(data: &[f32], ggml_type: u32) -> Result<Vec<u8>> {
+    let n = data.len();
+    let need_mult = |m: usize| -> Result<()> {
+        if !n.is_multiple_of(m) {
+            return Err(InferError::Format(format!(
+                "tensor length {n} is not a multiple of block size {m} for ggml type {ggml_type}"
+            )));
+        }
+        Ok(())
+    };
+    Ok(match ggml_type {
+        GGML_F32 => enc_f32(data),
+        GGML_F16 => enc_f16(data),
+        GGML_Q8_0 => {
+            need_mult(QK)?;
+            enc_q8_0(data)
+        }
+        GGML_Q8_1 => {
+            need_mult(QK)?;
+            enc_q8_1(data)
+        }
+        other => {
+            return Err(InferError::Format(format!(
+                "encode_tensor: unsupported ggml type {other}"
+            )))
+        }
+    })
+}
+
+#[allow(dead_code)] // consumed by later tasks
+fn enc_f32(data: &[f32]) -> Vec<u8> {
+    let mut o = Vec::with_capacity(data.len() * 4);
+    for &x in data {
+        o.extend_from_slice(&x.to_le_bytes());
+    }
+    o
+}
+
+#[allow(dead_code)] // consumed by later tasks
+fn enc_f16(data: &[f32]) -> Vec<u8> {
+    let mut o = Vec::with_capacity(data.len() * 2);
+    for &x in data {
+        o.extend_from_slice(&f32_to_f16(x).to_le_bytes());
+    }
+    o
+}
+
+/// Q8_0: per 32-element block, `d = amax/127` (f16), then 32 × i8 with
+/// `q = round(x/d)`. Decode is `d * q`.
+#[allow(dead_code)] // consumed by later tasks
+fn enc_q8_0(data: &[f32]) -> Vec<u8> {
+    let mut o = Vec::with_capacity(data.len() / QK * (2 + QK));
+    for blk in data.chunks_exact(QK) {
+        let amax = blk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let d = amax / 127.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        o.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+        for &x in blk {
+            let q = (x * id).round().clamp(-127.0, 127.0) as i8;
+            o.push(q as u8);
+        }
+    }
+    o
+}
+
+/// Q8_1: like Q8_0 plus a per-block sum `s = d * Σq` (f16). The reader ignores
+/// `s` on decode, but ggml stores it, so we compute it faithfully.
+#[allow(dead_code)] // consumed by later tasks
+fn enc_q8_1(data: &[f32]) -> Vec<u8> {
+    let mut o = Vec::with_capacity(data.len() / QK * (2 + 2 + QK));
+    for blk in data.chunks_exact(QK) {
+        let amax = blk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let d = amax / 127.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        let mut qs = [0i8; QK];
+        let mut sum = 0i32;
+        for (j, &x) in blk.iter().enumerate() {
+            let q = (x * id).round().clamp(-127.0, 127.0) as i8;
+            qs[j] = q;
+            sum += q as i32;
+        }
+        o.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+        o.extend_from_slice(&f32_to_f16(d * sum as f32).to_le_bytes());
+        for &q in &qs {
+            o.push(q as u8);
+        }
+    }
+    o
 }
 
 fn align_up(x: usize, a: usize) -> usize {
@@ -456,5 +549,71 @@ mod tests {
             o.extend_from_slice(&x.to_le_bytes());
         }
         o
+    }
+
+    // Round-trip a tensor through the real writer+reader stack and return the
+    // reconstructed f32 values. This is the encoder correctness oracle.
+    pub(crate) fn dequant_via_reader(data: &[f32], ggml_type: u32, dims: &[u64]) -> Vec<f32> {
+        use crate::gguf::{Gguf, MetaValue};
+        let mut b = GgufBuilder::new();
+        b.meta("general.architecture", MetaValue::String("llama".into()));
+        b.tensor(
+            "t",
+            dims,
+            ggml_type,
+            encode_tensor(data, ggml_type).unwrap(),
+        );
+        let g = Gguf::parse(b.into_bytes()).unwrap();
+        g.dequantize(g.tensor("t").unwrap()).unwrap()
+    }
+
+    fn max_abs_err(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn enc_f32_is_exact() {
+        use crate::gguf::GGML_F32;
+        let x: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.1).collect();
+        let back = dequant_via_reader(&x, GGML_F32, &[64]);
+        assert_eq!(back, x);
+    }
+
+    #[test]
+    fn enc_f16_within_half_ulp() {
+        use crate::gguf::GGML_F16;
+        let x: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.01).collect();
+        let back = dequant_via_reader(&x, GGML_F16, &[64]);
+        // Each value within f16 relative resolution near this magnitude.
+        assert!(max_abs_err(&x, &back) < 0.001);
+    }
+
+    #[test]
+    fn enc_q8_0_within_block_bound() {
+        use crate::gguf::GGML_Q8_0;
+        let x: Vec<f32> = (0..64).map(|i| ((i * 7) % 13) as f32 - 6.0).collect();
+        let back = dequant_via_reader(&x, GGML_Q8_0, &[64]);
+        let amax = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(max_abs_err(&x, &back) <= amax / 127.0 + 1e-4);
+    }
+
+    #[test]
+    fn enc_q8_1_within_block_bound() {
+        use crate::gguf::GGML_Q8_1;
+        let x: Vec<f32> = (0..64).map(|i| ((i * 5) % 11) as f32 - 5.0).collect();
+        let back = dequant_via_reader(&x, GGML_Q8_1, &[64]);
+        let amax = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(max_abs_err(&x, &back) <= amax / 127.0 + 1e-4);
+    }
+
+    #[test]
+    fn encode_tensor_rejects_ragged_quantized() {
+        use crate::gguf::GGML_Q8_0;
+        // 20 is not a multiple of QK=32.
+        let x = vec![0.0f32; 20];
+        assert!(encode_tensor(&x, GGML_Q8_0).is_err());
     }
 }
