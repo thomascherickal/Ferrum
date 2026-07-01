@@ -1,0 +1,55 @@
+# cargo-deny configuration — dependency vulnerability, license, and source audit.
+#
+# This governs the licenses/health of *dependencies*. The project's own license
+# is MIT (see LICENSE). Run at the workspace root and, separately, against the
+# excluded ferrum_gui crate (its own lockfile):
+#   cargo deny check
+#   cargo deny --manifest-path ferrum_gui/Cargo.toml check
+
+[advisories]
+version = 2
+# Refuse to build against yanked releases; security vulnerabilities fail by
+# default. "unmaintained" advisories are scoped to workspace crates only — deep
+# transitive unmaintained deps (e.g. Tauri's unic-* i18n crates) are outside our
+# control, so they don't fail CI, while a security vuln anywhere still does.
+yanked = "deny"
+unmaintained = "workspace"
+# Add specific RUSTSEC IDs here only when a fix is not yet available upstream.
+ignore = []
+
+[licenses]
+version = 2
+# Permissive-only allow-list covering both dependency trees. Every crate must
+# resolve to one of these. MPL-2.0 is weak (file-level) copyleft and is fine to
+# consume as a dependency; it does not affect this project's MIT licensing.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Unlicense",
+    "CC0-1.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Informational (non-fatal): duplicate versions are common in large trees, and
+# the "wildcard" deps flagged are just internal path crates (`ferrum_core` is
+# consumed as `{ path = ".." }`), which are legitimate.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+# Only crates.io; no unknown registries or git sources.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

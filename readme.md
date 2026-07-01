@@ -210,4 +210,4 @@ cargo doc   -p ferrum_core --open  # browse the API docs
 
 ## License
 
-Licensed under either of **MIT** or **Apache-2.0** at your option.
+Licensed under the **MIT** license. See [LICENSE](LICENSE).
