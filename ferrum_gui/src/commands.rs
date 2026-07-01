@@ -579,18 +579,13 @@ fn gguf_resident_bytes(g: &Gguf, prec: Option<QKind>) -> usize {
 
 /// Best-effort available RAM (Linux `/proc/meminfo`); `None` elsewhere.
 fn available_memory_bytes() -> Option<usize> {
-    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in info.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            return rest
-                .split_whitespace()
-                .next()?
-                .parse::<usize>()
-                .ok()
-                .map(|kb| kb * 1024);
-        }
-    }
-    None
+    // Cross-platform via sysinfo (0.33 reports bytes). The previous /proc/meminfo
+    // reader returned None on macOS/Windows, silently disabling the RAM guard on
+    // the very desktops the Tauri app also ships to.
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let avail = sys.available_memory();
+    (avail > 0).then_some(avail as usize)
 }
 
 #[derive(Serialize)]
@@ -1206,6 +1201,17 @@ mod tests {
     fn file_name_extracts_basename() {
         assert_eq!(file_name("/a/b/model.bin"), "model.bin");
         assert_eq!(file_name("model.bin"), "model.bin");
+    }
+
+    #[test]
+    fn available_memory_is_reported_cross_platform() {
+        // The RAM guard is only meaningful if this returns a real figure; the old
+        // /proc/meminfo reader returned None off Linux, disabling the guard there.
+        let avail = available_memory_bytes().expect("available memory should be reported");
+        assert!(
+            avail > 16 * 1024 * 1024,
+            "implausibly small avail: {avail} bytes"
+        );
     }
 
     #[test]

@@ -35,10 +35,27 @@ pub const DECODE_EFFICIENCY: f64 = 0.35;
 /// (imperfect parallel scaling + non-GEMM work).
 pub const TRAIN_EFFICIENCY: f64 = 0.5;
 
+/// Resident bytes per parameter **during training**: this engine's optimizer
+/// keeps four f32 tensors per weight — the master, the gradient, and Adam's two
+/// moments — so a trainable model needs ≈16 B/param in RAM (activations extra).
+pub const TRAIN_BYTES_PER_PARAM: f64 = 16.0;
+/// Resident bytes per parameter for forward-only **eval** (fp32 weights).
+pub const EVAL_BYTES_PER_PARAM: f64 = 4.0;
+
 // ── Pure bound math ──────────────────────────────────────────────────────────
 
 fn finite_pos(x: f64) -> bool {
     x.is_finite() && x > 0.0
+}
+
+/// Max parameters that fit in `mem_avail` bytes at `bytes_per_param`. Returns
+/// `+∞` when memory is unknown (`0`), so a later `min` leaves the compute bound
+/// untouched rather than collapsing it to zero.
+fn mem_bound_params(mem_avail: u64, bytes_per_param: f64) -> f64 {
+    if mem_avail == 0 || !finite_pos(bytes_per_param) {
+        return f64::INFINITY;
+    }
+    mem_avail as f64 / bytes_per_param
 }
 
 /// Max parameters decodable at >= [`TARGET_TOKS`], bandwidth-bound: each decoded
@@ -51,7 +68,7 @@ pub fn infer_max_params(bw_bytes_per_s: f64, bytes_per_param: f64) -> f64 {
 }
 
 /// Usable training/eval compute budget (FLOPs) within the 24h wall clock.
-/// `gflops` is the aggregate GEMM throughput across all cores.
+/// `gflops` is the aggregate GEMM throughput across all worker threads.
 fn flop_budget(gflops: f64) -> f64 {
     if !finite_pos(gflops) {
         return 0.0;
@@ -88,7 +105,7 @@ pub struct CapabilityReport {
     pub mem_avail: u64,
     /// Measured memory bandwidth (GB/s).
     pub mem_bw_gbps: f64,
-    /// Aggregate GEMM throughput across all cores (GFLOP/s).
+    /// Aggregate GEMM throughput across all worker threads (GFLOP/s).
     pub gemm_gflops: f64,
     pub infer_int4: f64,
     pub infer_int8: f64,
@@ -105,7 +122,11 @@ pub struct CapabilityReport {
 }
 
 /// Build a report from measured numbers (pure; no Tauri runtime needed).
-/// `gemm_single` is single-thread GFLOP/s; aggregate = single * cores.
+/// `gemm_single` is single-thread GFLOP/s; aggregate throughput uses `threads`
+/// (the engine's worker-pool size — what actually runs), not the hardware core
+/// count. Training/eval param bounds are the **min of the compute bound and the
+/// memory bound**, so a machine with plenty of FLOPs but little RAM is not told
+/// it can train a model that won't fit.
 fn assemble_report(
     cpu: String,
     cores: usize,
@@ -115,7 +136,9 @@ fn assemble_report(
     bw_bytes_per_s: f64,
     gemm_single: f64,
 ) -> CapabilityReport {
-    let gflops = gemm_single * cores as f64;
+    let gflops = gemm_single * threads.max(1) as f64;
+    let train_mem = mem_bound_params(mem_avail, TRAIN_BYTES_PER_PARAM);
+    let eval_mem = mem_bound_params(mem_avail, EVAL_BYTES_PER_PARAM);
     CapabilityReport {
         cpu,
         cores,
@@ -127,9 +150,9 @@ fn assemble_report(
         infer_int4: infer_max_params(bw_bytes_per_s, BPP_INT4),
         infer_int8: infer_max_params(bw_bytes_per_s, BPP_INT8),
         infer_f32: infer_max_params(bw_bytes_per_s, BPP_F32),
-        train_chinchilla: train_max_chinchilla(gflops),
-        train_fixed1b: train_max_fixed(gflops),
-        test_eval: test_max_params(gflops),
+        train_chinchilla: train_max_chinchilla(gflops).min(train_mem),
+        train_fixed1b: train_max_fixed(gflops).min(train_mem),
+        test_eval: test_max_params(gflops).min(eval_mem),
         target_toks: TARGET_TOKS,
         train_hours: TRAIN_SECS / 3600.0,
         eval_tokens: EVAL_TOKENS,
@@ -333,23 +356,80 @@ mod tests {
     #[test]
     fn report_assembles_consistent_bounds() {
         // Bypass the command (needs a Tauri runtime) and check the assembly
-        // helper used by it directly.
+        // helper used by it directly. cores ≠ threads to prove the aggregate uses
+        // the worker-pool size (threads), not the hardware core count.
         let r = assemble_report(
             "Test CPU".into(),
-            8,
-            8,
+            8, // cores
+            4, // threads (engine worker pool)
             16_000_000_000,
             8_000_000_000,
             8e9,  // 8 GB/s
             10.0, // 10 GFLOP/s single-thread
         );
         assert_eq!(r.cores, 8);
+        assert_eq!(r.threads, 4);
         assert!(
-            (r.gemm_gflops - 80.0).abs() < 1e-6,
-            "aggregate = single*cores"
+            (r.gemm_gflops - 40.0).abs() < 1e-6,
+            "aggregate = single*threads (got {})",
+            r.gemm_gflops
         );
         assert!(r.infer_int4 > r.infer_int8 && r.infer_int8 > r.infer_f32);
         assert!(r.train_chinchilla > 0.0 && r.train_fixed1b > 0.0 && r.test_eval > 0.0);
         assert_eq!(r.target_toks, TARGET_TOKS);
+    }
+
+    #[test]
+    fn mem_bound_is_infinite_when_memory_unknown() {
+        assert_eq!(mem_bound_params(0, TRAIN_BYTES_PER_PARAM), f64::INFINITY);
+        assert_eq!(mem_bound_params(16_000_000_000, 16.0), 1e9);
+    }
+
+    #[test]
+    fn training_bound_is_memory_capped_when_ram_is_scarce() {
+        // Huge compute, tiny RAM (1 GB): the training bound must collapse to the
+        // memory ceiling (1e9 / 16 B ≈ 62.5M params), not the compute figure.
+        let r = assemble_report(
+            "cpu".into(),
+            64,
+            64,
+            2_000_000_000,
+            1_000_000_000,
+            50e9,
+            200.0,
+        );
+        let mem_cap = 1_000_000_000.0 / TRAIN_BYTES_PER_PARAM;
+        assert!(
+            (r.train_chinchilla - mem_cap).abs() < 1.0,
+            "chinchilla not RAM-capped: {}",
+            r.train_chinchilla
+        );
+        assert!(
+            r.train_fixed1b <= mem_cap + 1.0,
+            "fixed not RAM-capped: {}",
+            r.train_fixed1b
+        );
+        // Compute alone (200 GFLOP/s × 64 threads) would have allowed more.
+        assert!(train_max_chinchilla(200.0 * 64.0) > mem_cap);
+    }
+
+    #[test]
+    fn training_bound_is_compute_limited_when_ram_is_ample() {
+        // Modest compute, huge RAM: the memory cap must NOT bind — the reported
+        // bound equals the pure compute figure.
+        let r = assemble_report(
+            "cpu".into(),
+            4,
+            4,
+            u64::MAX,
+            1_000_000_000_000_000,
+            8e9,
+            10.0,
+        );
+        let compute = train_max_chinchilla(10.0 * 4.0);
+        assert!(
+            (r.train_chinchilla - compute).abs() < 1.0,
+            "should be compute-limited"
+        );
     }
 }
