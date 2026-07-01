@@ -731,10 +731,6 @@ fn cmd_finetune_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let num_windows = tokens.len() - seq + 1;
     let steps_per_epoch = num_windows.div_ceil(batch.max(1)) as u64;
-    if warmup > 0 {
-        let total = steps_per_epoch * epochs as u64;
-        tr.set_lr_schedule(Some(LrSchedule::warmup_cosine(lr, warmup, total.max(warmup + 1))));
-    }
 
     // 5. Resume optimizer state if requested (continues where a prior run stopped).
     let mut rng = if let Some(ckpt) = args.flags.get("resume") {
@@ -746,6 +742,13 @@ fn cmd_finetune_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Rng::new(seed)
     };
+
+    // The schedule spans the *cumulative* step timeline (after any resume), so a
+    // resumed run does not start past total_steps — which would pin the LR at 0.
+    if warmup > 0 {
+        let total = tr.step_count() + steps_per_epoch * epochs as u64;
+        tr.set_lr_schedule(Some(LrSchedule::warmup_cosine(lr, warmup, total.max(warmup + 1))));
+    }
 
     println!(
         "\nFine-tuning: {epochs} epochs · seq {seq} · batch {batch} · lr {lr} · \

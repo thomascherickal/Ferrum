@@ -862,10 +862,6 @@ fn finetune_inner(app: AppHandle, p: FinetuneParams) -> Result<FinetuneResult, S
 
     let num_windows = tokens.len() - seq + 1;
     let steps_per_epoch = num_windows.div_ceil(batch) as u64;
-    if p.warmup > 0 {
-        let total = steps_per_epoch * p.epochs as u64;
-        tr.set_lr_schedule(Some(LrSchedule::warmup_cosine(p.lr, p.warmup, total.max(p.warmup + 1))));
-    }
 
     // 4. Resume optimizer state if requested.
     let mut rng = if let Some(ckpt) = p.resume.as_ref().filter(|s| !s.trim().is_empty()) {
@@ -880,6 +876,13 @@ fn finetune_inner(app: AppHandle, p: FinetuneParams) -> Result<FinetuneResult, S
     } else {
         Rng::new(p.seed)
     };
+
+    // The schedule spans the *cumulative* step timeline (after any resume), so a
+    // resumed run does not start past total_steps — which would pin the LR at 0.
+    if p.warmup > 0 {
+        let total = tr.step_count() + steps_per_epoch * p.epochs as u64;
+        tr.set_lr_schedule(Some(LrSchedule::warmup_cosine(p.lr, p.warmup, total.max(p.warmup + 1))));
+    }
 
     let threads = if p.threads == 0 { ferrum_core::num_threads() } else { p.threads };
 
