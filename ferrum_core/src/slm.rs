@@ -1242,6 +1242,22 @@ impl GenerativeSLM {
         let mut generated = seed.to_string();
         let seed_bytes = seed.len();
 
+        // Map each class name (a char's hex) → its index once, so per-step token
+        // lookup is O(1) instead of an O(vocab) linear scan per character.
+        let hex_to_idx: std::collections::HashMap<&str, usize> = self
+            .meta
+            .class_names
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.as_str(), i))
+            .collect();
+        let char_idx = |ch: char| -> usize {
+            hex_to_idx
+                .get(char_to_hex(ch).as_str())
+                .copied()
+                .unwrap_or(0)
+        };
+
         for step in 0..num_chars {
             let current_len = generated.chars().count();
             if current_len < context_len {
@@ -1261,15 +1277,6 @@ impl GenerativeSLM {
                 step,
                 context_chars.iter().collect::<String>()
             );
-
-            let char_idx = |ch: char| -> usize {
-                let hex = char_to_hex(ch);
-                self.meta
-                    .class_names
-                    .iter()
-                    .position(|s| s == &hex)
-                    .unwrap_or(0)
-            };
 
             let next_dist: Vec<f32> = if is_transformer {
                 // Token-ID input → [T, vocab] probabilities; keep the last row.
@@ -1375,12 +1382,19 @@ impl GenerativeSLM {
         let seed_bytes = seed.len();
         let cap = cached.capacity().max(1);
 
+        // O(1) class lookup (see `generate_stream_core`): built once, reused for
+        // every seed and generated character.
+        let hex_to_idx: std::collections::HashMap<&str, usize> = self
+            .meta
+            .class_names
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.as_str(), i))
+            .collect();
         let char_idx = |ch: char| -> usize {
-            let hex = char_to_hex(ch);
-            self.meta
-                .class_names
-                .iter()
-                .position(|s| s == &hex)
+            hex_to_idx
+                .get(char_to_hex(ch).as_str())
+                .copied()
                 .unwrap_or(0)
         };
 

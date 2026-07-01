@@ -47,8 +47,15 @@ pub struct GgufTokenizer {
     /// id → token piece, exactly as stored in the GGUF.
     tokens: Vec<String>,
     token_to_id: HashMap<String, u32>,
-    /// BPE merge ranks keyed by the (left, right) piece pair (lower = earlier).
-    merge_ranks: HashMap<(String, String), u32>,
+    /// BPE merge ranks keyed by the `left\0right` piece pair (lower = earlier).
+    /// A single joined `String` key (with a NUL separator, which never occurs in
+    /// a GPT-2 byte-encoded piece) lets the hot merge scan look up pairs through
+    /// a reused buffer with **zero per-pair allocation** (`get(&str)` via
+    /// `Borrow`), instead of cloning both pieces into a `(String, String)` key.
+    merges: HashMap<String, u32>,
+    /// Longest vocabulary token in **chars** — bounds the SPM longest-match
+    /// window so `encode_spm` is O(n·max_token_len), not O(n³).
+    max_token_len: usize,
     /// SPM `<0xXX>` byte-fallback tokens: raw byte → token id.
     byte_to_id: HashMap<u8, u32>,
     /// GPT-2 byte ↔ printable-unicode tables (BPE only).
@@ -143,16 +150,25 @@ impl GgufTokenizer {
             }
         }
 
-        // BPE merges: "left right" piece pairs, in priority order.
-        let mut merge_ranks = HashMap::new();
-        if let Some(merges) = string_array(g, "tokenizer.ggml.merges") {
-            for (rank, m) in merges.iter().enumerate() {
+        // BPE merges: "left right" piece pairs, in priority order. Stored under a
+        // `left\0right` joined key (see the `merges` field docs).
+        let mut merges = HashMap::new();
+        if let Some(pairs) = string_array(g, "tokenizer.ggml.merges") {
+            for (rank, m) in pairs.iter().enumerate() {
                 if let Some(sp) = m.find(' ') {
-                    let (l, r) = (m[..sp].to_string(), m[sp + 1..].to_string());
-                    merge_ranks.entry((l, r)).or_insert(rank as u32);
+                    let key = format!("{}\u{0}{}", &m[..sp], &m[sp + 1..]);
+                    merges.entry(key).or_insert(rank as u32);
                 }
             }
         }
+
+        // Longest token (in chars) for the SPM longest-match bound.
+        let max_token_len = tokens
+            .iter()
+            .map(|t| t.chars().count())
+            .max()
+            .unwrap_or(1)
+            .max(1);
 
         let bos = g
             .meta("tokenizer.ggml.bos_token_id")
@@ -168,7 +184,8 @@ impl GgufTokenizer {
             model,
             tokens,
             token_to_id,
-            merge_ranks,
+            merges,
+            max_token_len,
             byte_to_id,
             byte_encoder,
             byte_decoder,
@@ -221,14 +238,17 @@ impl GgufTokenizer {
             if pieces.is_empty() {
                 continue;
             }
-            // Greedy lowest-rank merges until none apply (standard BPE).
+            // Greedy lowest-rank merges until none apply (standard BPE). `key` is
+            // reused across every pair lookup so the scan allocates nothing.
+            let mut key = String::new();
             while pieces.len() > 1 {
                 let mut best: Option<(usize, u32)> = None;
                 for i in 0..pieces.len() - 1 {
-                    if let Some(&r) = self
-                        .merge_ranks
-                        .get(&(pieces[i].clone(), pieces[i + 1].clone()))
-                    {
+                    key.clear();
+                    key.push_str(&pieces[i]);
+                    key.push('\u{0}');
+                    key.push_str(&pieces[i + 1]);
+                    if let Some(&r) = self.merges.get(key.as_str()) {
                         let better = match best {
                             None => true,
                             Some((_, br)) => r < br,
@@ -292,9 +312,12 @@ impl GgufTokenizer {
         let mut out = Vec::new();
         let mut i = 0;
         while i < normalized.len() {
-            // Longest token in the vocab starting at i.
+            // Longest token in the vocab starting at i. The window is capped at
+            // the longest vocab token, so this is O(max_token_len) per position
+            // (not O(remaining-length)) — without the cap, encoding a long corpus
+            // is O(n³) and effectively hangs.
             let mut hit = None;
-            let mut j = normalized.len();
+            let mut j = (i + self.max_token_len).min(normalized.len());
             while j > i {
                 let cand: String = normalized[i..j].iter().collect();
                 if let Some(&id) = self.token_to_id.get(&cand) {
@@ -491,6 +514,40 @@ mod tests {
         let tk = GgufTokenizer::from_gguf(&g).unwrap();
         // "he" → dummy space → "▁he" (id 1).
         assert_eq!(tk.encode("he"), vec![1]);
+    }
+
+    #[test]
+    fn spm_encode_is_bounded_and_roundtrips_on_long_input() {
+        // A long input must encode quickly (the longest-match window is capped at
+        // the longest vocab token) and decode back exactly. Before the cap this
+        // was O(n³) and effectively hung on any real corpus.
+        let toks = ["<unk>", "\u{2581}", "a", "b", "ab"];
+        let mut kvs = Vec::new();
+        kv_str(&mut kvs, "tokenizer.ggml.model", "spm");
+        kv_str_array(&mut kvs, "tokenizer.ggml.tokens", &toks);
+        let g = tok_gguf(&kvs, 2);
+        let tk = GgufTokenizer::from_gguf(&g).unwrap();
+        assert_eq!(tk.max_token_len, 5); // "<unk>"
+        let input = "ab".repeat(10_000); // 20k chars — O(n³) would never finish
+        let ids = tk.encode(&input);
+        assert!(!ids.is_empty());
+        assert_eq!(tk.decode(&ids), input, "SPM long-input round-trip");
+    }
+
+    #[test]
+    fn bpe_roundtrips_long_input_with_reused_key_buffer() {
+        // Exercises the reused merge-key buffer across many pairs; byte-level BPE
+        // round-trips exactly for in-vocab bytes.
+        let toks = ["a", "b", "c", "\u{0120}", "ab", "abc", "\u{0120}a"];
+        let merges = ["a b", "ab c", "\u{0120} a"];
+        let mut kvs = Vec::new();
+        kv_str(&mut kvs, "tokenizer.ggml.model", "gpt2");
+        kv_str_array(&mut kvs, "tokenizer.ggml.tokens", &toks);
+        kv_str_array(&mut kvs, "tokenizer.ggml.merges", &merges);
+        let g = tok_gguf(&kvs, 3);
+        let tk = GgufTokenizer::from_gguf(&g).unwrap();
+        let input = "abc abc abc abc abc";
+        assert_eq!(tk.decode(&tk.encode(input)), input, "BPE round-trip");
     }
 
     #[test]
