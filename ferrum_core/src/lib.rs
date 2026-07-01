@@ -58,6 +58,7 @@ pub mod csv;
 pub mod dataset;
 pub mod error;
 pub mod gguf;
+pub mod gguf_write;
 pub mod gguf_tokenizer;
 pub mod layer;
 pub mod llm;

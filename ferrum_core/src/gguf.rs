@@ -33,44 +33,44 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Mutex;
 
-const GGUF_MAGIC: u32 = 0x4655_4747; // "GGUF" little-endian
-const DEFAULT_ALIGNMENT: u64 = 32;
+pub(crate) const GGUF_MAGIC: u32 = 0x4655_4747; // "GGUF" little-endian
+pub(crate) const DEFAULT_ALIGNMENT: u64 = 32;
 
 // GGML tensor element types (subset we can dequantize).
-const GGML_F32: u32 = 0;
-const GGML_F16: u32 = 1;
-const GGML_Q4_0: u32 = 2;
-const GGML_Q4_1: u32 = 3;
-const GGML_Q8_0: u32 = 8;
-const GGML_Q8_1: u32 = 9;
+pub(crate) const GGML_F32: u32 = 0;
+pub(crate) const GGML_F16: u32 = 1;
+pub(crate) const GGML_Q4_0: u32 = 2;
+pub(crate) const GGML_Q4_1: u32 = 3;
+pub(crate) const GGML_Q8_0: u32 = 8;
+pub(crate) const GGML_Q8_1: u32 = 9;
 // k-quant super-block formats (G-K). These dominate modern GGUF downloads:
 // `Q4_K_M` mixes Q4_K / Q5_K / Q6_K across tensors, so all three are needed to
 // load one real checkpoint.
-const GGML_Q4_K: u32 = 12;
-const GGML_Q5_K: u32 = 13;
-const GGML_Q6_K: u32 = 14;
+pub(crate) const GGML_Q4_K: u32 = 12;
+pub(crate) const GGML_Q5_K: u32 = 13;
+pub(crate) const GGML_Q6_K: u32 = 14;
 
-const QK: usize = 32; // GGML block length for the legacy quant formats
-const QK_K: usize = 256; // super-block length for the k-quant formats
+pub(crate) const QK: usize = 32; // GGML block length for the legacy quant formats
+pub(crate) const QK_K: usize = 256; // super-block length for the k-quant formats
                          // On-disk bytes per k-quant super-block of QK_K weights (must match ggml).
-const Q4_K_BLOCK: usize = 2 + 2 + 12 + QK_K / 2; // d, dmin, 6-bit scales, 4-bit qs = 144
-const Q5_K_BLOCK: usize = 2 + 2 + 12 + QK_K / 8 + QK_K / 2; // + qh high bits = 176
-const Q6_K_BLOCK: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2; // ql, qh, scales, d = 210
+pub(crate) const Q4_K_BLOCK: usize = 2 + 2 + 12 + QK_K / 2; // d, dmin, 6-bit scales, 4-bit qs = 144
+pub(crate) const Q5_K_BLOCK: usize = 2 + 2 + 12 + QK_K / 8 + QK_K / 2; // + qh high bits = 176
+pub(crate) const Q6_K_BLOCK: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2; // ql, qh, scales, d = 210
 
 // GGUF metadata value type tags.
-const VT_U8: u32 = 0;
-const VT_I8: u32 = 1;
-const VT_U16: u32 = 2;
-const VT_I16: u32 = 3;
-const VT_U32: u32 = 4;
-const VT_I32: u32 = 5;
-const VT_F32: u32 = 6;
-const VT_BOOL: u32 = 7;
-const VT_STRING: u32 = 8;
-const VT_ARRAY: u32 = 9;
-const VT_U64: u32 = 10;
-const VT_I64: u32 = 11;
-const VT_F64: u32 = 12;
+pub(crate) const VT_U8: u32 = 0;
+pub(crate) const VT_I8: u32 = 1;
+pub(crate) const VT_U16: u32 = 2;
+pub(crate) const VT_I16: u32 = 3;
+pub(crate) const VT_U32: u32 = 4;
+pub(crate) const VT_I32: u32 = 5;
+pub(crate) const VT_F32: u32 = 6;
+pub(crate) const VT_BOOL: u32 = 7;
+pub(crate) const VT_STRING: u32 = 8;
+pub(crate) const VT_ARRAY: u32 = 9;
+pub(crate) const VT_U64: u32 = 10;
+pub(crate) const VT_I64: u32 = 11;
+pub(crate) const VT_F64: u32 = 12;
 
 /// A typed GGUF metadata value.
 #[derive(Clone, Debug, PartialEq)]
@@ -880,7 +880,7 @@ fn dequant_q4_1(raw: &[u8], n: usize) -> Result<Vec<f32>> {
 /// Unpack the 6-bit scale `d` and min `m` for sub-block `j` (0..8) from the
 /// 12-byte packed `scales` of a Q4_K/Q5_K super-block (ggml `get_scale_min_k4`).
 #[inline]
-fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+pub(crate) fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     if j < 4 {
         (q[j] & 63, q[j + 4] & 63)
     } else {
