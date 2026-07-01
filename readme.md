@@ -37,7 +37,8 @@ hand tool for small models, not a frontier-LLM runtime.
   GGUF `F32/F16/Q8_0/Q8_1/Q4_0/Q4_1` and the **Q4_K/Q5_K/Q6_K** k-quants — *with
   their own tokenizer*, and decode them on the CPU (RMSNorm, RoPE, grouped-query
   attention, SwiGLU, KV cache) in int4/int8/f32. A streamed reader avoids holding
-  the whole file in RAM.
+  the whole file in RAM. You can also **write** them back: export a llama/qwen2 model
+  (imported or fine-tuned) to GGUF at f16/int8/int4/k-quants with `export-gguf`.
 - **Train the imported architecture too.** A finite-difference-checked backward
   pass (`llm_train`) makes the Llama/Qwen stack trainable, not just runnable.
 
@@ -119,6 +120,22 @@ rejected. On this class of CPU a 1B model decodes at only **a few tokens per
 second** with tens of seconds of prefill — see [ferrum_review.md](ferrum_review.md)
 §4 and [benchmarks.md](benchmarks.md) §4 for the measured ceiling and the math
 behind it.
+
+### Export a model back to GGUF
+
+```bash
+# Re-quantize a stock GGUF (e.g. Q4_K download → Q8_0).
+cargo run -p slm_cli -- export-gguf in.gguf out.gguf --quant q8_0
+
+# Export a fine-tuned model: weights come from the checkpoint, the tokenizer
+# and hyperparameters are copied from the source GGUF.
+cargo run -p slm_cli -- export-gguf base.gguf tuned.gguf --resume tuned.flck --quant q6_k
+```
+
+Ferrum writes GGUF v3 at `f32/f16/q8_0/q8_1/q4_0/q4_1/q4_k/q5_k/q6_k`. Norms and
+biases stay f32; a weight matrix whose row length is not block-aligned for the
+chosen quant is stored f16 (with a note). Only `llama`/`qwen2` models export
+(the only architectures that run in the GGUF ecosystem).
 
 ---
 

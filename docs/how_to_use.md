@@ -108,6 +108,21 @@ the visitor's input never leaves their machine. The WASM build runs serially
 
 ---
 
+## Export to GGUF (library)
+
+```rust
+use ferrum_core::{Gguf, GgufQuant};
+
+let g = Gguf::open("base.gguf")?;          // source: metadata + tokenizer
+let model = g.load_llama_prec(None)?;      // f32 model (fine-tune here if desired)
+model.write_gguf(&g, GgufQuant::Q4K, "out.gguf")?;
+```
+
+`write_gguf` carries the source's hyperparameters and tokenizer forward
+verbatim, so the exported file runs in llama.cpp / ollama unchanged.
+
+---
+
 ## Next steps
 
 - Compare BPE against character-level (`--vocab 0`) on the same corpus.
