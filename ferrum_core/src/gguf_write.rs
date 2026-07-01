@@ -8,8 +8,8 @@
 use crate::error::{InferError, Result};
 use crate::gguf::{
     MetaValue, DEFAULT_ALIGNMENT, GGML_F16, GGML_F32, GGML_Q4_0, GGML_Q4_1, GGML_Q4_K, GGML_Q5_K,
-    GGML_Q6_K, GGML_Q8_0, GGML_Q8_1, GGUF_MAGIC, QK, VT_ARRAY, VT_BOOL, VT_F32, VT_F64, VT_I16,
-    VT_I32, VT_I64, VT_I8, VT_STRING, VT_U16, VT_U32, VT_U64, VT_U8,
+    GGML_Q6_K, GGML_Q8_0, GGML_Q8_1, GGUF_MAGIC, QK, QK_K, VT_ARRAY, VT_BOOL, VT_F32, VT_F64,
+    VT_I16, VT_I32, VT_I64, VT_I8, VT_STRING, VT_U16, VT_U32, VT_U64, VT_U8,
 };
 
 /// The on-disk GGUF tensor type the writer should emit for weight matrices.
@@ -168,6 +168,10 @@ pub(crate) fn encode_tensor(data: &[f32], ggml_type: u32) -> Result<Vec<u8>> {
             need_mult(QK)?;
             enc_q4_1(data)
         }
+        GGML_Q4_K => {
+            need_mult(QK_K)?;
+            enc_q4_k(data)
+        }
         other => {
             return Err(InferError::Format(format!(
                 "encode_tensor: unsupported ggml type {other}"
@@ -292,6 +296,10 @@ fn enc_q4_1(data: &[f32]) -> Vec<u8> {
     o
 }
 
+/// Q4_K super-block length in encoded bytes.
+#[allow(dead_code)] // consumed by later tasks
+const Q4_K_BLOCK_LEN: usize = 2 + 2 + 12 + QK_K / 2; // 144
+
 /// Pack 8 six-bit sub-block scales and mins into the 12-byte layout that
 /// [`crate::gguf::get_scale_min_k4`] reads back. Exact inverse of that function.
 #[allow(dead_code)] // consumed by later tasks
@@ -307,6 +315,77 @@ fn put_scale_min_k4(sc: &[u8; 8], m: &[u8; 8]) -> [u8; 12] {
         q[j] |= (m[j] >> 4) << 6; // top 2 bits of the 6-bit min
     }
     q
+}
+
+/// Q4_K: per 256-element super-block, 8 sub-blocks of 32. Each sub-block gets an
+/// affine (scale, min) chosen to cover its [lo, hi]; those reals are then
+/// quantized to 6-bit via super-block `d`/`dmin`. Decode: `d*sc_s*q - dmin*m_s`.
+#[allow(dead_code)] // consumed by later tasks
+fn enc_q4_k(data: &[f32]) -> Vec<u8> {
+    let mut o = Vec::with_capacity(data.len() / QK_K * Q4_K_BLOCK_LEN);
+    for sblk in data.chunks_exact(QK_K) {
+        // 1. Per sub-block real scale/min covering [lo, hi], with min >= 0.
+        let mut scale_r = [0.0f32; 8];
+        let mut min_r = [0.0f32; 8];
+        for s in 0..8 {
+            let seg = &sblk[s * 32..s * 32 + 32];
+            let mut lo = f32::INFINITY;
+            let mut hi = f32::NEG_INFINITY;
+            for &v in seg {
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+            let min = if lo < 0.0 { -lo } else { 0.0 }; // >= 0
+            let base = -min; // <= 0
+            let scale = (hi - base) / 15.0;
+            scale_r[s] = if scale > 0.0 { scale } else { 0.0 };
+            min_r[s] = min;
+        }
+        // 2. Super-block factors and 6-bit sub-block codes.
+        let dmax = scale_r.iter().cloned().fold(0.0f32, f32::max);
+        let mmax = min_r.iter().cloned().fold(0.0f32, f32::max);
+        let d = dmax / 63.0;
+        let dmin = mmax / 63.0;
+        let (mut sc, mut m) = ([0u8; 8], [0u8; 8]);
+        for s in 0..8 {
+            sc[s] = if d > 0.0 {
+                ((scale_r[s] / d).round() as i32).clamp(0, 63) as u8
+            } else {
+                0
+            };
+            m[s] = if dmin > 0.0 {
+                ((min_r[s] / dmin).round() as i32).clamp(0, 63) as u8
+            } else {
+                0
+            };
+        }
+        // 3. Quantize each element against the ACTUAL reconstructed scale/min.
+        let mut qs = [0u8; QK_K / 2];
+        for s in 0..8 {
+            let a_scale = d * sc[s] as f32;
+            let a_min = dmin * m[s] as f32;
+            for l in 0..32 {
+                let x = sblk[s * 32 + l];
+                let q = if a_scale > 0.0 {
+                    (((x + a_min) / a_scale).round() as i32).clamp(0, 15) as u8
+                } else {
+                    0
+                };
+                let byte = 32 * (s / 2) + l;
+                if s % 2 == 0 {
+                    qs[byte] |= q;
+                } else {
+                    qs[byte] |= q << 4;
+                }
+            }
+        }
+        // 4. Emit: d, dmin (f16), 12-byte packed scales, 128-byte qs.
+        o.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+        o.extend_from_slice(&f32_to_f16(dmin).to_le_bytes());
+        o.extend_from_slice(&put_scale_min_k4(&sc, &m));
+        o.extend_from_slice(&qs);
+    }
+    o
 }
 
 fn align_up(x: usize, a: usize) -> usize {
@@ -732,5 +811,29 @@ mod tests {
             assert_eq!(d, sc[j], "scale mismatch at sub-block {j}");
             assert_eq!(mn, m[j], "min mismatch at sub-block {j}");
         }
+    }
+
+    #[test]
+    fn enc_q4_k_constant_block_is_near_exact() {
+        use crate::gguf::GGML_Q4_K;
+        for &c in &[0.5f32, -0.75, 0.0] {
+            let x = vec![c; QK_K];
+            let back = dequant_via_reader(&x, GGML_Q4_K, &[QK_K as u64]);
+            let err = max_abs_err(&x, &back);
+            assert!(err <= c.abs() * 0.02 + 1e-3, "c={c} err={err}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)]
+    fn enc_q4_k_within_bound() {
+        use crate::gguf::GGML_Q4_K;
+        // Deterministic pseudo-random-ish values in [-1, 1].
+        let x: Vec<f32> = (0..QK_K)
+            .map(|i| ((i as f32 * 12.9898).sin() * 43758.5453).fract() * 2.0 - 1.0)
+            .collect();
+        let back = dequant_via_reader(&x, GGML_Q4_K, &[QK_K as u64]);
+        let amax = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(max_abs_err(&x, &back) <= amax * 0.15, "q4_k error too high");
     }
 }
