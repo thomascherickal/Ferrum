@@ -8,8 +8,8 @@
 
 use crate::AppState;
 use ferrum_core::{
-    clean_corpus, corpus_stats, validate_for_training, CleanOptions, GenerativeSLM, Gguf,
-    GgufTokenizer, QKind, Rng, SamplingParams, TaskType,
+    clean_corpus, corpus_stats, validate_for_training, Adam, CleanOptions, GenerativeSLM, Gguf,
+    GgufTokenizer, LlamaTrainer, LrSchedule, QKind, Rng, SamplingParams, TaskType,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read};
@@ -640,6 +640,9 @@ pub struct GgufRunParams {
     pub ids: Option<String>,
     /// Load even if the memory estimate exceeds available RAM.
     pub force: bool,
+    /// Optional fine-tune checkpoint (`.flck`) to overlay on the base model.
+    /// When set, the model is loaded f32 (a checkpoint holds f32 weights).
+    pub resume: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -664,7 +667,9 @@ fn gguf_run_inner(p: GgufRunParams) -> Result<GgufRunResult, String> {
     if !(p.temp.is_finite() && p.temp > 0.0) {
         return Err("temperature must be a positive number".into());
     }
-    let prec = parse_quant(&p.quant)?;
+    // A fine-tune checkpoint holds f32 weights, so applying one forces f32.
+    let resume = p.resume.as_ref().filter(|s| !s.trim().is_empty()).cloned();
+    let prec = if resume.is_some() { None } else { parse_quant(&p.quant)? };
     let g = Gguf::open(&p.model_path).map_err(|e| format!("cannot open {}: {e}", p.model_path))?;
 
     // Memory guard before the (potentially large) load.
@@ -681,7 +686,16 @@ fn gguf_run_inner(p: GgufRunParams) -> Result<GgufRunResult, String> {
     }
 
     let tok = GgufTokenizer::from_gguf(&g).ok();
-    let model = g.load_llama_prec(prec).map_err(|e| format!("cannot load model: {e}"))?;
+    let mut model = g.load_llama_prec(prec).map_err(|e| format!("cannot load model: {e}"))?;
+
+    // Overlay fine-tuned weights from a checkpoint, if requested.
+    if let Some(ckpt) = &resume {
+        let bytes = std::fs::read(ckpt).map_err(|e| format!("cannot read checkpoint {ckpt}: {e}"))?;
+        let mut tr = LlamaTrainer::new(model).map_err(|e| format!("cannot wrap model: {e}"))?;
+        tr.load_checkpoint_into(&bytes)
+            .map_err(|e| format!("cannot apply checkpoint {ckpt}: {e}"))?;
+        model = tr.model;
+    }
 
     let prompt_ids: Vec<usize> = if let Some(ids) = p.ids.as_ref().filter(|s| !s.trim().is_empty()) {
         ids.split_whitespace().filter_map(|s| s.parse().ok()).collect()
@@ -719,6 +733,201 @@ fn gguf_run_inner(p: GgufRunParams) -> Result<GgufRunResult, String> {
         tokens_per_sec: out.len() as f32 / seconds.max(1e-6),
         seconds,
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5b. Fine-tune an imported GGUF (mirrors `slm_cli finetune-gguf`)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FinetuneParams {
+    pub model_path: String,
+    pub corpus_path: String,
+    pub out_path: String,
+    pub epochs: usize,
+    pub lr: f32,
+    pub batch_size: usize,
+    pub seq_len: usize,
+    pub warmup: u64,
+    pub clip: f32,
+    pub weight_decay: f32,
+    pub dropout: f32,
+    pub qat: bool,
+    pub seed: u64,
+    pub threads: usize,
+    pub resume: Option<String>,
+    pub force: bool,
+    pub verbose: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FinetuneResult {
+    pub out_path: String,
+    pub epochs: usize,
+    pub first_loss: f32,
+    pub final_loss: f32,
+    pub seconds: f64,
+    pub tokens: usize,
+    pub steps: u64,
+    pub bytes: u64,
+}
+
+/// AdamW-fine-tune an imported llama/qwen2 GGUF on a text corpus and write a
+/// `.flck` checkpoint that `run_gguf { resume }` can overlay on the base model.
+/// Per-epoch progress streams as `finetune-progress` events.
+#[tauri::command]
+pub async fn finetune_gguf(app: AppHandle, params: FinetuneParams) -> Result<FinetuneResult, String> {
+    tauri::async_runtime::spawn_blocking(move || finetune_inner(app, params))
+        .await
+        .map_err(|e| format!("task error: {e}"))?
+}
+
+fn finetune_inner(app: AppHandle, p: FinetuneParams) -> Result<FinetuneResult, String> {
+    if p.out_path.trim().is_empty() {
+        return Err("please provide an output checkpoint path (.flck)".into());
+    }
+    if p.epochs == 0 {
+        return Err("epochs must be ≥ 1".into());
+    }
+    if !(p.lr.is_finite() && p.lr > 0.0) {
+        return Err("learning rate must be a positive number".into());
+    }
+    ferrum_core::set_verbose(p.verbose);
+    let cleanup = || ferrum_core::set_verbose(false);
+
+    // 1. Open + f32-load the base model.
+    let g = Gguf::open(&p.model_path).map_err(|e| {
+        cleanup();
+        format!("cannot open {}: {e}", p.model_path)
+    })?;
+    let est = gguf_resident_bytes(&g, None); // f32
+    let train_est = est.saturating_mul(4); // weights + grad + Adam m/v
+    if let Some(avail) = available_memory_bytes() {
+        if (train_est as f64) > 0.9 * avail as f64 && !p.force {
+            cleanup();
+            return Err(format!(
+                "estimated training memory ({:.2} GB) exceeds 90% of available ({:.2} GB) — \
+                 fine-tune a smaller model or enable 'train anyway'.",
+                train_est as f64 / 1e9,
+                avail as f64 / 1e9
+            ));
+        }
+    }
+    let tok = GgufTokenizer::from_gguf(&g).map_err(|_| {
+        cleanup();
+        "this GGUF has no tokenizer; text fine-tuning needs one".to_string()
+    })?;
+    let model = g.load_llama_prec(None).map_err(|e| {
+        cleanup();
+        format!("cannot load model: {e}")
+    })?;
+
+    // 2. Read + tokenize the corpus.
+    let text = std::fs::read_to_string(&p.corpus_path).map_err(|e| {
+        cleanup();
+        format!("cannot read corpus {}: {e}", p.corpus_path)
+    })?;
+    if text.trim().is_empty() {
+        cleanup();
+        return Err(format!("corpus {} is empty", p.corpus_path));
+    }
+    let mut tokens: Vec<usize> = Vec::new();
+    if let Some(bos) = tok.bos() {
+        tokens.push(bos);
+    }
+    tokens.extend(tok.encode(&text));
+
+    let seq = p.seq_len.min(model.cfg.context_len).max(2);
+    let batch = p.batch_size.max(1);
+    if tokens.len() < seq {
+        cleanup();
+        return Err(format!(
+            "corpus tokenized to {} tokens but sequence length is {seq}; supply more text",
+            tokens.len()
+        ));
+    }
+
+    // 3. Build + configure the trainer.
+    let mut tr = LlamaTrainer::new(model).map_err(|e| {
+        cleanup();
+        format!("cannot build trainer: {e}")
+    })?;
+    tr.set_optimizer(Adam::new(p.lr));
+    tr.set_weight_decay(p.weight_decay.max(0.0));
+    tr.set_dropout(p.dropout);
+    tr.set_grad_clip(if p.clip > 0.0 { Some(p.clip) } else { None });
+    tr.set_qat(p.qat);
+
+    let num_windows = tokens.len() - seq + 1;
+    let steps_per_epoch = num_windows.div_ceil(batch) as u64;
+    if p.warmup > 0 {
+        let total = steps_per_epoch * p.epochs as u64;
+        tr.set_lr_schedule(Some(LrSchedule::warmup_cosine(p.lr, p.warmup, total.max(p.warmup + 1))));
+    }
+
+    // 4. Resume optimizer state if requested.
+    let mut rng = if let Some(ckpt) = p.resume.as_ref().filter(|s| !s.trim().is_empty()) {
+        let bytes = std::fs::read(ckpt).map_err(|e| {
+            cleanup();
+            format!("cannot read checkpoint {ckpt}: {e}")
+        })?;
+        tr.load_checkpoint_into(&bytes).map_err(|e| {
+            cleanup();
+            format!("cannot resume from {ckpt}: {e}")
+        })?
+    } else {
+        Rng::new(p.seed)
+    };
+
+    let threads = if p.threads == 0 { ferrum_core::num_threads() } else { p.threads };
+
+    // 5. Train, streaming per-epoch progress.
+    let t0 = std::time::Instant::now();
+    let mut first_loss = f32::NAN;
+    let mut final_loss = f32::NAN;
+    for e in 0..p.epochs {
+        let loss = match tr.finetune_epoch_threaded(&tokens, seq, batch, &mut rng, threads) {
+            Ok(l) => l,
+            Err(err) => {
+                cleanup();
+                return Err(format!("fine-tuning failed: {err}"));
+            }
+        };
+        if e == 0 {
+            first_loss = loss;
+        }
+        final_loss = loss;
+        let _ = app.emit(
+            "finetune-progress",
+            serde_json::json!({
+                "epoch": e + 1, "total": p.epochs, "loss": loss, "ppl": loss.exp(),
+            }),
+        );
+    }
+    let seconds = t0.elapsed().as_secs_f64();
+
+    // 6. Save the checkpoint.
+    let bytes = tr.save_checkpoint(&rng);
+    std::fs::write(&p.out_path, &bytes).map_err(|e| {
+        cleanup();
+        format!("cannot write {}: {e}", p.out_path)
+    })?;
+    cleanup();
+
+    let result = FinetuneResult {
+        out_path: p.out_path.clone(),
+        epochs: p.epochs,
+        first_loss,
+        final_loss,
+        seconds,
+        tokens: tokens.len(),
+        steps: tr.step_count(),
+        bytes: bytes.len() as u64,
+    };
+    let _ = app.emit("finetune-done", result.clone());
+    Ok(result)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -44,5 +44,9 @@ path = "tests/integration.rs"
 name = "test_gguf_llm"
 path = "tests/test_gguf_llm.rs"
 
+[[test]]
+name = "test_gguf_finetune"
+path = "tests/test_gguf_finetune.rs"
+
 [dependencies]
 ferrum_core = { path = "../ferrum_core" }

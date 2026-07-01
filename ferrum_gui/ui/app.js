@@ -519,6 +519,7 @@ $("ggRun").addEventListener("click", async () => {
   try {
     const seed = $("ggSeed").value.trim();
     const ids = $("ggIds").value.trim();
+    const resume = $("ggResume").value.trim();
     params = {
       modelPath: reqStr("ggPath", "GGUF file"),
       prompt: $("ggPrompt").value,
@@ -528,6 +529,7 @@ $("ggRun").addEventListener("click", async () => {
       genSeed: seed === "" ? null : parseInt(seed, 10),
       ids: ids === "" ? null : ids,
       force: $("ggForce").checked,
+      resume: resume === "" ? null : resume,
     };
     if (!params.prompt.trim() && !params.ids) throw new Error("Enter a prompt (or token IDs)");
   } catch (e) { setErr("errGguf", String(e)); return; }
@@ -557,6 +559,77 @@ $("ggRun").addEventListener("click", async () => {
     setErr("errGguf", String(e));
     toast("Run failed: " + e, "error");
   } finally { $("ggRun").disabled = false; }
+});
+
+// ── Fine-tune (GGUF) ────────────────────────────────────────────────────────────
+let ftLossHistory = [];
+function drawFtChart() {
+  const c = $("ftChart"), ctx = c.getContext("2d");
+  const w = c.width, h = c.height;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#1e293b"; ctx.fillRect(0, 0, w, h);
+  if (ftLossHistory.length < 2) return;
+  const max = Math.max(...ftLossHistory), min = Math.min(...ftLossHistory);
+  const pad = 8, span = (max - min) || 1;
+  ctx.strokeStyle = "#ea580c"; ctx.lineWidth = 2; ctx.beginPath();
+  ftLossHistory.forEach((v, i) => {
+    const x = pad + (i / (ftLossHistory.length - 1)) * (w - 2 * pad);
+    const y = pad + (1 - (v - min) / span) * (h - 2 * pad);
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.stroke();
+  ctx.fillStyle = "#94a3b8"; ctx.font = "11px monospace";
+  ctx.fillText("loss " + max.toFixed(4), pad, 14);
+  ctx.fillText(min.toFixed(4), pad, h - 4);
+}
+
+$("ftRun").addEventListener("click", async () => {
+  clearErr("errFt");
+  let params;
+  try {
+    const resume = $("ftResume").value.trim();
+    params = {
+      modelPath: reqStr("ftPath", "GGUF file"),
+      corpusPath: reqStr("ftCorpus", "Training corpus"),
+      outPath: reqStr("ftOut", "Output checkpoint"),
+      epochs: reqInt("ftEpochs", "Epochs"),
+      lr: reqNum("ftLr", "Learning rate", 0),
+      batchSize: reqInt("ftBatch", "Batch size"),
+      seqLen: reqInt("ftSeq", "Sequence length"),
+      warmup: Math.max(0, int("ftWarmup") || 0),
+      clip: Math.max(0, num("ftClip") || 0),
+      weightDecay: Math.max(0, num("ftWd") || 0),
+      dropout: Math.max(0, num("ftDropout") || 0),
+      qat: $("ftQat").checked,
+      seed: Math.max(0, int("ftSeed") || 0),
+      threads: Math.max(0, int("ftThreads") || 0),
+      resume: resume === "" ? null : resume,
+      force: $("ftForce").checked,
+      verbose: false,
+    };
+  } catch (e) { setErr("errFt", String(e)); return; }
+
+  ftLossHistory = []; drawFtChart();
+  $("ftBar").style.width = "0%";
+  $("ftResult").textContent = "";
+  $("ftStatus").textContent = "fine-tuning… (CPU: this can take a while)";
+  $("ftRun").disabled = true;
+  try {
+    const r = await invoke("finetune_gguf", { params });
+    $("ftStatus").textContent = "done";
+    $("ftResult").textContent =
+      `Saved ${r.bytes.toLocaleString()} bytes → ${r.outPath}\n` +
+      `epochs=${r.epochs}  first loss=${r.firstLoss.toFixed(6)}  final loss=${r.finalLoss.toFixed(6)}\n` +
+      `tokens=${r.tokens.toLocaleString()}  steps=${r.steps}  time=${r.seconds.toFixed(2)}s\n` +
+      `Run it: GGUF tab → set "Fine-tune checkpoint" to ${r.outPath}`;
+    toast("Fine-tune complete", "ok");
+    if (!$("ggPath").value) $("ggPath").value = params.modelPath;
+    if (!$("ggResume").value) $("ggResume").value = r.outPath;
+  } catch (e) {
+    $("ftStatus").textContent = "error";
+    setErr("errFt", String(e));
+    toast("Fine-tune failed: " + e, "error");
+  } finally { $("ftRun").disabled = false; }
 });
 
 // ── Tabular (train_cli via shell) ──────────────────────────────────────────────
@@ -686,6 +759,15 @@ async function wireEvents() {
     lossHistory.push(p.loss);
     if (lossHistory.length > 1000) lossHistory.shift();
     drawChart();
+  });
+  await listen("finetune-progress", (e) => {
+    const p = e.payload;
+    const pct = Math.round((p.epoch / p.total) * 100);
+    $("ftBar").style.width = pct + "%";
+    $("ftStatus").textContent = `epoch ${p.epoch}/${p.total} — loss ${p.loss.toFixed(4)} (ppl ${p.ppl.toFixed(2)})`;
+    ftLossHistory.push(p.loss);
+    if (ftLossHistory.length > 1000) ftLossHistory.shift();
+    drawFtChart();
   });
   await listen("gen-fragment", (e) => { if (generating) $("genOut").textContent += e.payload; });
 }

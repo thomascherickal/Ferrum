@@ -14,6 +14,8 @@
 //! train_transformer train    <corpus.txt> <model.bin> [options]
 //! train_transformer run      <corpus.txt> <model.bin> <seed text> [options]
 //! train_transformer generate <model.bin>  <seed text> [options]
+//! train_transformer run-gguf  <model.gguf> [prompt] [--resume ckpt.flck] [options]
+//! train_transformer finetune-gguf <model.gguf> <corpus.txt> <out.flck> [options]
 //! train_transformer info     <model.bin>
 //! ```
 //!
@@ -68,6 +70,8 @@ impl Args {
             "weight_decay", "dropout",
             // run-gguf options.
             "quant", "max", "ids",
+            // finetune-gguf options.
+            "seq", "warmup", "clip", "resume",
         ];
         let mut i = 0;
         while i < raw.len() {
@@ -147,6 +151,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "run" => cmd_run(&args),
         "generate" | "gen" => cmd_generate(&args),
         "run-gguf" | "gguf" => cmd_run_gguf(&args),
+        "finetune-gguf" | "finetune" => cmd_finetune_gguf(&args),
         "eval" => cmd_eval(&args),
         "info" => cmd_info(&args),
         "-h" | "--help" | "help" => {
@@ -170,6 +175,7 @@ fn print_usage() {
          \x20 train_transformer run      <corpus.txt> <model.bin> <seed text> [options]\n\
          \x20 train_transformer generate <model.bin>  <seed text> [options]\n\
          \x20 train_transformer run-gguf <model.gguf> [prompt] [options]\n\
+         \x20 train_transformer finetune-gguf <model.gguf> <corpus.txt> <out.flck> [options]\n\
          \x20 train_transformer eval     <model.bin>  <heldout.txt>\n\
          \x20 train_transformer info     <model.bin>\n\n\
          TRAIN / RUN options:\n\
@@ -187,8 +193,15 @@ fn print_usage() {
          \x20 --max N      --temp F  --gen-seed N\n\
          \x20 --ids \"1 2 3\"  (raw prompt token IDs; required if the file has no tokenizer)\n\
          \x20 --force        (load even if the memory estimate exceeds available RAM)\n\
+         \x20 --resume ckpt.flck  (overlay fine-tuned weights; forces f32 load)\n\
          \x20 NOTE: only F32/F16/Q8_0/Q8_1/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K GGUFs; on CPU\n\
          \x20 a 1B model decodes at only a few tokens/sec (see ferrum_review.md §4).\n\n\
+         FINETUNE-GGUF options (AdamW fine-tune an imported GGUF; f32 masters):\n\
+         \x20 --epochs N  --lr F  --batch N  --seq N   (window length; capped at ctx)\n\
+         \x20 --warmup N  --clip F  --weight_decay F  --dropout F   (schedule/regularization)\n\
+         \x20 --qat          (int8 quantization-aware fine-tuning)\n\
+         \x20 --threads N  --seed N  --resume ckpt.flck  --sample\n\
+         \x20 writes a .flck checkpoint; apply it with  run-gguf ... --resume out.flck\n\n\
          If <model.bin> already exists, train/run load the saved weights from\n\
          disk instead of retraining. Pass --force to retrain from scratch.\n\n\
          EXAMPLES:\n\
@@ -502,12 +515,22 @@ fn cmd_run_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let path = &args.positional[0];
     let prompt_text = args.positional[1..].join(" ");
 
+    // A fine-tune checkpoint holds f32 weights, so applying one forces an f32
+    // load regardless of --quant.
+    let resume = args.flags.get("resume").cloned();
     let quant = args.flags.get("quant").map(String::as_str).unwrap_or("int4");
-    let prec = match quant {
-        "int4" | "q4" => Some(QKind::Int4),
-        "int8" | "q8" => Some(QKind::Int8),
-        "f32" | "none" => None,
-        other => return Err(format!("--quant must be int4|int8|f32 (got '{other}')").into()),
+    let prec = if resume.is_some() {
+        if quant != "int4" && quant != "f32" && quant != "none" {
+            eprintln!("note: --resume applies f32 fine-tuned weights; ignoring --quant {quant}");
+        }
+        None
+    } else {
+        match quant {
+            "int4" | "q4" => Some(QKind::Int4),
+            "int8" | "q8" => Some(QKind::Int8),
+            "f32" | "none" => None,
+            other => return Err(format!("--quant must be int4|int8|f32 (got '{other}')").into()),
+        }
     };
 
     // Streamed open: parse the header without reading the whole file.
@@ -540,7 +563,7 @@ fn cmd_run_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Loading weights…");
     let t0 = Instant::now();
-    let model = g.load_llama_prec(prec).map_err(|e| format!("cannot load model: {e}"))?;
+    let mut model = g.load_llama_prec(prec).map_err(|e| format!("cannot load model: {e}"))?;
     println!(
         "  loaded in {:.2}s: {} layers, dim {}, vocab {}, ctx {}",
         t0.elapsed().as_secs_f32(),
@@ -549,6 +572,17 @@ fn cmd_run_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         model.cfg.vocab_size,
         model.cfg.context_len,
     );
+
+    // Overlay fine-tuned weights from a checkpoint, if requested.
+    if let Some(ckpt) = &resume {
+        use ferrum_core::LlamaTrainer;
+        let bytes = std::fs::read(ckpt).map_err(|e| format!("cannot read checkpoint {ckpt}: {e}"))?;
+        let mut tr = LlamaTrainer::new(model).map_err(|e| format!("cannot wrap model: {e}"))?;
+        tr.load_checkpoint_into(&bytes)
+            .map_err(|e| format!("cannot apply checkpoint {ckpt}: {e}"))?;
+        model = tr.model;
+        println!("  applied fine-tuned checkpoint {ckpt}");
+    }
 
     // Build the prompt token IDs (explicit --ids win; else encode the text).
     let prompt_ids: Vec<usize> = if let Some(ids) = args.flags.get("ids") {
@@ -594,5 +628,167 @@ fn cmd_run_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         dt,
         out_ids.len() as f32 / dt.max(1e-6)
     );
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// finetune-gguf: fine-tune an imported llama/qwen2 GGUF on a text corpus
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Fine-tune an imported GGUF (f32) with the full AdamW stack and write a
+/// checkpoint that `run-gguf --resume` (or a later `finetune-gguf --resume`) can
+/// apply back over the base GGUF.
+fn cmd_finetune_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    use ferrum_core::{
+        Adam, Gguf, GgufTokenizer, LlamaTrainer, LrSchedule, Rng, SamplingParams,
+    };
+
+    if args.positional.len() < 3 {
+        return Err("usage: train_transformer finetune-gguf <model.gguf> <corpus.txt> <out.flck> \
+                    [--epochs N] [--lr F] [--batch N] [--seq N] [--warmup N] [--clip F] \
+                    [--weight_decay F] [--dropout F] [--threads N] [--qat] [--seed N] \
+                    [--resume ckpt.flck] [--sample]"
+            .into());
+    }
+    let gguf_path = &args.positional[0];
+    let corpus_path = &args.positional[1];
+    let out_path = &args.positional[2];
+
+    // 1. Open + f32-load the base model (training needs full-precision masters).
+    println!("Opening {gguf_path} (streamed)…");
+    let g = Gguf::open(gguf_path).map_err(|e| format!("cannot open GGUF {gguf_path}: {e}"))?;
+    println!("  GGUF v{}   architecture = {}", g.version, g.architecture().unwrap_or("?"));
+    let est = estimate_resident_bytes(&g, None); // f32
+    println!("  estimated resident (f32) ≈ {:.2} GB", est as f64 / 1e9);
+    if let Some(avail) = available_memory_bytes() {
+        println!("  available memory         ≈ {:.2} GB", avail as f64 / 1e9);
+        // Training also needs grads + 2 Adam moments (≈4× the f32 weights again).
+        let train_est = est.saturating_mul(4);
+        println!("  estimated training RAM   ≈ {:.2} GB (weights + grad + Adam m/v)", train_est as f64 / 1e9);
+        if (train_est as f64) > 0.9 * avail as f64 && !args.has("force") {
+            return Err(format!(
+                "estimated training memory ({:.2} GB) exceeds 90% of available ({:.2} GB) — \
+                 fine-tune a smaller model, or pass --force to attempt it anyway.",
+                train_est as f64 / 1e9,
+                avail as f64 / 1e9
+            )
+            .into());
+        }
+    }
+
+    let tok = GgufTokenizer::from_gguf(&g)
+        .map_err(|_| "this GGUF has no tokenizer; text fine-tuning needs one")?;
+    println!("  tokenizer = {:?}  (vocab {})", tok.model(), tok.vocab_size());
+
+    println!("Loading weights (f32)…");
+    let t0 = Instant::now();
+    let model = g.load_llama_prec(None).map_err(|e| format!("cannot load model: {e}"))?;
+    println!(
+        "  loaded in {:.2}s: {} layers, dim {}, vocab {}, ctx {}",
+        t0.elapsed().as_secs_f32(),
+        model.cfg.n_layers, model.cfg.model_dim, model.cfg.vocab_size, model.cfg.context_len,
+    );
+
+    // 2. Read + tokenize the corpus.
+    let text = std::fs::read_to_string(corpus_path)
+        .map_err(|e| format!("cannot read corpus {corpus_path}: {e}"))?;
+    let mut tokens: Vec<usize> = Vec::new();
+    if let Some(bos) = tok.bos() {
+        tokens.push(bos);
+    }
+    tokens.extend(tok.encode(&text));
+    println!("  corpus: {} chars → {} tokens", text.len(), tokens.len());
+
+    // 3. Hyperparameters.
+    let epochs: usize = args.get("epochs", 3);
+    let lr: f32 = args.get("lr", 1e-4);
+    let batch: usize = args.get("batch", 8);
+    let seq: usize = args.get("seq", 64).min(model.cfg.context_len).max(2);
+    let weight_decay: f32 = args.get("weight_decay", 0.0);
+    let dropout: f32 = args.get("dropout", 0.0);
+    let clip: f32 = args.get("clip", 1.0);
+    let warmup: u64 = args.get("warmup", 0);
+    let qat = args.has("qat");
+    let seed: u64 = args.get("seed", 1337);
+    let threads_req: usize = args.get("threads", 0);
+    let threads = if threads_req == 0 { ferrum_core::num_threads() } else { threads_req };
+
+    if tokens.len() < seq {
+        return Err(format!(
+            "corpus has {} tokens but --seq is {seq}; supply more text or a smaller --seq",
+            tokens.len()
+        )
+        .into());
+    }
+
+    // 4. Build + configure the trainer.
+    let mut tr = LlamaTrainer::new(model).map_err(|e| format!("cannot build trainer: {e}"))?;
+    tr.set_optimizer(Adam::new(lr));
+    tr.set_weight_decay(weight_decay);
+    tr.set_dropout(dropout);
+    tr.set_grad_clip(if clip > 0.0 { Some(clip) } else { None });
+    tr.set_qat(qat);
+
+    let num_windows = tokens.len() - seq + 1;
+    let steps_per_epoch = num_windows.div_ceil(batch.max(1)) as u64;
+    if warmup > 0 {
+        let total = steps_per_epoch * epochs as u64;
+        tr.set_lr_schedule(Some(LrSchedule::warmup_cosine(lr, warmup, total.max(warmup + 1))));
+    }
+
+    // 5. Resume optimizer state if requested (continues where a prior run stopped).
+    let mut rng = if let Some(ckpt) = args.flags.get("resume") {
+        let bytes = std::fs::read(ckpt).map_err(|e| format!("cannot read checkpoint {ckpt}: {e}"))?;
+        let r = tr.load_checkpoint_into(&bytes)
+            .map_err(|e| format!("cannot resume from {ckpt}: {e}"))?;
+        println!("  resumed from {ckpt} at step {}", tr.step_count());
+        r
+    } else {
+        Rng::new(seed)
+    };
+
+    println!(
+        "\nFine-tuning: {epochs} epochs · seq {seq} · batch {batch} · lr {lr} · \
+         wd {weight_decay} · dropout {dropout} · clip {clip} · {}{} · {threads} threads",
+        if warmup > 0 { format!("warmup {warmup} ") } else { String::new() },
+        if qat { "QAT int8" } else { "f32" },
+    );
+    println!("  {num_windows} windows · {steps_per_epoch} steps/epoch");
+
+    // 6. Train.
+    for e in 0..epochs {
+        let te = Instant::now();
+        let loss = tr.finetune_epoch_threaded(&tokens, seq, batch, &mut rng, threads)?;
+        let secs = te.elapsed().as_secs_f32();
+        let toks = (num_windows * seq) as f32;
+        println!(
+            "  epoch {:>3}/{epochs}  loss {loss:.4}  ppl {:.2}  [{:.1}s, {:.0} tok/s, lr {:.2e}]",
+            e + 1,
+            loss.exp(),
+            secs,
+            toks / secs.max(1e-6),
+            tr.lr_schedule().map(|s| s.lr_at(tr.step_count())).unwrap_or(lr),
+        );
+    }
+
+    // 7. Save the checkpoint (weights + optimizer moments + RNG + step).
+    let bytes = tr.save_checkpoint(&rng);
+    std::fs::write(out_path, &bytes).map_err(|e| format!("cannot write {out_path}: {e}"))?;
+    println!(
+        "\nSaved fine-tune checkpoint → {out_path} ({:.2} MB)\n  \
+         run it with:  train_transformer run-gguf {gguf_path} \"<prompt>\" --resume {out_path}",
+        bytes.len() as f64 / 1e6
+    );
+
+    // 8. Optional sample generation from the fine-tuned model.
+    if args.has("sample") {
+        let prompt = tok.bos().into_iter().collect::<Vec<_>>();
+        let prompt = if prompt.is_empty() { vec![tokens[0]] } else { prompt };
+        let params = SamplingParams::with_temperature(args.get("temp", 0.8));
+        let eos = tok.eos();
+        let mut grng = Rng::new(time_seed());
+        let out = tr.model.generate(&prompt, args.get("max", 48), &params, eos, &mut grng)?;
+        println!("\n── sample ──\n{}\n────────────", tok.decode(&out));
+    }
     Ok(())
 }

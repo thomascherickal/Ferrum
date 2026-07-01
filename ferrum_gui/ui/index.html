@@ -29,6 +29,7 @@
     <button class="tab" data-tab="evaluate">Evaluate</button>
     <button class="tab" data-tab="models">Models</button>
     <button class="tab" data-tab="gguf">GGUF</button>
+    <button class="tab" data-tab="finetune">Fine-tune</button>
     <button class="tab" data-tab="tabular">Tabular (CLI)</button>
     <button class="tab" data-tab="system">System</button>
     <button class="tab" data-tab="capable">Capable</button>
@@ -287,6 +288,10 @@
       <label>Token IDs (only if the file has no tokenizer)
         <input type="text" id="ggIds" placeholder="e.g. 1 234 56" />
       </label>
+      <div class="row">
+        <label>Fine-tune checkpoint (optional) <input type="text" id="ggResume" placeholder="/path/to/finetune.flck — overlays trained weights (forces f32)" /></label>
+        <button class="ghost browse" data-target="ggResume">Browse…</button>
+      </div>
       <label class="chk"><input type="checkbox" id="ggForce" /> Load even if it may exceed available RAM</label>
       <span class="err" id="errGguf"></span>
       <div class="row">
@@ -294,6 +299,53 @@
         <span id="ggStatus" class="muted"></span>
       </div>
       <div id="ggOut" class="output" placeholder="Generated text appears here…"></div>
+    </section>
+
+    <!-- ── Fine-tune (GGUF) ──────────────────────────────────────────────── -->
+    <section class="panel" id="panel-finetune">
+      <h2>Fine-tune — adapt an imported GGUF to your corpus</h2>
+      <p class="hint">AdamW fine-tunes a Llama/Qwen <code>.gguf</code> on your own text (full-precision f32 masters),
+        then writes a <code>.flck</code> checkpoint. Run it back on the <strong>GGUF</strong> tab via the
+        “Fine-tune checkpoint” field. CPU-only: keep the model small — training needs roughly
+        4× the f32 weight size in RAM (weights + gradient + Adam moments).</p>
+      <div class="row">
+        <label>GGUF file <input type="text" id="ftPath" placeholder="/path/to/model.gguf" /></label>
+        <button class="ghost browse" data-target="ftPath">Browse…</button>
+      </div>
+      <div class="row">
+        <label>Training corpus (.txt) <input type="text" id="ftCorpus" placeholder="/path/to/corpus.txt" /></label>
+        <button class="ghost browse" data-target="ftCorpus">Browse…</button>
+      </div>
+      <div class="row">
+        <label>Output checkpoint (.flck) <input type="text" id="ftOut" placeholder="/path/to/finetune.flck" /></label>
+        <button class="ghost browse-save" data-target="ftOut">Browse…</button>
+      </div>
+      <div class="grid">
+        <label>Epochs <input type="number" id="ftEpochs" value="3" min="1" /></label>
+        <label>Learning rate <input type="number" id="ftLr" value="0.0001" step="0.00005" min="0" /></label>
+        <label>Batch size <input type="number" id="ftBatch" value="8" min="1" /></label>
+        <label>Sequence length <input type="number" id="ftSeq" value="64" min="2" /></label>
+        <label>Warmup steps (0=off) <input type="number" id="ftWarmup" value="0" min="0" /></label>
+        <label>Grad clip (0=off) <input type="number" id="ftClip" value="1.0" step="0.1" min="0" /></label>
+        <label>Weight decay <input type="number" id="ftWd" value="0.0" step="0.01" min="0" /></label>
+        <label>Dropout <input type="number" id="ftDropout" value="0.0" step="0.05" min="0" max="0.95" /></label>
+        <label>Threads (0=auto) <input type="number" id="ftThreads" value="0" min="0" /></label>
+        <label>Seed <input type="number" id="ftSeed" value="1337" min="0" /></label>
+      </div>
+      <div class="row">
+        <label>Resume checkpoint (optional) <input type="text" id="ftResume" placeholder="/path/to/prev.flck — continue a run" /></label>
+        <button class="ghost browse" data-target="ftResume">Browse…</button>
+      </div>
+      <label class="chk"><input type="checkbox" id="ftQat" /> Quantization-aware (int8) fine-tuning</label>
+      <label class="chk"><input type="checkbox" id="ftForce" /> Train even if the estimate exceeds available RAM</label>
+      <span class="err" id="errFt"></span>
+      <div class="row">
+        <button id="ftRun" class="primary">Fine-tune</button>
+        <div class="progress"><div class="bar" id="ftBar"></div></div>
+        <span id="ftStatus" class="muted"></span>
+      </div>
+      <canvas id="ftChart" width="900" height="140"></canvas>
+      <div id="ftResult" class="result"></div>
     </section>
 
     <!-- ── Tabular (train_cli) ───────────────────────────────────────────── -->

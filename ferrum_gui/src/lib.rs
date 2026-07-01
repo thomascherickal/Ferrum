@@ -10,6 +10,8 @@
 //! | `engine-log`    | `String` (one diagnostic line)       | `--verbose` sink      |
 //! | `train-progress`| `{ epoch, total, loss }`             | training callback     |
 //! | `train-done`    | [`commands::TrainResult`]            | training completion   |
+//! | `finetune-progress` | `{ epoch, total, loss, ppl }`    | GGUF fine-tune epoch  |
+//! | `finetune-done` | [`commands::FinetuneResult`]         | GGUF fine-tune done   |
 //! | `gen-fragment`  | `String` (streamed text fragment)    | streaming generation  |
 //! | `term-output`   | `{ line, stream }`                   | interactive terminal  |
 
@@ -59,6 +61,7 @@ pub fn run() {
             commands::model_info,
             commands::gguf_info,
             commands::run_gguf,
+            commands::finetune_gguf,
             commands::run_terminal,
             commands::term_cwd,
             commands::system_stats,
