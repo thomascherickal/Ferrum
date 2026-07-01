@@ -5,8 +5,11 @@
 //! is the exact inverse of the matching `dequant_*` decoder, and is verified by
 //! round-tripping through [`crate::gguf::Gguf`].
 
+use crate::error::InferError;
 use crate::gguf::{
-    GGML_F16, GGML_F32, GGML_Q4_0, GGML_Q4_1, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0, GGML_Q8_1,
+    MetaValue, DEFAULT_ALIGNMENT, GGML_F16, GGML_F32, GGML_Q4_0, GGML_Q4_1, GGML_Q4_K, GGML_Q5_K,
+    GGML_Q6_K, GGML_Q8_0, GGML_Q8_1, GGUF_MAGIC, VT_ARRAY, VT_BOOL, VT_F32, VT_F64, VT_I16, VT_I32,
+    VT_I64, VT_I8, VT_STRING, VT_U16, VT_U32, VT_U64, VT_U8,
 };
 
 /// The on-disk GGUF tensor type the writer should emit for weight matrices.
@@ -133,6 +136,234 @@ pub fn f32_to_f16(value: f32) -> u16 {
     sign | ((exp16 as u16) << 10) | mant16
 }
 
+fn align_up(x: usize, a: usize) -> usize {
+    if a == 0 {
+        x
+    } else {
+        x.div_ceil(a) * a
+    }
+}
+
+/// A tensor queued for emission: name, dims (GGML order), type id, encoded bytes.
+struct TensorOut {
+    name: String,
+    dims: Vec<u64>,
+    ggml_type: u32,
+    data: Vec<u8>,
+}
+
+/// Accumulates metadata + tensors, then emits a byte-exact GGUF v3 file.
+/// The exact inverse of [`crate::gguf`]'s `parse_header`.
+pub struct GgufBuilder {
+    metadata: Vec<(String, MetaValue)>,
+    tensors: Vec<TensorOut>,
+    alignment: usize,
+}
+
+impl Default for GgufBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GgufBuilder {
+    pub fn new() -> Self {
+        Self {
+            metadata: Vec::new(),
+            tensors: Vec::new(),
+            alignment: DEFAULT_ALIGNMENT as usize,
+        }
+    }
+
+    pub fn meta(&mut self, key: &str, val: MetaValue) -> &mut Self {
+        self.metadata.push((key.to_string(), val));
+        self
+    }
+
+    pub fn tensor(&mut self, name: &str, dims: &[u64], ggml_type: u32, data: Vec<u8>) -> &mut Self {
+        self.tensors.push(TensorOut {
+            name: name.to_string(),
+            dims: dims.to_vec(),
+            ggml_type,
+            data,
+        });
+        self
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        let mut o = Vec::new();
+        // Header.
+        put_u32(&mut o, GGUF_MAGIC);
+        put_u32(&mut o, 3); // version
+        put_u64(&mut o, self.tensors.len() as u64);
+        put_u64(&mut o, self.metadata.len() as u64);
+
+        // Metadata KV table, in insertion order.
+        for (k, v) in &self.metadata {
+            put_str(&mut o, k);
+            put_value(&mut o, v);
+        }
+
+        // Tensor directory. Offsets are relative to the (aligned) data section
+        // and each is aligned to `self.alignment`.
+        let mut running = 0usize;
+        let mut offsets = Vec::with_capacity(self.tensors.len());
+        for t in &self.tensors {
+            let off = align_up(running, self.alignment);
+            offsets.push(off);
+            running = off + t.data.len();
+        }
+        for (t, &off) in self.tensors.iter().zip(&offsets) {
+            put_str(&mut o, &t.name);
+            put_u32(&mut o, t.dims.len() as u32);
+            for &d in &t.dims {
+                put_u64(&mut o, d);
+            }
+            put_u32(&mut o, t.ggml_type);
+            put_u64(&mut o, off as u64);
+        }
+
+        // Pad to the data-section start, then write each tensor at its offset.
+        let data_start = align_up(o.len(), self.alignment);
+        o.resize(data_start, 0);
+        for (t, &off) in self.tensors.iter().zip(&offsets) {
+            let abs = data_start + off;
+            if o.len() < abs {
+                o.resize(abs, 0); // inter-tensor alignment padding
+            }
+            o.extend_from_slice(&t.data);
+        }
+        o
+    }
+
+    #[allow(dead_code)]
+    pub fn write(self, path: &str) -> crate::error::Result<()> {
+        let bytes = self.into_bytes();
+        std::fs::write(path, bytes).map_err(InferError::from)
+    }
+}
+
+// ── Little-endian put helpers ────────────────────────────────────────────────
+
+fn put_u32(o: &mut Vec<u8>, v: u32) {
+    o.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_u64(o: &mut Vec<u8>, v: u64) {
+    o.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_str(o: &mut Vec<u8>, s: &str) {
+    put_u64(o, s.len() as u64);
+    o.extend_from_slice(s.as_bytes());
+}
+
+/// Serialize one metadata value (type tag + payload). Mirrors `read_value`.
+fn put_value(o: &mut Vec<u8>, v: &MetaValue) {
+    match v {
+        MetaValue::U8(x) => {
+            put_u32(o, VT_U8);
+            o.push(*x);
+        }
+        MetaValue::I8(x) => {
+            put_u32(o, VT_I8);
+            o.push(*x as u8);
+        }
+        MetaValue::U16(x) => {
+            put_u32(o, VT_U16);
+            o.extend_from_slice(&x.to_le_bytes());
+        }
+        MetaValue::I16(x) => {
+            put_u32(o, VT_I16);
+            o.extend_from_slice(&x.to_le_bytes());
+        }
+        MetaValue::U32(x) => {
+            put_u32(o, VT_U32);
+            o.extend_from_slice(&x.to_le_bytes());
+        }
+        MetaValue::I32(x) => {
+            put_u32(o, VT_I32);
+            o.extend_from_slice(&x.to_le_bytes());
+        }
+        MetaValue::F32(x) => {
+            put_u32(o, VT_F32);
+            o.extend_from_slice(&x.to_le_bytes());
+        }
+        MetaValue::Bool(x) => {
+            put_u32(o, VT_BOOL);
+            o.push(*x as u8);
+        }
+        MetaValue::String(s) => {
+            put_u32(o, VT_STRING);
+            put_str(o, s);
+        }
+        MetaValue::U64(x) => {
+            put_u32(o, VT_U64);
+            o.extend_from_slice(&x.to_le_bytes());
+        }
+        MetaValue::I64(x) => {
+            put_u32(o, VT_I64);
+            o.extend_from_slice(&x.to_le_bytes());
+        }
+        MetaValue::F64(x) => {
+            put_u32(o, VT_F64);
+            o.extend_from_slice(&x.to_le_bytes());
+        }
+        MetaValue::Array(items) => {
+            put_u32(o, VT_ARRAY);
+            // Element type tag from the first item (empty arrays default to STRING,
+            // matching the common tokenizer-metadata case).
+            let elem_tag = items.first().map(value_type_tag).unwrap_or(VT_STRING);
+            put_u32(o, elem_tag);
+            put_u64(o, items.len() as u64);
+            for it in items {
+                put_value_payload(o, it);
+            }
+        }
+    }
+}
+
+/// The GGUF type tag for a value (without writing it).
+fn value_type_tag(v: &MetaValue) -> u32 {
+    match v {
+        MetaValue::U8(_) => VT_U8,
+        MetaValue::I8(_) => VT_I8,
+        MetaValue::U16(_) => VT_U16,
+        MetaValue::I16(_) => VT_I16,
+        MetaValue::U32(_) => VT_U32,
+        MetaValue::I32(_) => VT_I32,
+        MetaValue::F32(_) => VT_F32,
+        MetaValue::Bool(_) => VT_BOOL,
+        MetaValue::String(_) => VT_STRING,
+        MetaValue::U64(_) => VT_U64,
+        MetaValue::I64(_) => VT_I64,
+        MetaValue::F64(_) => VT_F64,
+        MetaValue::Array(_) => VT_ARRAY,
+    }
+}
+
+/// Write only a value's payload (no type tag) — used for array elements, whose
+/// type is written once for the whole array.
+fn put_value_payload(o: &mut Vec<u8>, v: &MetaValue) {
+    match v {
+        MetaValue::U8(x) => o.push(*x),
+        MetaValue::I8(x) => o.push(*x as u8),
+        MetaValue::U16(x) => o.extend_from_slice(&x.to_le_bytes()),
+        MetaValue::I16(x) => o.extend_from_slice(&x.to_le_bytes()),
+        MetaValue::U32(x) => o.extend_from_slice(&x.to_le_bytes()),
+        MetaValue::I32(x) => o.extend_from_slice(&x.to_le_bytes()),
+        MetaValue::F32(x) => o.extend_from_slice(&x.to_le_bytes()),
+        MetaValue::Bool(x) => o.push(*x as u8),
+        MetaValue::String(s) => put_str(o, s),
+        MetaValue::U64(x) => o.extend_from_slice(&x.to_le_bytes()),
+        MetaValue::I64(x) => o.extend_from_slice(&x.to_le_bytes()),
+        MetaValue::F64(x) => o.extend_from_slice(&x.to_le_bytes()),
+        MetaValue::Array(_) => {
+            // The reader rejects nested arrays; the writer never produces them.
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +408,53 @@ mod tests {
         assert!(GgufQuant::from_str("q4_k").unwrap().is_kquant());
         assert!(!GgufQuant::from_str("q8_0").unwrap().is_kquant());
         assert!(GgufQuant::from_str("bogus").is_none());
+    }
+
+    #[test]
+    fn builder_roundtrips_through_reader() {
+        use crate::gguf::{Gguf, MetaValue, GGML_F32};
+
+        // Two f32 tensors + scalar/string/array metadata.
+        let t0: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let t1: Vec<f32> = (0..4).map(|i| -(i as f32)).collect();
+
+        let mut b = GgufBuilder::new();
+        b.meta("general.architecture", MetaValue::String("llama".into()));
+        b.meta("llama.block_count", MetaValue::U32(2));
+        b.meta(
+            "tokenizer.ggml.tokens",
+            MetaValue::Array(vec![
+                MetaValue::String("a".into()),
+                MetaValue::String("b".into()),
+            ]),
+        );
+        b.tensor("t0", &[8], GGML_F32, f32s_to_le_bytes(&t0));
+        b.tensor("t1", &[4], GGML_F32, f32s_to_le_bytes(&t1));
+        let bytes = b.into_bytes();
+
+        let g = Gguf::parse(bytes).unwrap();
+        assert_eq!(g.version, 3);
+        assert_eq!(g.architecture(), Some("llama"));
+        assert_eq!(g.meta("llama.block_count").unwrap().as_usize(), Some(2));
+        // Tensors present with correct dims and decoded values.
+        assert_eq!(g.dequantize(g.tensor("t0").unwrap()).unwrap(), t0);
+        assert_eq!(g.dequantize(g.tensor("t1").unwrap()).unwrap(), t1);
+        // Array metadata preserved.
+        match g.meta("tokenizer.ggml.tokens").unwrap() {
+            MetaValue::Array(a) => {
+                assert_eq!(a.len(), 2);
+                assert_eq!(a[0].as_str(), Some("a"));
+            }
+            _ => panic!("tokens not an array"),
+        }
+    }
+
+    // Test-only helper: little-endian f32 bytes.
+    fn f32s_to_le_bytes(xs: &[f32]) -> Vec<u8> {
+        let mut o = Vec::with_capacity(xs.len() * 4);
+        for &x in xs {
+            o.extend_from_slice(&x.to_le_bytes());
+        }
+        o
     }
 }
