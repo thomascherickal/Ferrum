@@ -52,7 +52,7 @@ pub(crate) const GGML_Q6_K: u32 = 14;
 
 pub(crate) const QK: usize = 32; // GGML block length for the legacy quant formats
 pub(crate) const QK_K: usize = 256; // super-block length for the k-quant formats
-                         // On-disk bytes per k-quant super-block of QK_K weights (must match ggml).
+                                    // On-disk bytes per k-quant super-block of QK_K weights (must match ggml).
 pub(crate) const Q4_K_BLOCK: usize = 2 + 2 + 12 + QK_K / 2; // d, dmin, 6-bit scales, 4-bit qs = 144
 pub(crate) const Q5_K_BLOCK: usize = 2 + 2 + 12 + QK_K / 8 + QK_K / 2; // + qh high bits = 176
 pub(crate) const Q6_K_BLOCK: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2; // ql, qh, scales, d = 210

@@ -5,8 +5,6 @@
 //! is the exact inverse of the matching `dequant_*` decoder, and is verified by
 //! round-tripping through [`crate::gguf::Gguf`].
 
-use crate::gguf::f16_to_f32;
-
 /// Encode an `f32` as an IEEE-754 half (`u16`), round-to-nearest-ties-to-even.
 /// Inf/NaN, subnormals, and overflow-to-Inf are all handled. Exact inverse of
 /// [`crate::gguf::f16_to_f32`] on values representable as f16.
@@ -18,7 +16,11 @@ pub fn f32_to_f16(value: f32) -> u16 {
 
     if exp32 == 0xFF {
         // Inf (mant 0) or NaN (mant != 0 → a canonical quiet NaN).
-        return if mant32 != 0 { sign | 0x7E00 } else { sign | 0x7C00 };
+        return if mant32 != 0 {
+            sign | 0x7E00
+        } else {
+            sign | 0x7C00
+        };
     }
 
     let mut exp16 = exp32 - 127 + 15;
@@ -60,6 +62,7 @@ pub fn f32_to_f16(value: f32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gguf::f16_to_f32;
 
     #[test]
     fn f32_to_f16_is_exact_inverse_of_f16_to_f32() {
