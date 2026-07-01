@@ -71,7 +71,10 @@ impl RmsNorm {
         }
         let mut out = vec![0.0f32; rows * cols];
         for r in 0..rows {
-            let (xs, os) = (&x.data[r * cols..(r + 1) * cols], &mut out[r * cols..(r + 1) * cols]);
+            let (xs, os) = (
+                &x.data[r * cols..(r + 1) * cols],
+                &mut out[r * cols..(r + 1) * cols],
+            );
             self.forward_row(xs, os);
         }
         Tensor::matrix(rows, cols, out)
@@ -185,8 +188,16 @@ impl Attention {
             )));
         }
         Ok(Self {
-            wq, wk, wv, wo,
-            n_heads, n_kv_heads, head_dim, rope_dim, rope_base, rope_type,
+            wq,
+            wk,
+            wv,
+            wo,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            rope_dim,
+            rope_base,
+            rope_type,
         })
     }
 
@@ -202,8 +213,24 @@ impl Attention {
         let mut q = self.wq.forward(x)?.data;
         let mut k = self.wk.forward(x)?.data;
         let v = self.wv.forward(x)?.data;
-        apply_rope(&mut q, self.n_heads, self.head_dim, self.rope_dim, pos, self.rope_base, self.rope_type);
-        apply_rope(&mut k, self.n_kv_heads, self.head_dim, self.rope_dim, pos, self.rope_base, self.rope_type);
+        apply_rope(
+            &mut q,
+            self.n_heads,
+            self.head_dim,
+            self.rope_dim,
+            pos,
+            self.rope_base,
+            self.rope_type,
+        );
+        apply_rope(
+            &mut k,
+            self.n_kv_heads,
+            self.head_dim,
+            self.rope_dim,
+            pos,
+            self.rope_base,
+            self.rope_type,
+        );
         Ok((q, k, v))
     }
 
@@ -258,7 +285,10 @@ impl Attention {
         let len = cache.k.len() / self.kv_dim();
         let mut ctx = vec![0.0f32; self.q_dim()];
         self.attend(&q, &cache.k, &cache.v, len, &mut ctx);
-        Ok(self.wo.forward(&Tensor::matrix(1, self.q_dim(), ctx)?)?.data)
+        Ok(self
+            .wo
+            .forward(&Tensor::matrix(1, self.q_dim(), ctx)?)?
+            .data)
     }
 
     /// Independent full-sequence causal attention over a `[seq, model_dim]`
@@ -280,8 +310,16 @@ impl Attention {
         let mut ctx = vec![0.0f32; self.q_dim()];
         for t in 0..seq {
             // Causal: position t attends to cached positions 0..=t.
-            self.attend(&q_all[t * self.q_dim()..(t + 1) * self.q_dim()], &kc, &vc, t + 1, &mut ctx);
-            let o = self.wo.forward(&Tensor::matrix(1, self.q_dim(), ctx.clone())?)?;
+            self.attend(
+                &q_all[t * self.q_dim()..(t + 1) * self.q_dim()],
+                &kc,
+                &vc,
+                t + 1,
+                &mut ctx,
+            );
+            let o = self
+                .wo
+                .forward(&Tensor::matrix(1, self.q_dim(), ctx.clone())?)?;
             out[t * dim_in..(t + 1) * dim_in].copy_from_slice(&o.data);
         }
         Tensor::matrix(seq, dim_in, out)
@@ -352,10 +390,18 @@ impl LlamaBlock {
         let (seq, dim) = x.matrix_dims()?;
         let n1 = self.attn_norm.forward(x)?;
         let a = self.attn.forward_full(&n1)?;
-        let h = Tensor::matrix(seq, dim, (0..seq * dim).map(|i| x.data[i] + a.data[i]).collect())?;
+        let h = Tensor::matrix(
+            seq,
+            dim,
+            (0..seq * dim).map(|i| x.data[i] + a.data[i]).collect(),
+        )?;
         let n2 = self.ffn_norm.forward(&h)?;
         let f = self.ffn.forward(&n2)?;
-        Tensor::matrix(seq, dim, (0..seq * dim).map(|i| h.data[i] + f.data[i]).collect())
+        Tensor::matrix(
+            seq,
+            dim,
+            (0..seq * dim).map(|i| h.data[i] + f.data[i]).collect(),
+        )
     }
 }
 
@@ -388,7 +434,10 @@ pub struct LlamaCache {
 
 impl LlamaCache {
     pub fn new(n_layers: usize) -> Self {
-        Self { layers: vec![KvLayer::default(); n_layers], pos: 0 }
+        Self {
+            layers: vec![KvLayer::default(); n_layers],
+            pos: 0,
+        }
     }
     pub fn clear(&mut self) {
         for l in &mut self.layers {
@@ -565,7 +614,10 @@ mod tests {
             let n0 = x.iter().map(|v| v * v).sum::<f32>();
             apply_rope(&mut x, 1, 8, 8, 5, 10000.0, rt);
             let n1 = x.iter().map(|v| v * v).sum::<f32>();
-            assert!((n0 - n1).abs() < 1e-4, "rope changed norm for {rt:?}: {n0} vs {n1}");
+            assert!(
+                (n0 - n1).abs() < 1e-4,
+                "rope changed norm for {rt:?}: {n0} vs {n1}"
+            );
         }
     }
 
@@ -589,7 +641,12 @@ mod tests {
             lin(dim, kvd, seed + 1),
             lin(dim, kvd, seed + 2),
             lin(qd, dim, seed + 3),
-            n_heads, n_kv, hd, hd, 10000.0, RopeType::Norm,
+            n_heads,
+            n_kv,
+            hd,
+            hd,
+            10000.0,
+            RopeType::Norm,
         )
         .unwrap()
     }
@@ -608,8 +665,11 @@ mod tests {
             let row = &x.data[t * dim..(t + 1) * dim];
             let inc = attn.forward_one(row, t, &mut cache).unwrap();
             for (d, &got) in inc.iter().enumerate() {
-                assert!((got - full.data[t * dim + d]).abs() < 1e-4,
-                    "row {t} dim {d}: cached {got} vs full {}", full.data[t * dim + d]);
+                assert!(
+                    (got - full.data[t * dim + d]).abs() < 1e-4,
+                    "row {t} dim {d}: cached {got} vs full {}",
+                    full.data[t * dim + d]
+                );
             }
         }
     }
@@ -623,7 +683,9 @@ mod tests {
         let full = attn.forward_full(&x).unwrap();
         let mut cache = KvLayer::default();
         for t in 0..seq {
-            let inc = attn.forward_one(&x.data[t * dim..(t + 1) * dim], t, &mut cache).unwrap();
+            let inc = attn
+                .forward_one(&x.data[t * dim..(t + 1) * dim], t, &mut cache)
+                .unwrap();
             for (d, &got) in inc.iter().enumerate() {
                 assert!((got - full.data[t * dim + d]).abs() < 1e-4);
             }
@@ -634,8 +696,16 @@ mod tests {
     fn attention_rejects_bad_gqa() {
         // 5 query heads cannot evenly share 2 KV heads.
         let r = Attention::new(
-            lin(8, 20, 1), lin(8, 8, 2), lin(8, 8, 3), lin(20, 8, 4),
-            5, 2, 4, 4, 10000.0, RopeType::Norm,
+            lin(8, 20, 1),
+            lin(8, 8, 2),
+            lin(8, 8, 3),
+            lin(20, 8, 4),
+            5,
+            2,
+            4,
+            4,
+            10000.0,
+            RopeType::Norm,
         );
         assert!(r.is_err());
     }
@@ -654,7 +724,10 @@ mod tests {
         let h: Vec<f32> = (0..ffn)
             .map(|i| (g.data[i] / (1.0 + (-g.data[i]).exp())) * u.data[i])
             .collect();
-        let want = ff.down.forward(&Tensor::matrix(1, ffn, h).unwrap()).unwrap();
+        let want = ff
+            .down
+            .forward(&Tensor::matrix(1, ffn, h).unwrap())
+            .unwrap();
         for (a, b) in got.data.iter().zip(&want.data) {
             assert!((a - b).abs() < 1e-6);
         }
@@ -663,12 +736,23 @@ mod tests {
 
     // ── Block + Model ─────────────────────────────────────────────────────────
 
-    fn block(dim: usize, n_heads: usize, n_kv: usize, hd: usize, ffn: usize, seed: u64) -> LlamaBlock {
+    fn block(
+        dim: usize,
+        n_heads: usize,
+        n_kv: usize,
+        hd: usize,
+        ffn: usize,
+        seed: u64,
+    ) -> LlamaBlock {
         LlamaBlock {
             attn_norm: RmsNorm::new(vec![1.0; dim], 1e-6),
             attn: attention(dim, n_heads, n_kv, hd, seed),
             ffn_norm: RmsNorm::new(vec![1.0; dim], 1e-6),
-            ffn: FeedForward::new(lin(dim, ffn, seed + 10), lin(dim, ffn, seed + 11), lin(ffn, dim, seed + 12)),
+            ffn: FeedForward::new(
+                lin(dim, ffn, seed + 10),
+                lin(dim, ffn, seed + 11),
+                lin(ffn, dim, seed + 12),
+            ),
         }
     }
 
@@ -680,10 +764,14 @@ mod tests {
         let full = b.forward_full(&x).unwrap();
         let mut cache = KvLayer::default();
         for t in 0..seq {
-            let inc = b.forward_one(&x.data[t * dim..(t + 1) * dim], t, &mut cache).unwrap();
+            let inc = b
+                .forward_one(&x.data[t * dim..(t + 1) * dim], t, &mut cache)
+                .unwrap();
             for (d, &got) in inc.iter().enumerate() {
-                assert!((got - full.data[t * dim + d]).abs() < 1e-4,
-                    "block row {t} dim {d}");
+                assert!(
+                    (got - full.data[t * dim + d]).abs() < 1e-4,
+                    "block row {t} dim {d}"
+                );
             }
         }
     }
@@ -691,9 +779,18 @@ mod tests {
     fn tiny_model() -> LlamaModel {
         let (vocab, dim, hd, ffn) = (12, 16, 4, 32);
         let cfg = LlamaConfig {
-            vocab_size: vocab, model_dim: dim, n_layers: 2, n_heads: 4, n_kv_heads: 2,
-            head_dim: hd, ffn_dim: ffn, rope_dim: hd, rope_base: 10000.0,
-            rope_type: RopeType::Norm, norm_eps: 1e-6, context_len: 32,
+            vocab_size: vocab,
+            model_dim: dim,
+            n_layers: 2,
+            n_heads: 4,
+            n_kv_heads: 2,
+            head_dim: hd,
+            ffn_dim: ffn,
+            rope_dim: hd,
+            rope_base: 10000.0,
+            rope_type: RopeType::Norm,
+            norm_eps: 1e-6,
+            context_len: 32,
         };
         LlamaModel {
             cfg,
@@ -718,8 +815,12 @@ mod tests {
             let logits = model.forward_one(tok, &mut cache).unwrap();
             let row = &full.data[t * vocab..(t + 1) * vocab];
             for v in 0..vocab {
-                assert!((logits[v] - row[v]).abs() < 1e-3,
-                    "step {t} vocab {v}: cached {} vs full {}", logits[v], row[v]);
+                assert!(
+                    (logits[v] - row[v]).abs() < 1e-3,
+                    "step {t} vocab {v}: cached {} vs full {}",
+                    logits[v],
+                    row[v]
+                );
             }
         }
         assert_eq!(cache.pos(), tokens.len());
@@ -729,17 +830,29 @@ mod tests {
     fn generate_is_deterministic_and_respects_eos() {
         let model = tiny_model();
         let params = SamplingParams::with_temperature(0.8);
-        let a = model.generate(&[1, 2, 3], 10, &params, None, &mut Rng::new(7)).unwrap();
-        let b = model.generate(&[1, 2, 3], 10, &params, None, &mut Rng::new(7)).unwrap();
+        let a = model
+            .generate(&[1, 2, 3], 10, &params, None, &mut Rng::new(7))
+            .unwrap();
+        let b = model
+            .generate(&[1, 2, 3], 10, &params, None, &mut Rng::new(7))
+            .unwrap();
         assert_eq!(a, b, "generation must be deterministic for a fixed seed");
         assert_eq!(a.len(), 10);
         assert!(a.iter().all(|&t| t < model.cfg.vocab_size));
 
         // Greedy with an eos that will be hit stops early (temperature→0 ≈ argmax).
         let greedy = SamplingParams::with_temperature(0.01);
-        let first = model.generate(&[1, 2, 3], 1, &greedy, None, &mut Rng::new(1)).unwrap()[0];
-        let stopped = model.generate(&[1, 2, 3], 10, &greedy, Some(first), &mut Rng::new(1)).unwrap();
-        assert_eq!(stopped, vec![first], "should stop at eos on the first token");
+        let first = model
+            .generate(&[1, 2, 3], 1, &greedy, None, &mut Rng::new(1))
+            .unwrap()[0];
+        let stopped = model
+            .generate(&[1, 2, 3], 10, &greedy, Some(first), &mut Rng::new(1))
+            .unwrap();
+        assert_eq!(
+            stopped,
+            vec![first],
+            "should stop at eos on the first token"
+        );
     }
 
     #[test]
@@ -763,13 +876,31 @@ mod tests {
     fn attention_rejects_odd_or_oversized_rope_dim() {
         // rope_dim must be even and ≤ head_dim.
         assert!(Attention::new(
-            lin(8, 8, 1), lin(8, 8, 2), lin(8, 8, 3), lin(8, 8, 4),
-            2, 2, 4, 5, 10000.0, RopeType::Norm,
-        ).is_err());
+            lin(8, 8, 1),
+            lin(8, 8, 2),
+            lin(8, 8, 3),
+            lin(8, 8, 4),
+            2,
+            2,
+            4,
+            5,
+            10000.0,
+            RopeType::Norm,
+        )
+        .is_err());
         assert!(Attention::new(
-            lin(8, 8, 1), lin(8, 8, 2), lin(8, 8, 3), lin(8, 8, 4),
-            2, 2, 4, 6, 10000.0, RopeType::Norm,
-        ).is_err());
+            lin(8, 8, 1),
+            lin(8, 8, 2),
+            lin(8, 8, 3),
+            lin(8, 8, 4),
+            2,
+            2,
+            4,
+            6,
+            10000.0,
+            RopeType::Norm,
+        )
+        .is_err());
     }
 
     #[test]

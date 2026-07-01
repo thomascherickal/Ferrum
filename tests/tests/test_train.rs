@@ -1,7 +1,4 @@
-use ferrum_core::{
-    loss::softmax_cross_entropy,
-    Net, Rng, Sgd, Tensor,
-};
+use ferrum_core::{loss::softmax_cross_entropy, Net, Rng, Sgd, Tensor};
 
 #[test]
 fn net_parameter_count() {

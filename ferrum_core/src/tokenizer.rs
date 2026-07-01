@@ -99,7 +99,12 @@ impl ByteBpeTokenizer {
 
     /// Rebuild the `pair → rank` map from the current merge list.
     fn rebuild_ranks(&mut self) {
-        self.ranks = self.merges.iter().enumerate().map(|(i, &p)| (p, i)).collect();
+        self.ranks = self
+            .merges
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| (p, i))
+            .collect();
     }
 
     /// Learn up to `vocab_size − 256` merges from `corpus`.
@@ -120,8 +125,12 @@ impl ByteBpeTokenizer {
             .iter()
             .map(|c| c.bytes().map(u32::from).collect())
             .collect();
-        vprintln!("[tokenizer::train] corpus={} bytes, {} chunks, target vocab={}",
-            corpus.len(), chunks.len(), vocab_size);
+        vprintln!(
+            "[tokenizer::train] corpus={} bytes, {} chunks, target vocab={}",
+            corpus.len(),
+            chunks.len(),
+            vocab_size
+        );
 
         while tok.vocab.len() < vocab_size {
             // Count adjacent pairs within each chunk.
@@ -142,9 +151,19 @@ impl ByteBpeTokenizer {
                 break;
             }
             let new_id = tok.vocab.len() as u32;
-            let merged = [tok.vocab[pair.0 as usize].clone(), tok.vocab[pair.1 as usize].clone()].concat();
-            vprintln!("[tokenizer::train] merge {}: {:?}+{:?} → id {} (count {})",
-                tok.merges.len(), pair.0, pair.1, new_id, count);
+            let merged = [
+                tok.vocab[pair.0 as usize].clone(),
+                tok.vocab[pair.1 as usize].clone(),
+            ]
+            .concat();
+            vprintln!(
+                "[tokenizer::train] merge {}: {:?}+{:?} → id {} (count {})",
+                tok.merges.len(),
+                pair.0,
+                pair.1,
+                new_id,
+                count
+            );
             tok.vocab.push(merged);
             tok.merges.push(pair);
             for chunk in &mut chunks {
@@ -152,7 +171,11 @@ impl ByteBpeTokenizer {
             }
         }
         tok.rebuild_ranks();
-        vprintln!("[tokenizer::train] done: vocab={}, merges={}", tok.vocab.len(), tok.merges.len());
+        vprintln!(
+            "[tokenizer::train] done: vocab={}, merges={}",
+            tok.vocab.len(),
+            tok.merges.len()
+        );
         Ok(tok)
     }
 
@@ -313,19 +336,22 @@ impl ByteBpeTokenizer {
                 let (a, b) = entry
                     .split_once(',')
                     .ok_or_else(|| InferError::Format(format!("bad merge entry {entry:?}")))?;
-                let a: u32 = a.trim().parse().map_err(|_| {
-                    InferError::ParseError(format!("bad merge id {a:?}"))
-                })?;
-                let b: u32 = b.trim().parse().map_err(|_| {
-                    InferError::ParseError(format!("bad merge id {b:?}"))
-                })?;
+                let a: u32 = a
+                    .trim()
+                    .parse()
+                    .map_err(|_| InferError::ParseError(format!("bad merge id {a:?}")))?;
+                let b: u32 = b
+                    .trim()
+                    .parse()
+                    .map_err(|_| InferError::ParseError(format!("bad merge id {b:?}")))?;
                 if a as usize >= tok.vocab.len() || b as usize >= tok.vocab.len() {
                     return Err(InferError::Format(format!(
                         "merge ({a},{b}) references undefined token (vocab {})",
                         tok.vocab.len()
                     )));
                 }
-                let merged = [tok.vocab[a as usize].clone(), tok.vocab[b as usize].clone()].concat();
+                let merged =
+                    [tok.vocab[a as usize].clone(), tok.vocab[b as usize].clone()].concat();
                 tok.vocab.push(merged);
                 tok.merges.push((a, b));
             }
@@ -362,7 +388,11 @@ mod tests {
     fn trained_roundtrip_exact() {
         let tok = ByteBpeTokenizer::train(CORPUS, 300).unwrap();
         for text in [CORPUS, "lowest news", "unseen zzz 🌸 text"] {
-            assert_eq!(tok.decode(&tok.encode(text)), text, "roundtrip failed for {text:?}");
+            assert_eq!(
+                tok.decode(&tok.encode(text)),
+                text,
+                "roundtrip failed for {text:?}"
+            );
         }
     }
 
@@ -459,10 +489,11 @@ mod tests {
         let tok = ByteBpeTokenizer::train("ab ab ab ab ab", 300).unwrap();
         for (id, bytes) in tok.vocab.iter().enumerate() {
             if id >= BASE_VOCAB {
-                let has_inner_space = bytes
-                    .iter()
-                    .any(|&b| (b as char).is_whitespace());
-                assert!(!has_inner_space, "merged token {id} ({bytes:?}) spans whitespace");
+                let has_inner_space = bytes.iter().any(|&b| (b as char).is_whitespace());
+                assert!(
+                    !has_inner_space,
+                    "merged token {id} ({bytes:?}) spans whitespace"
+                );
             }
         }
     }
@@ -495,7 +526,11 @@ mod tests {
         let tok = ByteBpeTokenizer::train(CORPUS, 320).unwrap();
         let restored = ByteBpeTokenizer::from_state(&tok.encode_state()).unwrap();
         for text in [CORPUS, "lowest newer news", "🌸 unseen"] {
-            assert_eq!(restored.encode(text), tok.encode(text), "mismatch for {text:?}");
+            assert_eq!(
+                restored.encode(text),
+                tok.encode(text),
+                "mismatch for {text:?}"
+            );
         }
     }
 
@@ -523,12 +558,19 @@ mod tests {
         // Ordinary text never encodes to a special id.
         let ids = tok.encode("low lowest newer");
         let max_text_id = tok.vocab_size() - tok.num_special();
-        assert!(ids.iter().all(|&i| i < max_text_id), "text encoded to a special id");
+        assert!(
+            ids.iter().all(|&i| i < max_text_id),
+            "text encoded to a special id"
+        );
         // Special tokens decode to nothing, so they vanish from text.
         let eos = tok.eos_id().unwrap();
         assert_eq!(tok.decode(&[eos]), "");
         let mixed = tok.encode_framed("low", true, true);
-        assert_eq!(tok.decode(&mixed), "low", "framing must not alter decoded text");
+        assert_eq!(
+            tok.decode(&mixed),
+            "low",
+            "framing must not alter decoded text"
+        );
     }
 
     #[test]
@@ -542,7 +584,10 @@ mod tests {
         assert_eq!(&framed[1..framed.len() - 1], bare.as_slice());
         // Without registered specials, framing is a no-op.
         let plain = ByteBpeTokenizer::train(CORPUS, 300).unwrap();
-        assert_eq!(plain.encode_framed("lower", true, true), plain.encode("lower"));
+        assert_eq!(
+            plain.encode_framed("lower", true, true),
+            plain.encode("lower")
+        );
     }
 
     #[test]

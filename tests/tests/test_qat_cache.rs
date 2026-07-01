@@ -60,14 +60,15 @@ fn default_config_is_valid() {
 fn train_transformer_config_trains_a_generating_model() {
     let mut rng = Rng::new(1);
     let mut epochs_seen = 0usize;
-    let slm =
-        GenerativeSLM::train_transformer_config(CORPUS, &tiny_config(), &mut rng, |_, _| {
-            epochs_seen += 1;
-        })
-        .unwrap();
+    let slm = GenerativeSLM::train_transformer_config(CORPUS, &tiny_config(), &mut rng, |_, _| {
+        epochs_seen += 1;
+    })
+    .unwrap();
     assert_eq!(epochs_seen, tiny_config().epochs);
     assert_eq!(slm.meta.task, TaskType::TransformerSLM);
-    let out = slm.generate("the quick brown fox", 20, 0.8, &mut Rng::new(2)).unwrap();
+    let out = slm
+        .generate("the quick brown fox", 20, 0.8, &mut Rng::new(2))
+        .unwrap();
     assert!(out.chars().count() >= "the quick brown fox".chars().count() + 20);
 }
 
@@ -75,9 +76,8 @@ fn train_transformer_config_trains_a_generating_model() {
 fn save_writes_int8_finf_v5_and_load_roundtrips() {
     let path = temp_model_path("save_load");
     let mut rng = Rng::new(3);
-    let slm =
-        GenerativeSLM::train_transformer_config(CORPUS, &tiny_config(), &mut rng, |_, _| {})
-            .unwrap();
+    let slm = GenerativeSLM::train_transformer_config(CORPUS, &tiny_config(), &mut rng, |_, _| {})
+        .unwrap();
     slm.save(path.to_str().unwrap()).unwrap();
 
     // Saved file must be int8-quantized FINF v5.
@@ -91,8 +91,12 @@ fn save_writes_int8_finf_v5_and_load_roundtrips() {
     assert_eq!(loaded.meta.task, TaskType::TransformerSLM);
     assert_eq!(loaded.meta.class_names, slm.meta.class_names);
     assert_eq!(loaded.meta.input_dim, slm.meta.input_dim);
-    let a = loaded.generate("the quick", 15, 0.8, &mut Rng::new(9)).unwrap();
-    let b = loaded.generate("the quick", 15, 0.8, &mut Rng::new(9)).unwrap();
+    let a = loaded
+        .generate("the quick", 15, 0.8, &mut Rng::new(9))
+        .unwrap();
+    let b = loaded
+        .generate("the quick", 15, 0.8, &mut Rng::new(9))
+        .unwrap();
     assert_eq!(a, b);
 
     let _ = std::fs::remove_file(&path);
@@ -104,9 +108,8 @@ fn save_creates_parent_directories() {
     dir.push(format!("ferrum_test_nested_{}", std::process::id()));
     let path = dir.join("deep").join("model.bin");
     let mut rng = Rng::new(4);
-    let slm =
-        GenerativeSLM::train_transformer_config(CORPUS, &tiny_config(), &mut rng, |_, _| {})
-            .unwrap();
+    let slm = GenerativeSLM::train_transformer_config(CORPUS, &tiny_config(), &mut rng, |_, _| {})
+        .unwrap();
     slm.save(path.to_str().unwrap()).unwrap();
     assert!(path.exists());
     let _ = std::fs::remove_dir_all(&dir);
@@ -121,11 +124,10 @@ fn load_or_train_trains_once_then_loads_from_disk() {
     // First call: no file on disk → trains and saves.
     let mut rng = Rng::new(5);
     let mut first_epochs = 0usize;
-    let (_slm, loaded) =
-        GenerativeSLM::load_or_train(path_str, CORPUS, &cfg, &mut rng, |_, _| {
-            first_epochs += 1;
-        })
-        .unwrap();
+    let (_slm, loaded) = GenerativeSLM::load_or_train(path_str, CORPUS, &cfg, &mut rng, |_, _| {
+        first_epochs += 1;
+    })
+    .unwrap();
     assert!(!loaded, "first call must train, not load");
     assert_eq!(first_epochs, cfg.epochs);
     assert!(path.exists(), "model file must be written after training");
@@ -143,7 +145,9 @@ fn load_or_train_trains_once_then_loads_from_disk() {
     assert_eq!(reloaded.meta.task, TaskType::TransformerSLM);
 
     // The cached model still generates.
-    let out = reloaded.generate("the quick", 10, 0.8, &mut Rng::new(7)).unwrap();
+    let out = reloaded
+        .generate("the quick", 10, 0.8, &mut Rng::new(7))
+        .unwrap();
     assert!(out.starts_with("the quick"));
 
     let _ = std::fs::remove_file(&path);
@@ -159,29 +163,51 @@ fn bpe_config_trains_qat_model_and_embeds_tokenizer() {
     // list, a ≥256 token vocabulary, and an empty character class list.
     let mut rng = Rng::new(101);
     let cfg = tiny_bpe_config();
-    let slm = GenerativeSLM::train_transformer_config(BPE_CORPUS, &cfg, &mut rng, |_, _| {}).unwrap();
+    let slm =
+        GenerativeSLM::train_transformer_config(BPE_CORPUS, &cfg, &mut rng, |_, _| {}).unwrap();
 
     assert_eq!(slm.meta.task, TaskType::TransformerSLM);
-    assert!(!slm.meta.tokenizer_state.is_empty(), "BPE merge list must be stored");
-    assert!(slm.meta.output_dim >= 256, "BPE vocab is at least the 256-byte base");
-    assert!(slm.meta.output_dim <= cfg.vocab_size, "vocab must not exceed the requested size");
-    assert!(slm.meta.class_names.is_empty(), "BPE models decode via the tokenizer, not class_names");
+    assert!(
+        !slm.meta.tokenizer_state.is_empty(),
+        "BPE merge list must be stored"
+    );
+    assert!(
+        slm.meta.output_dim >= 256,
+        "BPE vocab is at least the 256-byte base"
+    );
+    assert!(
+        slm.meta.output_dim <= cfg.vocab_size,
+        "vocab must not exceed the requested size"
+    );
+    assert!(
+        slm.meta.class_names.is_empty(),
+        "BPE models decode via the tokenizer, not class_names"
+    );
 }
 
 #[test]
 fn bpe_model_generates_and_preserves_seed() {
     let mut rng = Rng::new(202);
-    let slm =
-        GenerativeSLM::train_transformer_config(BPE_CORPUS, &tiny_bpe_config(), &mut rng, |_, _| {})
-            .unwrap();
+    let slm = GenerativeSLM::train_transformer_config(
+        BPE_CORPUS,
+        &tiny_bpe_config(),
+        &mut rng,
+        |_, _| {},
+    )
+    .unwrap();
 
     // num_chars counts characters even though generation runs over tokens.
     let seed = "the quick brown fox";
     let out = slm.generate(seed, 20, 0.8, &mut Rng::new(7)).unwrap();
-    assert!(out.starts_with(seed), "seed must round-trip through the tokenizer: {out:?}");
+    assert!(
+        out.starts_with(seed),
+        "seed must round-trip through the tokenizer: {out:?}"
+    );
     assert!(
         out.chars().count() >= seed.chars().count() + 20,
-        "expected at least {} chars, got {}", seed.chars().count() + 20, out.chars().count()
+        "expected at least {} chars, got {}",
+        seed.chars().count() + 20,
+        out.chars().count()
     );
 }
 
@@ -192,9 +218,13 @@ fn bpe_short_seed_is_left_padded_not_rejected() {
     // embedded-MLP fallback left-pads the token context. Either way a short
     // prompt is accepted rather than rejected.
     let mut rng = Rng::new(303);
-    let slm =
-        GenerativeSLM::train_transformer_config(BPE_CORPUS, &tiny_bpe_config(), &mut rng, |_, _| {})
-            .unwrap();
+    let slm = GenerativeSLM::train_transformer_config(
+        BPE_CORPUS,
+        &tiny_bpe_config(),
+        &mut rng,
+        |_, _| {},
+    )
+    .unwrap();
     let out = slm.generate("the", 8, 0.5, &mut Rng::new(1)).unwrap();
     assert!(out.starts_with("the"));
     assert!(out.chars().count() >= "the".chars().count());
@@ -204,9 +234,13 @@ fn bpe_short_seed_is_left_padded_not_rejected() {
 fn bpe_save_load_roundtrips_and_is_deterministic() {
     let path = temp_model_path("bpe_save_load");
     let mut rng = Rng::new(404);
-    let slm =
-        GenerativeSLM::train_transformer_config(BPE_CORPUS, &tiny_bpe_config(), &mut rng, |_, _| {})
-            .unwrap();
+    let slm = GenerativeSLM::train_transformer_config(
+        BPE_CORPUS,
+        &tiny_bpe_config(),
+        &mut rng,
+        |_, _| {},
+    )
+    .unwrap();
     slm.save(path.to_str().unwrap()).unwrap();
 
     // Saved file is int8-quantized FINF v5 (QAT path), exactly like char models.
@@ -221,8 +255,12 @@ fn bpe_save_load_roundtrips_and_is_deterministic() {
 
     // Generation from the reloaded model is deterministic for a fixed seed and
     // matches the in-memory model (int8 QAT means the file behaves identically).
-    let a = slm.generate("the quick brown", 12, 0.7, &mut Rng::new(9)).unwrap();
-    let b = loaded.generate("the quick brown", 12, 0.7, &mut Rng::new(9)).unwrap();
+    let a = slm
+        .generate("the quick brown", 12, 0.7, &mut Rng::new(9))
+        .unwrap();
+    let b = loaded
+        .generate("the quick brown", 12, 0.7, &mut Rng::new(9))
+        .unwrap();
     assert_eq!(a, b, "reloaded BPE model must generate identically");
 
     let _ = std::fs::remove_file(&path);
@@ -233,9 +271,13 @@ fn bpe_quantized_outputs_track_in_memory_model() {
     use ferrum_core::Tensor;
     let path = temp_model_path("bpe_quant_drift");
     let mut rng = Rng::new(505);
-    let slm =
-        GenerativeSLM::train_transformer_config(BPE_CORPUS, &tiny_bpe_config(), &mut rng, |_, _| {})
-            .unwrap();
+    let slm = GenerativeSLM::train_transformer_config(
+        BPE_CORPUS,
+        &tiny_bpe_config(),
+        &mut rng,
+        |_, _| {},
+    )
+    .unwrap();
     slm.save(path.to_str().unwrap()).unwrap();
     let loaded = GenerativeSLM::load(path.to_str().unwrap()).unwrap();
 
@@ -255,7 +297,10 @@ fn bpe_quantized_outputs_track_in_memory_model() {
 fn bpe_vocab_below_256_is_rejected() {
     // 1..256 is invalid: the byte base vocabulary is irreducible.
     let mut rng = Rng::new(606);
-    let cfg = TransformerConfig { vocab_size: 100, ..tiny_config() };
+    let cfg = TransformerConfig {
+        vocab_size: 100,
+        ..tiny_config()
+    };
     assert!(GenerativeSLM::train_transformer_config(CORPUS, &cfg, &mut rng, |_, _| {}).is_err());
 }
 
@@ -266,9 +311,8 @@ fn quantized_save_outputs_stay_close_to_in_memory_model() {
     use ferrum_core::Tensor;
     let path = temp_model_path("quant_drift");
     let mut rng = Rng::new(8);
-    let slm =
-        GenerativeSLM::train_transformer_config(CORPUS, &tiny_config(), &mut rng, |_, _| {})
-            .unwrap();
+    let slm = GenerativeSLM::train_transformer_config(CORPUS, &tiny_config(), &mut rng, |_, _| {})
+        .unwrap();
     slm.save(path.to_str().unwrap()).unwrap();
     let loaded = GenerativeSLM::load(path.to_str().unwrap()).unwrap();
 
@@ -279,7 +323,10 @@ fn quantized_save_outputs_stay_close_to_in_memory_model() {
     let b = loaded.model.forward(&x).unwrap();
     assert_eq!(a.shape, b.shape);
     for (p, q) in a.data.iter().zip(&b.data) {
-        assert!((p - q).abs() < 0.05, "int8 file drifted from trained model: {p} vs {q}");
+        assert!(
+            (p - q).abs() < 0.05,
+            "int8 file drifted from trained model: {p} vs {q}"
+        );
     }
     let _ = std::fs::remove_file(&path);
 }

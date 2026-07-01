@@ -1,6 +1,4 @@
-use ferrum_core::{
-    fit_normalizer_with_target, mse, CsvDataset, Net, Rng, Sgd, TaskType,
-};
+use ferrum_core::{fit_normalizer_with_target, mse, CsvDataset, Net, Rng, Sgd, TaskType};
 
 const REGRESSION_CSV: &str = "\
 x1,x2,price
@@ -37,5 +35,8 @@ fn test_regression_pipeline() {
 
     // Final loss should be lower
     let (l1, _) = mse(&net.forward(&x).unwrap(), &y_norm).unwrap();
-    assert!(l1 < l0, "regression training didn't reduce loss: {l0} -> {l1}");
+    assert!(
+        l1 < l0,
+        "regression training didn't reduce loss: {l0} -> {l1}"
+    );
 }

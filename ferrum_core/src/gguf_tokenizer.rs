@@ -101,9 +101,12 @@ fn parse_byte_token(tok: &str) -> Option<u8> {
 
 fn string_array(g: &Gguf, key: &str) -> Option<Vec<String>> {
     match g.meta(key) {
-        Some(MetaValue::Array(items)) => {
-            Some(items.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
-        }
+        Some(MetaValue::Array(items)) => Some(
+            items
+                .iter()
+                .map(|v| v.as_str().unwrap_or("").to_string())
+                .collect(),
+        ),
         _ => None,
     }
 }
@@ -151,8 +154,14 @@ impl GgufTokenizer {
             }
         }
 
-        let bos = g.meta("tokenizer.ggml.bos_token_id").and_then(|v| v.as_usize()).map(|u| u as u32);
-        let eos = g.meta("tokenizer.ggml.eos_token_id").and_then(|v| v.as_usize()).map(|u| u as u32);
+        let bos = g
+            .meta("tokenizer.ggml.bos_token_id")
+            .and_then(|v| v.as_usize())
+            .map(|u| u as u32);
+        let eos = g
+            .meta("tokenizer.ggml.eos_token_id")
+            .and_then(|v| v.as_usize())
+            .map(|u| u as u32);
 
         let (byte_encoder, byte_decoder) = gpt2_byte_tables();
         Ok(Self {
@@ -205,8 +214,10 @@ impl GgufTokenizer {
         let mut out = Vec::new();
         for chunk in pretokenize(text) {
             // Byte-level map: each byte → one printable GPT-2 char (a "piece").
-            let mut pieces: Vec<String> =
-                chunk.bytes().map(|b| self.byte_encoder[b as usize].to_string()).collect();
+            let mut pieces: Vec<String> = chunk
+                .bytes()
+                .map(|b| self.byte_encoder[b as usize].to_string())
+                .collect();
             if pieces.is_empty() {
                 continue;
             }
@@ -214,7 +225,10 @@ impl GgufTokenizer {
             while pieces.len() > 1 {
                 let mut best: Option<(usize, u32)> = None;
                 for i in 0..pieces.len() - 1 {
-                    if let Some(&r) = self.merge_ranks.get(&(pieces[i].clone(), pieces[i + 1].clone())) {
+                    if let Some(&r) = self
+                        .merge_ranks
+                        .get(&(pieces[i].clone(), pieces[i + 1].clone()))
+                    {
                         let better = match best {
                             None => true,
                             Some((_, br)) => r < br,
@@ -249,7 +263,9 @@ impl GgufTokenizer {
     fn decode_bpe(&self, ids: &[usize]) -> String {
         let mut bytes = Vec::new();
         for &id in ids {
-            let Some(tok) = self.tokens.get(id) else { continue };
+            let Some(tok) = self.tokens.get(id) else {
+                continue;
+            };
             for ch in tok.chars() {
                 match self.byte_decoder.get(&ch) {
                     Some(&b) => bytes.push(b),
@@ -269,8 +285,10 @@ impl GgufTokenizer {
 
     fn encode_spm(&self, text: &str) -> Vec<usize> {
         // SentencePiece prepends a dummy space and renders spaces as ▁.
-        let normalized: Vec<char> =
-            format!(" {text}").replace(' ', &SPM_SPACE.to_string()).chars().collect();
+        let normalized: Vec<char> = format!(" {text}")
+            .replace(' ', &SPM_SPACE.to_string())
+            .chars()
+            .collect();
         let mut out = Vec::new();
         let mut i = 0;
         while i < normalized.len() {
@@ -308,7 +326,9 @@ impl GgufTokenizer {
     fn decode_spm(&self, ids: &[usize]) -> String {
         let mut bytes = Vec::new();
         for &id in ids {
-            let Some(tok) = self.tokens.get(id) else { continue };
+            let Some(tok) = self.tokens.get(id) else {
+                continue;
+            };
             if let Some(b) = parse_byte_token(tok) {
                 bytes.push(b);
                 continue;
@@ -490,7 +510,11 @@ mod tests {
         let (enc, dec) = gpt2_byte_tables();
         for b in 0u16..256 {
             let b = b as u8;
-            assert_eq!(dec.get(&enc[b as usize]), Some(&b), "byte {b} not invertible");
+            assert_eq!(
+                dec.get(&enc[b as usize]),
+                Some(&b),
+                "byte {b} not invertible"
+            );
         }
         assert_eq!(dec.len(), 256, "encoder is not injective");
         // Space maps to the BPE marker 'Ġ' (U+0120).
@@ -499,7 +523,13 @@ mod tests {
 
     #[test]
     fn pretokenize_attaches_leading_space() {
-        assert_eq!(pretokenize("hi there"), vec!["hi".to_string(), " there".to_string()]);
-        assert_eq!(pretokenize("a1!"), vec!["a".to_string(), "1".to_string(), "!".to_string()]);
+        assert_eq!(
+            pretokenize("hi there"),
+            vec!["hi".to_string(), " there".to_string()]
+        );
+        assert_eq!(
+            pretokenize("a1!"),
+            vec!["a".to_string(), "1".to_string(), "!".to_string()]
+        );
     }
 }

@@ -83,8 +83,12 @@ pub fn stats(data: &[f32]) -> (f32, f32, f32) {
     let mut max = f32::NEG_INFINITY;
     let mut sum = 0.0f64;
     for &v in data {
-        if v < min { min = v; }
-        if v > max { max = v; }
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
         sum += v as f64;
     }
     (min, max, (sum / data.len() as f64) as f32)
@@ -98,7 +102,10 @@ pub fn check_nan_inf(data: &[f32], label: &str) -> bool {
     if nan_count > 0 || inf_count > 0 {
         log_line(&format!(
             "[ferrum_core::WARN] ⚠️  {} contains {} NaN, {} Inf out of {} elements!",
-            label, nan_count, inf_count, data.len()
+            label,
+            nan_count,
+            inf_count,
+            data.len()
         ));
         return true;
     }

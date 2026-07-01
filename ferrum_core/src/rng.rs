@@ -7,9 +7,7 @@ impl Rng {
     pub fn new(seed: u64) -> Self {
         let actual_seed = if seed == 0 { 0x9E3779B97F4A7C15 } else { seed };
         crate::vprintln!("[rng::Rng::new] seed={} (effective={})", seed, actual_seed);
-        Self {
-            state: actual_seed,
-        }
+        Self { state: actual_seed }
     }
 
     /// The raw internal state — pair with [`Rng::from_state`] to checkpoint and
@@ -116,7 +114,11 @@ mod tests {
         assert_eq!(perm.len(), n);
         let mut seen = perm.clone();
         seen.sort_unstable();
-        assert_eq!(seen, (0..n).collect::<Vec<_>>(), "not a permutation of 0..n");
+        assert_eq!(
+            seen,
+            (0..n).collect::<Vec<_>>(),
+            "not a permutation of 0..n"
+        );
         // Empty / singleton edge cases.
         assert!(Rng::new(1).shuffled_indices(0).is_empty());
         assert_eq!(Rng::new(1).shuffled_indices(1), vec![0]);
@@ -124,9 +126,15 @@ mod tests {
 
     #[test]
     fn shuffled_indices_is_deterministic_and_actually_shuffles() {
-        assert_eq!(Rng::new(5).shuffled_indices(64), Rng::new(5).shuffled_indices(64));
+        assert_eq!(
+            Rng::new(5).shuffled_indices(64),
+            Rng::new(5).shuffled_indices(64)
+        );
         // Overwhelmingly likely to differ from the identity for n=64.
-        assert_ne!(Rng::new(5).shuffled_indices(64), (0..64).collect::<Vec<_>>());
+        assert_ne!(
+            Rng::new(5).shuffled_indices(64),
+            (0..64).collect::<Vec<_>>()
+        );
     }
 
     #[test]

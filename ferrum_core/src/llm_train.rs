@@ -54,7 +54,10 @@ struct LinBuf {
 }
 impl LinBuf {
     fn zeros(lin: &Linear) -> Self {
-        Self { w: vec![0.0; lin.in_features() * lin.out_features()], b: vec![0.0; lin.out_features()] }
+        Self {
+            w: vec![0.0; lin.in_features() * lin.out_features()],
+            b: vec![0.0; lin.out_features()],
+        }
     }
     fn clear(&mut self) {
         self.w.iter_mut().for_each(|x| *x = 0.0);
@@ -115,7 +118,15 @@ impl Buffers {
         for b in &mut self.blocks {
             b.attn_norm.iter_mut().for_each(|x| *x = 0.0);
             b.ffn_norm.iter_mut().for_each(|x| *x = 0.0);
-            for g in [&mut b.wq, &mut b.wk, &mut b.wv, &mut b.wo, &mut b.gate, &mut b.up, &mut b.down] {
+            for g in [
+                &mut b.wq,
+                &mut b.wk,
+                &mut b.wv,
+                &mut b.wo,
+                &mut b.gate,
+                &mut b.up,
+                &mut b.down,
+            ] {
                 g.clear();
             }
         }
@@ -126,17 +137,25 @@ impl Buffers {
         let mut v: Vec<&[f32]> = vec![&self.tok_emb];
         for b in &self.blocks {
             v.push(&b.attn_norm);
-            v.push(&b.wq.w); v.push(&b.wq.b);
-            v.push(&b.wk.w); v.push(&b.wk.b);
-            v.push(&b.wv.w); v.push(&b.wv.b);
-            v.push(&b.wo.w); v.push(&b.wo.b);
+            v.push(&b.wq.w);
+            v.push(&b.wq.b);
+            v.push(&b.wk.w);
+            v.push(&b.wk.b);
+            v.push(&b.wv.w);
+            v.push(&b.wv.b);
+            v.push(&b.wo.w);
+            v.push(&b.wo.b);
             v.push(&b.ffn_norm);
-            v.push(&b.gate.w); v.push(&b.gate.b);
-            v.push(&b.up.w); v.push(&b.up.b);
-            v.push(&b.down.w); v.push(&b.down.b);
+            v.push(&b.gate.w);
+            v.push(&b.gate.b);
+            v.push(&b.up.w);
+            v.push(&b.up.b);
+            v.push(&b.down.w);
+            v.push(&b.down.b);
         }
         v.push(&self.final_norm);
-        v.push(&self.lm_head.w); v.push(&self.lm_head.b);
+        v.push(&self.lm_head.w);
+        v.push(&self.lm_head.b);
         v
     }
 
@@ -144,17 +163,25 @@ impl Buffers {
         let mut v: Vec<&mut [f32]> = vec![&mut self.tok_emb];
         for b in &mut self.blocks {
             v.push(&mut b.attn_norm);
-            v.push(&mut b.wq.w); v.push(&mut b.wq.b);
-            v.push(&mut b.wk.w); v.push(&mut b.wk.b);
-            v.push(&mut b.wv.w); v.push(&mut b.wv.b);
-            v.push(&mut b.wo.w); v.push(&mut b.wo.b);
+            v.push(&mut b.wq.w);
+            v.push(&mut b.wq.b);
+            v.push(&mut b.wk.w);
+            v.push(&mut b.wk.b);
+            v.push(&mut b.wv.w);
+            v.push(&mut b.wv.b);
+            v.push(&mut b.wo.w);
+            v.push(&mut b.wo.b);
             v.push(&mut b.ffn_norm);
-            v.push(&mut b.gate.w); v.push(&mut b.gate.b);
-            v.push(&mut b.up.w); v.push(&mut b.up.b);
-            v.push(&mut b.down.w); v.push(&mut b.down.b);
+            v.push(&mut b.gate.w);
+            v.push(&mut b.gate.b);
+            v.push(&mut b.up.w);
+            v.push(&mut b.up.b);
+            v.push(&mut b.down.w);
+            v.push(&mut b.down.b);
         }
         v.push(&mut self.final_norm);
-        v.push(&mut self.lm_head.w); v.push(&mut self.lm_head.b);
+        v.push(&mut self.lm_head.w);
+        v.push(&mut self.lm_head.b);
         v
     }
 
@@ -209,17 +236,25 @@ fn param_meta(model: &LlamaModel) -> Vec<(usize, bool)> {
     let mut v: Vec<(usize, bool)> = vec![(model.tok_emb.len() / dim, true)]; // tok_emb [vocab, dim]
     for b in &model.blocks {
         v.push((1, false)); // attn_norm
-        v.push((b.attn.wq.in_features(), true)); v.push((1, false));
-        v.push((b.attn.wk.in_features(), true)); v.push((1, false));
-        v.push((b.attn.wv.in_features(), true)); v.push((1, false));
-        v.push((b.attn.wo.in_features(), true)); v.push((1, false));
+        v.push((b.attn.wq.in_features(), true));
+        v.push((1, false));
+        v.push((b.attn.wk.in_features(), true));
+        v.push((1, false));
+        v.push((b.attn.wv.in_features(), true));
+        v.push((1, false));
+        v.push((b.attn.wo.in_features(), true));
+        v.push((1, false));
         v.push((1, false)); // ffn_norm
-        v.push((b.ffn.gate.in_features(), true)); v.push((1, false));
-        v.push((b.ffn.up.in_features(), true)); v.push((1, false));
-        v.push((b.ffn.down.in_features(), true)); v.push((1, false));
+        v.push((b.ffn.gate.in_features(), true));
+        v.push((1, false));
+        v.push((b.ffn.up.in_features(), true));
+        v.push((1, false));
+        v.push((b.ffn.down.in_features(), true));
+        v.push((1, false));
     }
     v.push((1, false)); // final_norm
-    v.push((model.lm_head.in_features(), true)); v.push((1, false));
+    v.push((model.lm_head.in_features(), true));
+    v.push((1, false));
     v
 }
 
@@ -227,17 +262,25 @@ fn param_data_ref(model: &LlamaModel) -> Vec<&[f32]> {
     let mut v: Vec<&[f32]> = vec![&model.tok_emb];
     for b in &model.blocks {
         v.push(&b.attn_norm.weight);
-        v.push(&b.attn.wq.weight.data); v.push(&b.attn.wq.bias.data);
-        v.push(&b.attn.wk.weight.data); v.push(&b.attn.wk.bias.data);
-        v.push(&b.attn.wv.weight.data); v.push(&b.attn.wv.bias.data);
-        v.push(&b.attn.wo.weight.data); v.push(&b.attn.wo.bias.data);
+        v.push(&b.attn.wq.weight.data);
+        v.push(&b.attn.wq.bias.data);
+        v.push(&b.attn.wk.weight.data);
+        v.push(&b.attn.wk.bias.data);
+        v.push(&b.attn.wv.weight.data);
+        v.push(&b.attn.wv.bias.data);
+        v.push(&b.attn.wo.weight.data);
+        v.push(&b.attn.wo.bias.data);
         v.push(&b.ffn_norm.weight);
-        v.push(&b.ffn.gate.weight.data); v.push(&b.ffn.gate.bias.data);
-        v.push(&b.ffn.up.weight.data); v.push(&b.ffn.up.bias.data);
-        v.push(&b.ffn.down.weight.data); v.push(&b.ffn.down.bias.data);
+        v.push(&b.ffn.gate.weight.data);
+        v.push(&b.ffn.gate.bias.data);
+        v.push(&b.ffn.up.weight.data);
+        v.push(&b.ffn.up.bias.data);
+        v.push(&b.ffn.down.weight.data);
+        v.push(&b.ffn.down.bias.data);
     }
     v.push(&model.final_norm.weight);
-    v.push(&model.lm_head.weight.data); v.push(&model.lm_head.bias.data);
+    v.push(&model.lm_head.weight.data);
+    v.push(&model.lm_head.bias.data);
     v
 }
 
@@ -245,17 +288,25 @@ fn param_data_mut(model: &mut LlamaModel) -> Vec<&mut [f32]> {
     let mut v: Vec<&mut [f32]> = vec![&mut model.tok_emb];
     for b in &mut model.blocks {
         v.push(&mut b.attn_norm.weight);
-        v.push(&mut b.attn.wq.weight.data); v.push(&mut b.attn.wq.bias.data);
-        v.push(&mut b.attn.wk.weight.data); v.push(&mut b.attn.wk.bias.data);
-        v.push(&mut b.attn.wv.weight.data); v.push(&mut b.attn.wv.bias.data);
-        v.push(&mut b.attn.wo.weight.data); v.push(&mut b.attn.wo.bias.data);
+        v.push(&mut b.attn.wq.weight.data);
+        v.push(&mut b.attn.wq.bias.data);
+        v.push(&mut b.attn.wk.weight.data);
+        v.push(&mut b.attn.wk.bias.data);
+        v.push(&mut b.attn.wv.weight.data);
+        v.push(&mut b.attn.wv.bias.data);
+        v.push(&mut b.attn.wo.weight.data);
+        v.push(&mut b.attn.wo.bias.data);
         v.push(&mut b.ffn_norm.weight);
-        v.push(&mut b.ffn.gate.weight.data); v.push(&mut b.ffn.gate.bias.data);
-        v.push(&mut b.ffn.up.weight.data); v.push(&mut b.ffn.up.bias.data);
-        v.push(&mut b.ffn.down.weight.data); v.push(&mut b.ffn.down.bias.data);
+        v.push(&mut b.ffn.gate.weight.data);
+        v.push(&mut b.ffn.gate.bias.data);
+        v.push(&mut b.ffn.up.weight.data);
+        v.push(&mut b.ffn.up.bias.data);
+        v.push(&mut b.ffn.down.weight.data);
+        v.push(&mut b.ffn.down.bias.data);
     }
     v.push(&mut model.final_norm.weight);
-    v.push(&mut model.lm_head.weight.data); v.push(&mut model.lm_head.bias.data);
+    v.push(&mut model.lm_head.weight.data);
+    v.push(&mut model.lm_head.bias.data);
     v
 }
 
@@ -327,7 +378,9 @@ fn rmsnorm_backward_row(dy: &[f32], x: &[f32], w: &[f32], inv: f32, dw: &mut [f3
         dw[i] += dy[i] * x[i] * inv;
     }
     let inv3 = inv * inv * inv / d as f32;
-    (0..d).map(|j| inv * dy[j] * w[j] - inv3 * x[j] * gx).collect()
+    (0..d)
+        .map(|j| inv * dy[j] * w[j] - inv3 * x[j] * gx)
+        .collect()
 }
 
 fn sigmoid(x: f32) -> f32 {
@@ -429,8 +482,26 @@ fn attn_forward(cfg: &LlamaConfig, attn: &Attention, xn: &[f32], seq: usize) -> 
     let mut k = lin_forward(&attn.wk, xn, seq);
     let v = lin_forward(&attn.wv, xn, seq);
     for t in 0..seq {
-        rope_apply(&mut q[t * q_dim..t * q_dim + q_dim], nh, hd, cfg.rope_dim, t, cfg.rope_base, cfg.rope_type, false);
-        rope_apply(&mut k[t * kv_dim..t * kv_dim + kv_dim], nkv, hd, cfg.rope_dim, t, cfg.rope_base, cfg.rope_type, false);
+        rope_apply(
+            &mut q[t * q_dim..t * q_dim + q_dim],
+            nh,
+            hd,
+            cfg.rope_dim,
+            t,
+            cfg.rope_base,
+            cfg.rope_type,
+            false,
+        );
+        rope_apply(
+            &mut k[t * kv_dim..t * kv_dim + kv_dim],
+            nkv,
+            hd,
+            cfg.rope_dim,
+            t,
+            cfg.rope_base,
+            cfg.rope_type,
+            false,
+        );
     }
 
     let mut ctx = vec![0.0f32; seq * q_dim];
@@ -467,7 +538,14 @@ fn attn_forward(cfg: &LlamaConfig, attn: &Attention, xn: &[f32], seq: usize) -> 
             probs[t * nh + h] = sc;
         }
     }
-    AttnCache { xn: xn.to_vec(), q, k, v, ctx, probs }
+    AttnCache {
+        xn: xn.to_vec(),
+        q,
+        k,
+        v,
+        ctx,
+        probs,
+    }
 }
 
 /// Returns the attention sublayer output `o = wo(ctx)` for the cache.
@@ -475,7 +553,14 @@ fn attn_output(attn: &Attention, c: &AttnCache, seq: usize) -> Vec<f32> {
     lin_forward(&attn.wo, &c.ctx, seq)
 }
 
-fn attn_backward(cfg: &LlamaConfig, attn: &Attention, c: &AttnCache, d_o: &[f32], seq: usize, g: &mut BlockBuf) -> Vec<f32> {
+fn attn_backward(
+    cfg: &LlamaConfig,
+    attn: &Attention,
+    c: &AttnCache,
+    d_o: &[f32],
+    seq: usize,
+    g: &mut BlockBuf,
+) -> Vec<f32> {
     let (nh, nkv, hd, dim) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, cfg.model_dim);
     let (q_dim, kv_dim, group) = (nh * hd, nkv * hd, nh / nkv);
     let scale = 1.0 / (hd as f32).sqrt();
@@ -518,8 +603,26 @@ fn attn_backward(cfg: &LlamaConfig, attn: &Attention, c: &AttnCache, d_o: &[f32]
 
     // RoPE backward (transpose rotation) on dq, dk.
     for t in 0..seq {
-        rope_apply(&mut dq[t * q_dim..t * q_dim + q_dim], nh, hd, cfg.rope_dim, t, cfg.rope_base, cfg.rope_type, true);
-        rope_apply(&mut dk[t * kv_dim..t * kv_dim + kv_dim], nkv, hd, cfg.rope_dim, t, cfg.rope_base, cfg.rope_type, true);
+        rope_apply(
+            &mut dq[t * q_dim..t * q_dim + q_dim],
+            nh,
+            hd,
+            cfg.rope_dim,
+            t,
+            cfg.rope_base,
+            cfg.rope_type,
+            true,
+        );
+        rope_apply(
+            &mut dk[t * kv_dim..t * kv_dim + kv_dim],
+            nkv,
+            hd,
+            cfg.rope_dim,
+            t,
+            cfg.rope_base,
+            cfg.rope_type,
+            true,
+        );
     }
 
     let dxq = lin_backward(&attn.wq, &c.xn, &dq, seq, &mut g.wq);
@@ -531,7 +634,14 @@ fn attn_backward(cfg: &LlamaConfig, attn: &Attention, c: &AttnCache, d_o: &[f32]
 /// SwiGLU FFN forward. When `dropout > 0`, the hidden `silu(g)⊙u` is
 /// inverted-dropout masked using a generator seeded by `seed`, so a worker can
 /// reproduce the mask in backward from the cache.
-fn ffn_forward(cfg: &LlamaConfig, ffn: &FeedForward, xn: &[f32], seq: usize, dropout: f32, seed: u64) -> FfnCache {
+fn ffn_forward(
+    cfg: &LlamaConfig,
+    ffn: &FeedForward,
+    xn: &[f32],
+    seq: usize,
+    dropout: f32,
+    seed: u64,
+) -> FfnCache {
     let f = cfg.ffn_dim;
     let g = lin_forward(&ffn.gate, xn, seq);
     let u = lin_forward(&ffn.up, xn, seq);
@@ -540,7 +650,13 @@ fn ffn_forward(cfg: &LlamaConfig, ffn: &FeedForward, xn: &[f32], seq: usize, dro
         let scale = 1.0 / (1.0 - dropout);
         let mut drng = Rng::new(seed);
         let mask: Vec<f32> = (0..h.len())
-            .map(|_| if drng.next_f32() < dropout { 0.0 } else { scale })
+            .map(|_| {
+                if drng.next_f32() < dropout {
+                    0.0
+                } else {
+                    scale
+                }
+            })
             .collect();
         for (hi, &mi) in h.iter_mut().zip(&mask) {
             *hi *= mi;
@@ -549,14 +665,27 @@ fn ffn_forward(cfg: &LlamaConfig, ffn: &FeedForward, xn: &[f32], seq: usize, dro
     } else {
         None
     };
-    FfnCache { xn: xn.to_vec(), g, u, h, mask }
+    FfnCache {
+        xn: xn.to_vec(),
+        g,
+        u,
+        h,
+        mask,
+    }
 }
 
 fn ffn_output(ffn: &FeedForward, c: &FfnCache, seq: usize) -> Vec<f32> {
     lin_forward(&ffn.down, &c.h, seq)
 }
 
-fn ffn_backward(cfg: &LlamaConfig, ffn: &FeedForward, c: &FfnCache, d_f: &[f32], seq: usize, g: &mut BlockBuf) -> Vec<f32> {
+fn ffn_backward(
+    cfg: &LlamaConfig,
+    ffn: &FeedForward,
+    c: &FfnCache,
+    d_f: &[f32],
+    seq: usize,
+    g: &mut BlockBuf,
+) -> Vec<f32> {
     let (dim, f) = (cfg.model_dim, cfg.ffn_dim);
     let d_h_in = lin_backward(&ffn.down, &c.h, d_f, seq, &mut g.down);
     let mut dg = vec![0.0f32; seq * f];
@@ -576,14 +705,27 @@ fn ffn_backward(cfg: &LlamaConfig, ffn: &FeedForward, c: &FfnCache, d_f: &[f32],
     (0..seq * dim).map(|i| dxg[i] + dxu[i]).collect()
 }
 
-fn block_backward(cfg: &LlamaConfig, block: &LlamaBlock, bc: &BlockCache, d_out: &[f32], seq: usize, g: &mut BlockBuf) -> Vec<f32> {
+fn block_backward(
+    cfg: &LlamaConfig,
+    block: &LlamaBlock,
+    bc: &BlockCache,
+    d_out: &[f32],
+    seq: usize,
+    g: &mut BlockBuf,
+) -> Vec<f32> {
     let dim = cfg.model_dim;
     // out = h + ffn(rmsnorm2(h)); d_f = d_out (residual to h handled below).
     let d_n2 = ffn_backward(cfg, &block.ffn, &bc.ffn, d_out, seq, g);
     let mut d_h = d_out.to_vec();
     for t in 0..seq {
         let s = t * dim;
-        let dxr = rmsnorm_backward_row(&d_n2[s..s + dim], &bc.h[s..s + dim], &block.ffn_norm.weight, bc.n2_inv[t], &mut g.ffn_norm);
+        let dxr = rmsnorm_backward_row(
+            &d_n2[s..s + dim],
+            &bc.h[s..s + dim],
+            &block.ffn_norm.weight,
+            bc.n2_inv[t],
+            &mut g.ffn_norm,
+        );
         for d in 0..dim {
             d_h[s + d] += dxr[d];
         }
@@ -593,7 +735,13 @@ fn block_backward(cfg: &LlamaConfig, block: &LlamaBlock, bc: &BlockCache, d_out:
     let mut d_x = d_h.clone();
     for t in 0..seq {
         let s = t * dim;
-        let dxr = rmsnorm_backward_row(&d_n1[s..s + dim], &bc.x[s..s + dim], &block.attn_norm.weight, bc.n1_inv[t], &mut g.attn_norm);
+        let dxr = rmsnorm_backward_row(
+            &d_n1[s..s + dim],
+            &bc.x[s..s + dim],
+            &block.attn_norm.weight,
+            bc.n1_inv[t],
+            &mut g.attn_norm,
+        );
         for d in 0..dim {
             d_x[s + d] += dxr[d];
         }
@@ -606,13 +754,21 @@ fn block_backward(cfg: &LlamaConfig, block: &LlamaBlock, bc: &BlockCache, d_out:
 /// Forward pass over `tokens`, returning the activation cache. With `dropout > 0`
 /// each block's SwiGLU hidden is inverted-dropout masked from a `seed`-derived
 /// generator (per-block offset) so it is reproducible in backward.
-fn forward_train(model: &LlamaModel, tokens: &[usize], dropout: f32, seed: u64) -> Result<FwdCache> {
+fn forward_train(
+    model: &LlamaModel,
+    tokens: &[usize],
+    dropout: f32,
+    seed: u64,
+) -> Result<FwdCache> {
     let cfg = &model.cfg;
     let (seq, dim) = (tokens.len(), cfg.model_dim);
     let mut x = vec![0.0f32; seq * dim];
     for (t, &tok) in tokens.iter().enumerate() {
         if tok >= cfg.vocab_size {
-            return Err(InferError::DimMismatch(format!("token {tok} ≥ vocab {}", cfg.vocab_size)));
+            return Err(InferError::DimMismatch(format!(
+                "token {tok} ≥ vocab {}",
+                cfg.vocab_size
+            )));
         }
         x[t * dim..(t + 1) * dim].copy_from_slice(&model.tok_emb[tok * dim..(tok + 1) * dim]);
     }
@@ -625,7 +781,8 @@ fn forward_train(model: &LlamaModel, tokens: &[usize], dropout: f32, seed: u64) 
         #[allow(clippy::needless_range_loop)]
         for t in 0..seq {
             let s = t * dim;
-            let (y, inv) = rmsnorm_forward_row(&x[s..s + dim], &block.attn_norm.weight, cfg.norm_eps);
+            let (y, inv) =
+                rmsnorm_forward_row(&x[s..s + dim], &block.attn_norm.weight, cfg.norm_eps);
             n1[s..s + dim].copy_from_slice(&y);
             n1_inv[t] = inv;
         }
@@ -638,7 +795,8 @@ fn forward_train(model: &LlamaModel, tokens: &[usize], dropout: f32, seed: u64) 
         #[allow(clippy::needless_range_loop)] // see the n1 loop above
         for t in 0..seq {
             let s = t * dim;
-            let (y, inv) = rmsnorm_forward_row(&h[s..s + dim], &block.ffn_norm.weight, cfg.norm_eps);
+            let (y, inv) =
+                rmsnorm_forward_row(&h[s..s + dim], &block.ffn_norm.weight, cfg.norm_eps);
             n2[s..s + dim].copy_from_slice(&y);
             n2_inv[t] = inv;
         }
@@ -647,7 +805,14 @@ fn forward_train(model: &LlamaModel, tokens: &[usize], dropout: f32, seed: u64) 
         let f = ffn_output(&block.ffn, &ffn, seq);
         let out: Vec<f32> = (0..seq * dim).map(|i| h[i] + f[i]).collect();
 
-        blocks.push(BlockCache { x: x.clone(), n1_inv, attn, h, n2_inv, ffn });
+        blocks.push(BlockCache {
+            x: x.clone(),
+            n1_inv,
+            attn,
+            h,
+            n2_inv,
+            ffn,
+        });
         x = out;
     }
 
@@ -657,18 +822,31 @@ fn forward_train(model: &LlamaModel, tokens: &[usize], dropout: f32, seed: u64) 
     #[allow(clippy::needless_range_loop)] // `t` derives the row offset and indexes nf_inv
     for t in 0..seq {
         let s = t * dim;
-        let (y, inv) = rmsnorm_forward_row(&xfinal[s..s + dim], &model.final_norm.weight, cfg.norm_eps);
+        let (y, inv) =
+            rmsnorm_forward_row(&xfinal[s..s + dim], &model.final_norm.weight, cfg.norm_eps);
         xn[s..s + dim].copy_from_slice(&y);
         nf_inv[t] = inv;
     }
     let logits = lin_forward(&model.lm_head, &xn, seq);
-    Ok(FwdCache { blocks, xfinal, nf_inv, xn, logits })
+    Ok(FwdCache {
+        blocks,
+        xfinal,
+        nf_inv,
+        xn,
+        logits,
+    })
 }
 
 /// Backprop `d_logits` through the whole model, **accumulating** into `g` (the
 /// embedding scatter and every dW/db/dnorm are `+=`), so summing across a
 /// minibatch is just repeated calls into the same buffer.
-fn backward_into(model: &LlamaModel, cache: &FwdCache, d_logits: &[f32], tokens: &[usize], g: &mut Buffers) -> Result<()> {
+fn backward_into(
+    model: &LlamaModel,
+    cache: &FwdCache,
+    d_logits: &[f32],
+    tokens: &[usize],
+    g: &mut Buffers,
+) -> Result<()> {
     let cfg = &model.cfg;
     let (seq, dim) = (tokens.len(), cfg.model_dim);
 
@@ -688,7 +866,14 @@ fn backward_into(model: &LlamaModel, cache: &FwdCache, d_logits: &[f32], tokens:
     }
 
     for bi in (0..model.blocks.len()).rev() {
-        d_x = block_backward(cfg, &model.blocks[bi], &cache.blocks[bi], &d_x, seq, &mut g.blocks[bi]);
+        d_x = block_backward(
+            cfg,
+            &model.blocks[bi],
+            &cache.blocks[bi],
+            &d_x,
+            seq,
+            &mut g.blocks[bi],
+        );
     }
 
     for (t, &tok) in tokens.iter().enumerate() {
@@ -703,7 +888,12 @@ fn backward_into(model: &LlamaModel, cache: &FwdCache, d_logits: &[f32], tokens:
 /// Pure forward+backward over one sequence against the (read-only) model,
 /// returning `(loss, flat-gradients)` in canonical order. Used by both the
 /// serial accumulator and the data-parallel workers.
-fn seq_grad_flat(model: &LlamaModel, tokens: &[usize], dropout: f32, seed: u64) -> Result<(f32, Vec<f32>)> {
+fn seq_grad_flat(
+    model: &LlamaModel,
+    tokens: &[usize],
+    dropout: f32,
+    seed: u64,
+) -> Result<(f32, Vec<f32>)> {
     let cache = forward_train(model, tokens, dropout, seed)?;
     let (loss, d_logits) = cross_entropy(&cache.logits, tokens, model.cfg.vocab_size);
     if !loss.is_finite() {
@@ -742,8 +932,12 @@ impl LlamaTrainer {
     pub fn new(model: LlamaModel) -> Result<Self> {
         for (i, b) in model.blocks.iter().enumerate() {
             for (name, lin) in [
-                ("attn_q", &b.attn.wq), ("attn_k", &b.attn.wk), ("attn_v", &b.attn.wv),
-                ("attn_output", &b.attn.wo), ("ffn_gate", &b.ffn.gate), ("ffn_up", &b.ffn.up),
+                ("attn_q", &b.attn.wq),
+                ("attn_k", &b.attn.wk),
+                ("attn_v", &b.attn.wv),
+                ("attn_output", &b.attn.wo),
+                ("ffn_gate", &b.ffn.gate),
+                ("ffn_up", &b.ffn.up),
                 ("ffn_down", &b.ffn.down),
             ] {
                 if lin.qweight().is_some() {
@@ -755,7 +949,9 @@ impl LlamaTrainer {
             }
         }
         if model.lm_head.qweight().is_some() {
-            return Err(InferError::DimMismatch("lm_head is quantized; training needs f32 weights".into()));
+            return Err(InferError::DimMismatch(
+                "lm_head is quantized; training needs f32 weights".into(),
+            ));
         }
         let grads = Buffers::zeros(&model);
         let m = Buffers::zeros(&model);
@@ -847,7 +1043,10 @@ impl LlamaTrainer {
     /// Handy for comparing training runs (e.g. verifying a resumed checkpoint
     /// matches the model it was saved from).
     pub fn model_snapshot(&self) -> Vec<Vec<f32>> {
-        param_data_ref(&self.model).iter().map(|s| s.to_vec()).collect()
+        param_data_ref(&self.model)
+            .iter()
+            .map(|s| s.to_vec())
+            .collect()
     }
 
     // ── Loss (pure forward) ──────────────────────────────────────────────────
@@ -876,7 +1075,10 @@ impl LlamaTrainer {
     // ── QAT snapshot / fake-quantize / restore ───────────────────────────────
 
     fn snapshot_weights(&self) -> Vec<Vec<f32>> {
-        param_data_ref(&self.model).iter().map(|s| s.to_vec()).collect()
+        param_data_ref(&self.model)
+            .iter()
+            .map(|s| s.to_vec())
+            .collect()
     }
     fn restore_weights(&mut self, snap: &[Vec<f32>]) {
         for (s, src) in param_data_mut(&mut self.model).into_iter().zip(snap) {
@@ -926,7 +1128,12 @@ impl LlamaTrainer {
             Some(s) => s.lr_at(t),
             None => self.adam.lr,
         };
-        let (b1, b2, eps, wd) = (self.adam.beta1, self.adam.beta2, self.adam.eps, self.weight_decay);
+        let (b1, b2, eps, wd) = (
+            self.adam.beta1,
+            self.adam.beta2,
+            self.adam.eps,
+            self.weight_decay,
+        );
         let bc1 = 1.0 - b1.powi(t.min(i32::MAX as u64) as i32);
         let bc2 = 1.0 - b2.powi(t.min(i32::MAX as u64) as i32);
 
@@ -1072,7 +1279,12 @@ impl LlamaTrainer {
     /// Shared gradient computation for one minibatch of already-sliced windows,
     /// optionally across threads, followed by a single AdamW step. Returns the
     /// mean loss over the batch.
-    fn step_over_windows(&mut self, windows: &[&[usize]], base_seed: u64, threads: usize) -> Result<f32> {
+    fn step_over_windows(
+        &mut self,
+        windows: &[&[usize]],
+        base_seed: u64,
+        threads: usize,
+    ) -> Result<f32> {
         // No threads on wasm: always take the serial accumulator path.
         #[cfg(target_arch = "wasm32")]
         {
@@ -1175,18 +1387,20 @@ impl LlamaTrainer {
         out.extend_from_slice(b"FLCK");
         out.extend_from_slice(&1u32.to_le_bytes());
         for v in [
-            c.vocab_size, c.model_dim, c.n_layers, c.n_heads, c.n_kv_heads, c.head_dim, c.ffn_dim,
+            c.vocab_size,
+            c.model_dim,
+            c.n_layers,
+            c.n_heads,
+            c.n_kv_heads,
+            c.head_dim,
+            c.ffn_dim,
         ] {
             out.extend_from_slice(&(v as u32).to_le_bytes());
         }
         out.push(self.qat as u8);
         out.extend_from_slice(&self.step_t.to_le_bytes());
         out.extend_from_slice(&rng.state().to_le_bytes());
-        for flat in [
-            self.model_flat(),
-            self.m.to_flat(),
-            self.v.to_flat(),
-        ] {
+        for flat in [self.model_flat(), self.m.to_flat(), self.v.to_flat()] {
             for &x in &flat {
                 out.extend_from_slice(&x.to_le_bytes());
             }
@@ -1215,11 +1429,19 @@ impl LlamaTrainer {
         }
         let c = &self.model.cfg;
         let want = [
-            c.vocab_size, c.model_dim, c.n_layers, c.n_heads, c.n_kv_heads, c.head_dim, c.ffn_dim,
+            c.vocab_size,
+            c.model_dim,
+            c.n_layers,
+            c.n_heads,
+            c.n_kv_heads,
+            c.head_dim,
+            c.ffn_dim,
         ];
         for &w in &want {
             if cur.u32()? as usize != w {
-                return Err(InferError::Format("checkpoint shape does not match this model".into()));
+                return Err(InferError::Format(
+                    "checkpoint shape does not match this model".into(),
+                ));
             }
         }
         self.qat = cur.u8()? != 0;
@@ -1272,7 +1494,9 @@ impl Cur<'_> {
     }
     fn u64(&mut self) -> Result<u64> {
         let b = self.take(8)?;
-        Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+        Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
     }
     fn u8(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
@@ -1335,12 +1559,28 @@ mod tests {
         Linear::new(in_f, out_f, w, vec![0.0; out_f]).unwrap()
     }
 
-    fn tiny(vocab: usize, dim: usize, n_heads: usize, n_kv: usize, ffn: usize, n_layers: usize) -> LlamaModel {
+    fn tiny(
+        vocab: usize,
+        dim: usize,
+        n_heads: usize,
+        n_kv: usize,
+        ffn: usize,
+        n_layers: usize,
+    ) -> LlamaModel {
         let hd = dim / n_heads;
         let cfg = LlamaConfig {
-            vocab_size: vocab, model_dim: dim, n_layers, n_heads, n_kv_heads: n_kv,
-            head_dim: hd, ffn_dim: ffn, rope_dim: hd, rope_base: 10000.0,
-            rope_type: RopeType::Norm, norm_eps: 1e-5, context_len: 64,
+            vocab_size: vocab,
+            model_dim: dim,
+            n_layers,
+            n_heads,
+            n_kv_heads: n_kv,
+            head_dim: hd,
+            ffn_dim: ffn,
+            rope_dim: hd,
+            rope_base: 10000.0,
+            rope_type: RopeType::Norm,
+            norm_eps: 1e-5,
+            context_len: 64,
         };
         let blocks = (0..n_layers)
             .map(|l| {
@@ -1348,12 +1588,24 @@ mod tests {
                 LlamaBlock {
                     attn_norm: RmsNorm::new(vec![1.0; dim], 1e-5),
                     attn: Attention::new(
-                        lin(dim, n_heads * hd, s), lin(dim, n_kv * hd, s + 1),
-                        lin(dim, n_kv * hd, s + 2), lin(n_heads * hd, dim, s + 3),
-                        n_heads, n_kv, hd, hd, 10000.0, RopeType::Norm,
-                    ).unwrap(),
+                        lin(dim, n_heads * hd, s),
+                        lin(dim, n_kv * hd, s + 1),
+                        lin(dim, n_kv * hd, s + 2),
+                        lin(n_heads * hd, dim, s + 3),
+                        n_heads,
+                        n_kv,
+                        hd,
+                        hd,
+                        10000.0,
+                        RopeType::Norm,
+                    )
+                    .unwrap(),
                     ffn_norm: RmsNorm::new(vec![1.0; dim], 1e-5),
-                    ffn: FeedForward::new(lin(dim, ffn, s + 4), lin(dim, ffn, s + 5), lin(ffn, dim, s + 6)),
+                    ffn: FeedForward::new(
+                        lin(dim, ffn, s + 4),
+                        lin(dim, ffn, s + 5),
+                        lin(ffn, dim, s + 6),
+                    ),
                 }
             })
             .collect();
@@ -1427,7 +1679,10 @@ mod tests {
         tr.loss_and_backward(&tokens).unwrap();
 
         let eps = 1e-3;
-        let check = |g: f32, set: &mut dyn FnMut(&mut LlamaTrainer, f32), tr: &mut LlamaTrainer, label: &str| {
+        let check = |g: f32,
+                     set: &mut dyn FnMut(&mut LlamaTrainer, f32),
+                     tr: &mut LlamaTrainer,
+                     label: &str| {
             set(tr, eps);
             let lp = tr.loss(&tokens).unwrap();
             set(tr, -2.0 * eps);
@@ -1437,15 +1692,40 @@ mod tests {
             assert!((fd - g).abs() < 3e-2, "{label} fd={fd} got={g}");
         };
         let g = tr.grads.tok_emb[3 * 8 + 2];
-        check(g, &mut |t, d| t.model.tok_emb[3 * 8 + 2] += d, &mut tr, "tok_emb");
+        check(
+            g,
+            &mut |t, d| t.model.tok_emb[3 * 8 + 2] += d,
+            &mut tr,
+            "tok_emb",
+        );
         let g = tr.grads.blocks[0].wq.w[5];
-        check(g, &mut |t, d| t.model.blocks[0].attn.wq.weight.data[5] += d, &mut tr, "wq");
+        check(
+            g,
+            &mut |t, d| t.model.blocks[0].attn.wq.weight.data[5] += d,
+            &mut tr,
+            "wq",
+        );
         let g = tr.grads.blocks[1].down.w[9];
-        check(g, &mut |t, d| t.model.blocks[1].ffn.down.weight.data[9] += d, &mut tr, "down");
+        check(
+            g,
+            &mut |t, d| t.model.blocks[1].ffn.down.weight.data[9] += d,
+            &mut tr,
+            "down",
+        );
         let g = tr.grads.blocks[0].attn_norm[3];
-        check(g, &mut |t, d| t.model.blocks[0].attn_norm.weight[3] += d, &mut tr, "attn_norm");
+        check(
+            g,
+            &mut |t, d| t.model.blocks[0].attn_norm.weight[3] += d,
+            &mut tr,
+            "attn_norm",
+        );
         let g = tr.grads.lm_head.w[4];
-        check(g, &mut |t, d| t.model.lm_head.weight.data[4] += d, &mut tr, "lm_head");
+        check(
+            g,
+            &mut |t, d| t.model.lm_head.weight.data[4] += d,
+            &mut tr,
+            "lm_head",
+        );
     }
 
     #[test]
@@ -1460,7 +1740,10 @@ mod tests {
             last = tr.train_step(&tokens).unwrap();
         }
         let lf = tr.loss(&tokens).unwrap();
-        assert!(lf < l0 * 0.5, "loss did not fall enough: {l0} → {lf} (last step {last})");
+        assert!(
+            lf < l0 * 0.5,
+            "loss did not fall enough: {l0} → {lf} (last step {last})"
+        );
         assert!(lf.is_finite());
     }
 
@@ -1479,15 +1762,30 @@ mod tests {
         tr.set_lr(0.5);
         tr.set_weight_decay(0.1);
         // Zero gradients: only decoupled decay acts.
-        for v in tr.model.lm_head.weight.data.iter_mut() { *v = 2.0; } // matrix
-        for v in tr.model.lm_head.bias.data.iter_mut() { *v = 2.0; }   // bias (1-D)
-        for v in tr.model.final_norm.weight.iter_mut() { *v = 2.0; }   // norm (1-D)
+        for v in tr.model.lm_head.weight.data.iter_mut() {
+            *v = 2.0;
+        } // matrix
+        for v in tr.model.lm_head.bias.data.iter_mut() {
+            *v = 2.0;
+        } // bias (1-D)
+        for v in tr.model.final_norm.weight.iter_mut() {
+            *v = 2.0;
+        } // norm (1-D)
         tr.grads.clear();
         tr.apply_step();
         // matrix: 2 − 0.5·0.1·2 = 1.9
-        assert!((tr.model.lm_head.weight.data[0] - 1.9).abs() < 1e-5, "matrix not decayed");
-        assert!((tr.model.lm_head.bias.data[0] - 2.0).abs() < 1e-6, "bias decayed");
-        assert!((tr.model.final_norm.weight[0] - 2.0).abs() < 1e-6, "norm decayed");
+        assert!(
+            (tr.model.lm_head.weight.data[0] - 1.9).abs() < 1e-5,
+            "matrix not decayed"
+        );
+        assert!(
+            (tr.model.lm_head.bias.data[0] - 2.0).abs() < 1e-6,
+            "bias decayed"
+        );
+        assert!(
+            (tr.model.final_norm.weight[0] - 2.0).abs() < 1e-6,
+            "norm decayed"
+        );
     }
 
     #[test]
@@ -1511,7 +1809,14 @@ mod tests {
         b.grads.load_flat(&avg);
         b.apply_step();
 
-        for (x, y) in a.model.lm_head.weight.data.iter().zip(&b.model.lm_head.weight.data) {
+        for (x, y) in a
+            .model
+            .lm_head
+            .weight
+            .data
+            .iter()
+            .zip(&b.model.lm_head.weight.data)
+        {
             assert!((x - y).abs() < 1e-6, "batch != hand-averaged: {x} vs {y}");
         }
     }
@@ -1537,7 +1842,10 @@ mod tests {
         for _ in 0..15 {
             last = tr.finetune_epoch(&tokens, 8, 8, &mut rng).unwrap();
         }
-        assert!(last < first * 0.7, "epoch training did not reduce loss: {first:.4} → {last:.4}");
+        assert!(
+            last < first * 0.7,
+            "epoch training did not reduce loss: {first:.4} → {last:.4}"
+        );
     }
 
     #[test]
@@ -1548,12 +1856,16 @@ mod tests {
         let mut serial = LlamaTrainer::new(base_clone(&base)).unwrap();
         serial.set_lr(0.02);
         let mut rs = Rng::new(99);
-        let ls = serial.finetune_epoch_threaded(&tokens, 6, 8, &mut rs, 1).unwrap();
+        let ls = serial
+            .finetune_epoch_threaded(&tokens, 6, 8, &mut rs, 1)
+            .unwrap();
 
         let mut threaded = LlamaTrainer::new(base_clone(&base)).unwrap();
         threaded.set_lr(0.02);
         let mut rt = Rng::new(99);
-        let lt = threaded.finetune_epoch_threaded(&tokens, 6, 8, &mut rt, 1).unwrap();
+        let lt = threaded
+            .finetune_epoch_threaded(&tokens, 6, 8, &mut rt, 1)
+            .unwrap();
 
         assert_eq!(ls, lt);
         for (x, y) in serial.model_flat().iter().zip(&threaded.model_flat()) {
@@ -1570,13 +1882,16 @@ mod tests {
         serial.set_lr(0.02);
         let mut rs = Rng::new(1);
         for _ in 0..3 {
-            serial.finetune_epoch_threaded(&tokens, 6, 16, &mut rs, 1).unwrap();
+            serial
+                .finetune_epoch_threaded(&tokens, 6, 16, &mut rs, 1)
+                .unwrap();
         }
         let mut par = LlamaTrainer::new(base_clone(&base)).unwrap();
         par.set_lr(0.02);
         let mut rp = Rng::new(1);
         for _ in 0..3 {
-            par.finetune_epoch_threaded(&tokens, 6, 16, &mut rp, 4).unwrap();
+            par.finetune_epoch_threaded(&tokens, 6, 16, &mut rp, 4)
+                .unwrap();
         }
         for (x, y) in serial.model_flat().iter().zip(&par.model_flat()) {
             assert!((x - y).abs() < 1e-4, "multishard drifted: {x} vs {y}");
@@ -1598,13 +1913,21 @@ mod tests {
         let mut sched = LlamaTrainer::new(base_clone(&base)).unwrap();
         sched.set_lr(0.02);
         let steps_per_epoch = (tokens.len() - 8 + 1).div_ceil(8) as u64;
-        sched.set_lr_schedule(Some(LrSchedule::warmup_cosine(0.02, steps_per_epoch, steps_per_epoch * 5)));
+        sched.set_lr_schedule(Some(LrSchedule::warmup_cosine(
+            0.02,
+            steps_per_epoch,
+            steps_per_epoch * 5,
+        )));
         let mut rsc = Rng::new(5);
         for _ in 0..5 {
             sched.finetune_epoch(&tokens, 8, 8, &mut rsc).unwrap();
         }
         assert_eq!(sched.step_count(), steps_per_epoch * 5);
-        let differ = fixed.model_flat().iter().zip(&sched.model_flat()).any(|(a, b)| (a - b).abs() > 1e-6);
+        let differ = fixed
+            .model_flat()
+            .iter()
+            .zip(&sched.model_flat())
+            .any(|(a, b)| (a - b).abs() > 1e-6);
         assert!(differ, "schedule had no effect");
     }
 
@@ -1652,12 +1975,25 @@ mod tests {
         for &i in &[0usize, 7, 15] {
             let g = tr.grads.blocks[0].down.w[i];
             tr.model.blocks[0].ffn.down.weight.data[i] += eps;
-            let lp = cross_entropy(&forward_train(&tr.model, &tokens, p, seed).unwrap().logits, &tokens, 5).0;
+            let lp = cross_entropy(
+                &forward_train(&tr.model, &tokens, p, seed).unwrap().logits,
+                &tokens,
+                5,
+            )
+            .0;
             tr.model.blocks[0].ffn.down.weight.data[i] -= 2.0 * eps;
-            let lm = cross_entropy(&forward_train(&tr.model, &tokens, p, seed).unwrap().logits, &tokens, 5).0;
+            let lm = cross_entropy(
+                &forward_train(&tr.model, &tokens, p, seed).unwrap().logits,
+                &tokens,
+                5,
+            )
+            .0;
             tr.model.blocks[0].ffn.down.weight.data[i] += eps;
             let fd = (lp - lm) / (2.0 * eps);
-            assert!((fd - g).abs() < 6e-3 + 0.03 * g.abs(), "down.w[{i}] fd={fd} got={g}");
+            assert!(
+                (fd - g).abs() < 6e-3 + 0.03 * g.abs(),
+                "down.w[{i}] fd={fd} got={g}"
+            );
         }
     }
 

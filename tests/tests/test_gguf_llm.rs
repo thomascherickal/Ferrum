@@ -69,7 +69,12 @@ fn synth_llama_with_tokenizer() -> Vec<u8> {
     let mut infos = Vec::new();
     let mut data = Vec::new();
     let mut count = 0u32;
-    let add = |infos: &mut Vec<u8>, data: &mut Vec<u8>, count: &mut u32, name: &str, ne: &[u64], vals: &[f32]| {
+    let add = |infos: &mut Vec<u8>,
+               data: &mut Vec<u8>,
+               count: &mut u32,
+               name: &str,
+               ne: &[u64],
+               vals: &[f32]| {
         let off = data.len() as u64;
         for &v in vals {
             pf32(data, v);
@@ -84,21 +89,105 @@ fn synth_llama_with_tokenizer() -> Vec<u8> {
         *count += 1;
     };
 
-    add(&mut infos, &mut data, &mut count, "token_embd.weight", &[dim as u64, vocab as u64], &rnd(vocab * dim));
+    add(
+        &mut infos,
+        &mut data,
+        &mut count,
+        "token_embd.weight",
+        &[dim as u64, vocab as u64],
+        &rnd(vocab * dim),
+    );
     for i in 0..n_layers {
         let p = format!("blk.{i}");
-        add(&mut infos, &mut data, &mut count, &format!("{p}.attn_norm.weight"), &[dim as u64], &vec![1.0; dim]);
-        add(&mut infos, &mut data, &mut count, &format!("{p}.attn_q.weight"), &[dim as u64, qd as u64], &rnd(dim * qd));
-        add(&mut infos, &mut data, &mut count, &format!("{p}.attn_k.weight"), &[dim as u64, qd as u64], &rnd(dim * qd));
-        add(&mut infos, &mut data, &mut count, &format!("{p}.attn_v.weight"), &[dim as u64, qd as u64], &rnd(dim * qd));
-        add(&mut infos, &mut data, &mut count, &format!("{p}.attn_output.weight"), &[qd as u64, dim as u64], &rnd(qd * dim));
-        add(&mut infos, &mut data, &mut count, &format!("{p}.ffn_norm.weight"), &[dim as u64], &vec![1.0; dim]);
-        add(&mut infos, &mut data, &mut count, &format!("{p}.ffn_gate.weight"), &[dim as u64, ffn as u64], &rnd(dim * ffn));
-        add(&mut infos, &mut data, &mut count, &format!("{p}.ffn_up.weight"), &[dim as u64, ffn as u64], &rnd(dim * ffn));
-        add(&mut infos, &mut data, &mut count, &format!("{p}.ffn_down.weight"), &[ffn as u64, dim as u64], &rnd(ffn * dim));
+        add(
+            &mut infos,
+            &mut data,
+            &mut count,
+            &format!("{p}.attn_norm.weight"),
+            &[dim as u64],
+            &vec![1.0; dim],
+        );
+        add(
+            &mut infos,
+            &mut data,
+            &mut count,
+            &format!("{p}.attn_q.weight"),
+            &[dim as u64, qd as u64],
+            &rnd(dim * qd),
+        );
+        add(
+            &mut infos,
+            &mut data,
+            &mut count,
+            &format!("{p}.attn_k.weight"),
+            &[dim as u64, qd as u64],
+            &rnd(dim * qd),
+        );
+        add(
+            &mut infos,
+            &mut data,
+            &mut count,
+            &format!("{p}.attn_v.weight"),
+            &[dim as u64, qd as u64],
+            &rnd(dim * qd),
+        );
+        add(
+            &mut infos,
+            &mut data,
+            &mut count,
+            &format!("{p}.attn_output.weight"),
+            &[qd as u64, dim as u64],
+            &rnd(qd * dim),
+        );
+        add(
+            &mut infos,
+            &mut data,
+            &mut count,
+            &format!("{p}.ffn_norm.weight"),
+            &[dim as u64],
+            &vec![1.0; dim],
+        );
+        add(
+            &mut infos,
+            &mut data,
+            &mut count,
+            &format!("{p}.ffn_gate.weight"),
+            &[dim as u64, ffn as u64],
+            &rnd(dim * ffn),
+        );
+        add(
+            &mut infos,
+            &mut data,
+            &mut count,
+            &format!("{p}.ffn_up.weight"),
+            &[dim as u64, ffn as u64],
+            &rnd(dim * ffn),
+        );
+        add(
+            &mut infos,
+            &mut data,
+            &mut count,
+            &format!("{p}.ffn_down.weight"),
+            &[ffn as u64, dim as u64],
+            &rnd(ffn * dim),
+        );
     }
-    add(&mut infos, &mut data, &mut count, "output_norm.weight", &[dim as u64], &vec![1.0; dim]);
-    add(&mut infos, &mut data, &mut count, "output.weight", &[dim as u64, vocab as u64], &rnd(dim * vocab));
+    add(
+        &mut infos,
+        &mut data,
+        &mut count,
+        "output_norm.weight",
+        &[dim as u64],
+        &vec![1.0; dim],
+    );
+    add(
+        &mut infos,
+        &mut data,
+        &mut count,
+        "output.weight",
+        &[dim as u64, vocab as u64],
+        &rnd(dim * vocab),
+    );
 
     // Metadata table (architecture + tokenizer).
     let toks = ["h", "i", " ", "a", "b", "c", "d", "e", "f", "g"];
@@ -158,17 +247,28 @@ fn gguf_run_pipeline_end_to_end() {
     // 4. Encode a prompt with the imported tokenizer; ids must be in-vocab.
     let mut prompt = vec![tok.bos().unwrap()];
     prompt.extend(tok.encode("hi"));
-    assert!(prompt.iter().all(|&t| t < model.cfg.vocab_size), "prompt {prompt:?} out of vocab");
-    assert_eq!(tok.decode(&tok.encode("hi")), "hi", "tokenizer must round-trip");
+    assert!(
+        prompt.iter().all(|&t| t < model.cfg.vocab_size),
+        "prompt {prompt:?} out of vocab"
+    );
+    assert_eq!(
+        tok.decode(&tok.encode("hi")),
+        "hi",
+        "tokenizer must round-trip"
+    );
 
     // 5. Generate (the CLI's exact call) and decode.
     let params = SamplingParams::with_temperature(0.8);
-    let out = model.generate(&prompt, 8, &params, tok.eos(), &mut Rng::new(7)).unwrap();
+    let out = model
+        .generate(&prompt, 8, &params, tok.eos(), &mut Rng::new(7))
+        .unwrap();
     assert!(out.iter().all(|&t| t < model.cfg.vocab_size));
     let _text = tok.decode(&out); // must not panic on any produced ids
 
     // Deterministic for a fixed seed.
-    let again = model.generate(&prompt, 8, &params, tok.eos(), &mut Rng::new(7)).unwrap();
+    let again = model
+        .generate(&prompt, 8, &params, tok.eos(), &mut Rng::new(7))
+        .unwrap();
     assert_eq!(out, again);
 
     let _ = std::fs::remove_file(&path);

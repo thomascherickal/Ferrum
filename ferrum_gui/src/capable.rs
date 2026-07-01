@@ -144,7 +144,10 @@ fn assemble_report(
 pub async fn capability_report(state: State<'_, AppState>) -> Result<CapabilityReport, String> {
     // Snapshot machine facts under the shared sysinfo lock, then release it.
     let (cpu, cores, mem_total, mem_avail) = {
-        let mut sys = state.sys.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
+        let mut sys = state
+            .sys
+            .lock()
+            .map_err(|e| format!("state lock poisoned: {e}"))?;
         // Ensure the CPU list is populated before reading it; otherwise `cpus()`
         // can be empty (→ cores = 0 → all GFLOP-derived bounds collapse to 0).
         sys.refresh_cpu_all();
@@ -155,7 +158,12 @@ pub async fn capability_report(state: State<'_, AppState>) -> Result<CapabilityR
             .map(|c| c.brand().trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "unknown CPU".to_string());
-        (cpu, sys.cpus().len(), sys.total_memory(), sys.available_memory())
+        (
+            cpu,
+            sys.cpus().len(),
+            sys.total_memory(),
+            sys.available_memory(),
+        )
     };
     // `cores` is the live sysinfo hardware CPU count; `threads` is the engine's
     // parallel pool size (`ferrum_core::num_threads()`) — the two can differ.
@@ -167,7 +175,15 @@ pub async fn capability_report(state: State<'_, AppState>) -> Result<CapabilityR
             .await
             .map_err(|e| format!("benchmark task error: {e}"))?;
 
-    Ok(assemble_report(cpu, cores, threads, mem_total, mem_avail, bw, gemm_single))
+    Ok(assemble_report(
+        cpu,
+        cores,
+        threads,
+        mem_total,
+        mem_avail,
+        bw,
+        gemm_single,
+    ))
 }
 
 // ── Live micro-benchmark ─────────────────────────────────────────────────────
@@ -250,14 +266,20 @@ mod tests {
         let i4 = infer_max_params(bw, BPP_INT4);
         let i8 = infer_max_params(bw, BPP_INT8);
         let f32 = infer_max_params(bw, BPP_F32);
-        assert!(i4 > i8 && i8 > f32, "expected int4 > int8 > f32, got {i4} {i8} {f32}");
+        assert!(
+            i4 > i8 && i8 > f32,
+            "expected int4 > int8 > f32, got {i4} {i8} {f32}"
+        );
     }
 
     #[test]
     fn infer_bound_scales_with_bandwidth() {
         let lo = infer_max_params(5e9, BPP_INT8);
         let hi = infer_max_params(20e9, BPP_INT8);
-        assert!(hi > lo * 3.0, "4x bandwidth should give ~4x params: {lo} {hi}");
+        assert!(
+            hi > lo * 3.0,
+            "4x bandwidth should give ~4x params: {lo} {hi}"
+        );
     }
 
     #[test]
@@ -313,12 +335,19 @@ mod tests {
         // Bypass the command (needs a Tauri runtime) and check the assembly
         // helper used by it directly.
         let r = assemble_report(
-            "Test CPU".into(), 8, 8, 16_000_000_000, 8_000_000_000,
-            8e9,   // 8 GB/s
-            10.0,  // 10 GFLOP/s single-thread
+            "Test CPU".into(),
+            8,
+            8,
+            16_000_000_000,
+            8_000_000_000,
+            8e9,  // 8 GB/s
+            10.0, // 10 GFLOP/s single-thread
         );
         assert_eq!(r.cores, 8);
-        assert!((r.gemm_gflops - 80.0).abs() < 1e-6, "aggregate = single*cores");
+        assert!(
+            (r.gemm_gflops - 80.0).abs() < 1e-6,
+            "aggregate = single*cores"
+        );
         assert!(r.infer_int4 > r.infer_int8 && r.infer_int8 > r.infer_f32);
         assert!(r.train_chinchilla > 0.0 && r.train_fixed1b > 0.0 && r.test_eval > 0.0);
         assert_eq!(r.target_toks, TARGET_TOKS);

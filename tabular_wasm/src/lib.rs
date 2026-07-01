@@ -4,8 +4,8 @@
 //!   `TabularModel`       — original tabular inference (classification / regression)
 //!   `TransformerSLMModel`— character-level SLM with attention map access
 
-use ferrum_core::{argmax_rows, from_bytes, TaskType};
 use ferrum_core::layer::{Embedding, KvCache, TransformerBlock};
+use ferrum_core::{argmax_rows, from_bytes, TaskType};
 use wasm_bindgen::prelude::*;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -28,7 +28,12 @@ impl TabularModel {
             from_bytes(bytes).map_err(|e| JsValue::from_str(&e.to_string()))?;
         let task = meta.task;
         let meta_json = meta.to_json();
-        Ok(Self { model, norm, meta_json, task })
+        Ok(Self {
+            model,
+            norm,
+            meta_json,
+            task,
+        })
     }
 
     pub fn metadata(&self) -> String {
@@ -42,9 +47,13 @@ impl TabularModel {
     pub fn predict(&self, values: &[f32]) -> Result<String, JsValue> {
         let raw = ferrum_core::Tensor::row(values.to_vec())
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let input = self.norm.transform(&raw)
+        let input = self
+            .norm
+            .transform(&raw)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let out = self.model.forward(&input)
+        let out = self
+            .model
+            .forward(&input)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
         let json = match self.task {
@@ -52,16 +61,26 @@ impl TabularModel {
                 let class_idx =
                     argmax_rows(&out).map_err(|e| JsValue::from_str(&e.to_string()))?[0];
                 let confidence = out.data[class_idx];
-                let probs = out.data.iter().map(|p| format!("{p:.6}")).collect::<Vec<_>>().join(",");
-                format!(r#"{{"type":"classification","class_index":{class_idx},"confidence":{confidence:.6},"probabilities":[{probs}]}}"#)
+                let probs = out
+                    .data
+                    .iter()
+                    .map(|p| format!("{p:.6}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    r#"{{"type":"classification","class_index":{class_idx},"confidence":{confidence:.6},"probabilities":[{probs}]}}"#
+                )
             }
             TaskType::Regression => {
                 let pred_norm = out.data[0];
                 let pred_raw = self.norm.denormalise_target(pred_norm);
-                format!(r#"{{"type":"regression","value":{pred_raw:.4},"value_norm":{pred_norm:.6}}}"#)
+                format!(
+                    r#"{{"type":"regression","value":{pred_raw:.4},"value_norm":{pred_norm:.6}}}"#
+                )
             }
             TaskType::TransformerSLM => {
-                r#"{"type":"error","message":"Use TransformerSLMModel for SLM inference"}"#.to_string()
+                r#"{"type":"error","message":"Use TransformerSLMModel for SLM inference"}"#
+                    .to_string()
             }
         };
         Ok(json)
@@ -139,8 +158,14 @@ impl TransformerSLMModel {
 
         let meta_json = meta.to_json();
         Ok(Self {
-            model, meta_json, vocab_size, context_len, num_heads, num_blocks,
-            caches, cache_pos: 0,
+            model,
+            meta_json,
+            vocab_size,
+            context_len,
+            num_heads,
+            num_blocks,
+            caches,
+            cache_pos: 0,
         })
     }
 
@@ -185,12 +210,15 @@ impl TransformerSLMModel {
         let input = ferrum_core::Tensor::matrix(1, self.context_len, context.to_vec())
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-        let out = self.model.forward(&input)
+        let out = self
+            .model
+            .forward(&input)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
         // out is [1 * T, vocab] from the embedding chain, then [1, vocab] after lm_head.
         // We want the last row (the next-token prediction).
-        let (rows, cols) = out.matrix_dims()
+        let (rows, cols) = out
+            .matrix_dims()
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         let last_row_start = (rows - 1) * cols;
         Ok(out.data[last_row_start..].to_vec())
@@ -226,7 +254,9 @@ impl TransformerSLMModel {
     /// full (`context_len` positions) — re-`prime` with a fresh window then.
     pub fn predict_next_cached(&mut self, token_id: usize) -> Result<Vec<f32>, JsValue> {
         if self.cache_pos == 0 {
-            return Err(JsValue::from_str("Call prime(context) before predict_next_cached"));
+            return Err(JsValue::from_str(
+                "Call prime(context) before predict_next_cached",
+            ));
         }
         self.feed_token(token_id)
     }
@@ -245,14 +275,17 @@ impl TransformerSLMModel {
             if let Some(emb) = any.downcast_ref::<Embedding>() {
                 x = Some(emb.embed_one(token, self.cache_pos).map_err(js)?);
             } else if let Some(tb) = any.downcast_ref::<TransformerBlock>() {
-                let cur = x.ok_or_else(|| JsValue::from_str("model has no Embedding before TransformerBlock"))?;
+                let cur = x.ok_or_else(|| {
+                    JsValue::from_str("model has no Embedding before TransformerBlock")
+                })?;
                 x = Some(
                     tb.forward_with_cache(&cur, &mut self.caches[block_idx])
                         .map_err(js)?,
                 );
                 block_idx += 1;
             } else {
-                let cur = x.ok_or_else(|| JsValue::from_str("model must start with an Embedding layer"))?;
+                let cur =
+                    x.ok_or_else(|| JsValue::from_str("model must start with an Embedding layer"))?;
                 x = Some(layer.forward(&cur).map_err(js)?);
             }
         }
@@ -281,7 +314,8 @@ impl TransformerSLMModel {
     /// `probs` = output of `predict_next`. `temperature` = 1.0 is neutral.
     /// Lower temperature → more deterministic. Higher → more random.
     pub fn sample_from_probs(&self, probs: &[f32], temperature: f32, random_value: f32) -> usize {
-        let scaled: Vec<f32> = probs.iter()
+        let scaled: Vec<f32> = probs
+            .iter()
             .map(|&p| (p.ln() / temperature.max(0.01)).exp())
             .collect();
         let sum: f32 = scaled.iter().sum();
@@ -290,14 +324,17 @@ impl TransformerSLMModel {
         let r = random_value.clamp(0.0, 1.0 - 1e-7);
         for (i, &p) in normed.iter().enumerate() {
             cumsum += p;
-            if r <= cumsum { return i; }
+            if r <= cumsum {
+                return i;
+            }
         }
         normed.len() - 1
     }
 
     /// Compute Shannon entropy of a probability distribution (0 = certain, ln(V) = uniform).
     pub fn entropy(&self, probs: &[f32]) -> f32 {
-        probs.iter()
+        probs
+            .iter()
             .filter(|&&p| p > 1e-10)
             .map(|&p| -p * p.ln())
             .sum()
@@ -316,17 +353,20 @@ impl TransformerSLMModel {
 // ─────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
-    use ferrum_core::{
-        from_bytes, to_bytes, Embedding, LayerNorm, Linear, ModelMetadata, Net, Normalizer,
-        Rng, TaskType, Tensor, TransformerBlock,
-    };
     use ferrum_core::model::Sequential;
+    use ferrum_core::{
+        from_bytes, to_bytes, Embedding, LayerNorm, Linear, ModelMetadata, Net, Normalizer, Rng,
+        TaskType, Tensor, TransformerBlock,
+    };
 
     fn clf_bytes() -> Vec<u8> {
         let mut rng = Rng::new(1);
         let net = Net::mlp(4, 8, 3, &mut rng);
         let model = net.to_inference().unwrap();
-        let norm = Normalizer { means: vec![5.8, 3.0, 3.7, 1.2], stds: vec![0.8, 0.4, 1.7, 0.8] };
+        let norm = Normalizer {
+            means: vec![5.8, 3.0, 3.7, 1.2],
+            stds: vec![0.8, 0.4, 1.7, 0.8],
+        };
         let meta = ModelMetadata {
             dataset_name: "test".into(),
             task: TaskType::Classification,
@@ -352,28 +392,64 @@ mod tests {
         let scale = (1.0 / embed_dim as f32).sqrt();
 
         let emb = Embedding::new(
-            vocab_size, context_len, embed_dim,
-            (0..vocab_size * embed_dim).map(|_| rng.next_normal() * scale).collect(),
-            (0..context_len * embed_dim).map(|_| rng.next_normal() * scale).collect(),
-        ).unwrap();
+            vocab_size,
+            context_len,
+            embed_dim,
+            (0..vocab_size * embed_dim)
+                .map(|_| rng.next_normal() * scale)
+                .collect(),
+            (0..context_len * embed_dim)
+                .map(|_| rng.next_normal() * scale)
+                .collect(),
+        )
+        .unwrap();
 
         let tb = TransformerBlock::new(
-            context_len, num_heads, embed_dim,
-            vec![1.0; embed_dim], vec![0.0; embed_dim],
-            (0..embed_dim*embed_dim).map(|_| rng.next_normal() * scale).collect(), vec![0.0; embed_dim],
-            (0..embed_dim*embed_dim).map(|_| rng.next_normal() * scale).collect(), vec![0.0; embed_dim],
-            (0..embed_dim*embed_dim).map(|_| rng.next_normal() * scale).collect(), vec![0.0; embed_dim],
-            (0..embed_dim*embed_dim).map(|_| rng.next_normal() * scale).collect(), vec![0.0; embed_dim],
-            vec![1.0; embed_dim], vec![0.0; embed_dim],
-            (0..embed_dim*hidden_dim).map(|_| rng.next_normal() * scale).collect(), vec![0.0; hidden_dim],
-            (0..hidden_dim*embed_dim).map(|_| rng.next_normal() * scale).collect(), vec![0.0; embed_dim],
-        ).unwrap();
+            context_len,
+            num_heads,
+            embed_dim,
+            vec![1.0; embed_dim],
+            vec![0.0; embed_dim],
+            (0..embed_dim * embed_dim)
+                .map(|_| rng.next_normal() * scale)
+                .collect(),
+            vec![0.0; embed_dim],
+            (0..embed_dim * embed_dim)
+                .map(|_| rng.next_normal() * scale)
+                .collect(),
+            vec![0.0; embed_dim],
+            (0..embed_dim * embed_dim)
+                .map(|_| rng.next_normal() * scale)
+                .collect(),
+            vec![0.0; embed_dim],
+            (0..embed_dim * embed_dim)
+                .map(|_| rng.next_normal() * scale)
+                .collect(),
+            vec![0.0; embed_dim],
+            vec![1.0; embed_dim],
+            vec![0.0; embed_dim],
+            (0..embed_dim * hidden_dim)
+                .map(|_| rng.next_normal() * scale)
+                .collect(),
+            vec![0.0; hidden_dim],
+            (0..hidden_dim * embed_dim)
+                .map(|_| rng.next_normal() * scale)
+                .collect(),
+            vec![0.0; embed_dim],
+        )
+        .unwrap();
 
-        let ln_final = LayerNorm::new(embed_dim, vec![1.0; embed_dim], vec![0.0; embed_dim]).unwrap();
-        let lm_head = Linear::new(embed_dim, vocab_size,
-            (0..embed_dim * vocab_size).map(|_| rng.next_normal() * scale).collect(),
+        let ln_final =
+            LayerNorm::new(embed_dim, vec![1.0; embed_dim], vec![0.0; embed_dim]).unwrap();
+        let lm_head = Linear::new(
+            embed_dim,
+            vocab_size,
+            (0..embed_dim * vocab_size)
+                .map(|_| rng.next_normal() * scale)
+                .collect(),
             vec![0.0; vocab_size],
-        ).unwrap();
+        )
+        .unwrap();
 
         let model = Sequential::new()
             .with(Box::new(emb))
@@ -381,8 +457,13 @@ mod tests {
             .with(Box::new(ln_final))
             .with(Box::new(lm_head));
 
-        let vocab_strs: Vec<String> = (0..vocab_size).map(|i| ((b'a' + i as u8) as char).to_string()).collect();
-        let norm = Normalizer { means: vec![], stds: vec![] };
+        let vocab_strs: Vec<String> = (0..vocab_size)
+            .map(|i| ((b'a' + i as u8) as char).to_string())
+            .collect();
+        let norm = Normalizer {
+            means: vec![],
+            stds: vec![],
+        };
         let meta = ModelMetadata {
             dataset_name: "slm_test".into(),
             task: TaskType::TransformerSLM,

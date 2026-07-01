@@ -121,10 +121,10 @@ fn fold_punctuation(ch: char) -> Option<&'static str> {
     Some(match ch {
         '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{2032}' => "'", // ‘ ’ ‚ ′
         '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{2033}' => "\"", // “ ” „ ″
-        '\u{2013}' | '\u{2014}' | '\u{2015}' => "-",               // – — ―
-        '\u{2026}' => "...",                                       // …
-        '\u{00A0}' | '\u{2007}' | '\u{202F}' => " ",               // nbsp variants
-        '\u{2022}' => "*",                                         // •
+        '\u{2013}' | '\u{2014}' | '\u{2015}' => "-",              // – — ―
+        '\u{2026}' => "...",                                      // …
+        '\u{00A0}' | '\u{2007}' | '\u{202F}' => " ",              // nbsp variants
+        '\u{2022}' => "*",                                        // •
         _ => return None,
     })
 }
@@ -167,9 +167,7 @@ fn strip_gutenberg_boilerplate(raw: &str) -> &str {
         .find("*** START OF")
         .or_else(|| raw.find("***START OF"))
         .and_then(|i| raw[i..].find('\n').map(|j| i + j + 1));
-    let end = raw
-        .find("*** END OF")
-        .or_else(|| raw.find("***END OF"));
+    let end = raw.find("*** END OF").or_else(|| raw.find("***END OF"));
     match (start, end) {
         (Some(s), Some(e)) if s < e => &raw[s..e],
         _ => raw,
@@ -203,7 +201,9 @@ pub fn validate_for_training(text: &str, context_len: usize) -> Result<()> {
     }
     let chars = text.chars().filter(|&c| c != '\r').count();
     if chars == 0 {
-        return Err(InferError::DimMismatch("corpus is empty after cleaning".into()));
+        return Err(InferError::DimMismatch(
+            "corpus is empty after cleaning".into(),
+        ));
     }
     if chars < context_len + 1 {
         return Err(InferError::DimMismatch(format!(
@@ -227,7 +227,10 @@ mod tests {
 
     #[test]
     fn lowercase_option_folds_case() {
-        let opts = CleanOptions { lowercase: true, ..CleanOptions::default() };
+        let opts = CleanOptions {
+            lowercase: true,
+            ..CleanOptions::default()
+        };
         assert_eq!(clean_corpus("ABCdef", &opts).trim(), "abcdef");
     }
 
@@ -240,7 +243,9 @@ mod tests {
         assert!(cleaned.contains("dash-dash"));
         assert!(cleaned.contains("ellipsis..."));
         // No smart punctuation should remain.
-        for bad in ['\u{201C}', '\u{201D}', '\u{2018}', '\u{2019}', '\u{2014}', '\u{2026}'] {
+        for bad in [
+            '\u{201C}', '\u{201D}', '\u{2018}', '\u{2019}', '\u{2014}', '\u{2026}',
+        ] {
             assert!(!cleaned.contains(bad), "found {bad:?}");
         }
     }
@@ -283,13 +288,22 @@ mod tests {
     #[test]
     fn gutenberg_passthrough_when_markers_absent() {
         let raw = "just a normal corpus with no markers\n";
-        let opts = CleanOptions { collapse_whitespace: false, ..CleanOptions::default() };
-        assert_eq!(clean_corpus(raw, &opts), "just a normal corpus with no markers\n");
+        let opts = CleanOptions {
+            collapse_whitespace: false,
+            ..CleanOptions::default()
+        };
+        assert_eq!(
+            clean_corpus(raw, &opts),
+            "just a normal corpus with no markers\n"
+        );
     }
 
     #[test]
     fn max_chars_truncates() {
-        let opts = CleanOptions { max_chars: Some(5), ..CleanOptions::default() };
+        let opts = CleanOptions {
+            max_chars: Some(5),
+            ..CleanOptions::default()
+        };
         let cleaned = clean_corpus("abcdefghij", &opts);
         assert_eq!(cleaned.chars().count(), 5);
     }

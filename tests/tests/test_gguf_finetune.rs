@@ -67,7 +67,12 @@ fn synth_llama() -> Vec<u8> {
     let mut infos = Vec::new();
     let mut data = Vec::new();
     let mut count = 0u32;
-    let add = |infos: &mut Vec<u8>, data: &mut Vec<u8>, count: &mut u32, name: &str, ne: &[u64], vals: &[f32]| {
+    let add = |infos: &mut Vec<u8>,
+               data: &mut Vec<u8>,
+               count: &mut u32,
+               name: &str,
+               ne: &[u64],
+               vals: &[f32]| {
         let off = data.len() as u64;
         for &v in vals {
             pf32(data, v);
@@ -82,21 +87,105 @@ fn synth_llama() -> Vec<u8> {
         *count += 1;
     };
 
-    add(&mut infos, &mut data, &mut count, "token_embd.weight", &[dim as u64, vocab as u64], &rnd(vocab * dim));
+    add(
+        &mut infos,
+        &mut data,
+        &mut count,
+        "token_embd.weight",
+        &[dim as u64, vocab as u64],
+        &rnd(vocab * dim),
+    );
     for i in 0..n_layers {
         let p = format!("blk.{i}");
-        add(&mut infos, &mut data, &mut count, &format!("{p}.attn_norm.weight"), &[dim as u64], &vec![1.0; dim]);
-        add(&mut infos, &mut data, &mut count, &format!("{p}.attn_q.weight"), &[dim as u64, qd as u64], &rnd(dim * qd));
-        add(&mut infos, &mut data, &mut count, &format!("{p}.attn_k.weight"), &[dim as u64, qd as u64], &rnd(dim * qd));
-        add(&mut infos, &mut data, &mut count, &format!("{p}.attn_v.weight"), &[dim as u64, qd as u64], &rnd(dim * qd));
-        add(&mut infos, &mut data, &mut count, &format!("{p}.attn_output.weight"), &[qd as u64, dim as u64], &rnd(qd * dim));
-        add(&mut infos, &mut data, &mut count, &format!("{p}.ffn_norm.weight"), &[dim as u64], &vec![1.0; dim]);
-        add(&mut infos, &mut data, &mut count, &format!("{p}.ffn_gate.weight"), &[dim as u64, ffn as u64], &rnd(dim * ffn));
-        add(&mut infos, &mut data, &mut count, &format!("{p}.ffn_up.weight"), &[dim as u64, ffn as u64], &rnd(dim * ffn));
-        add(&mut infos, &mut data, &mut count, &format!("{p}.ffn_down.weight"), &[ffn as u64, dim as u64], &rnd(ffn * dim));
+        add(
+            &mut infos,
+            &mut data,
+            &mut count,
+            &format!("{p}.attn_norm.weight"),
+            &[dim as u64],
+            &vec![1.0; dim],
+        );
+        add(
+            &mut infos,
+            &mut data,
+            &mut count,
+            &format!("{p}.attn_q.weight"),
+            &[dim as u64, qd as u64],
+            &rnd(dim * qd),
+        );
+        add(
+            &mut infos,
+            &mut data,
+            &mut count,
+            &format!("{p}.attn_k.weight"),
+            &[dim as u64, qd as u64],
+            &rnd(dim * qd),
+        );
+        add(
+            &mut infos,
+            &mut data,
+            &mut count,
+            &format!("{p}.attn_v.weight"),
+            &[dim as u64, qd as u64],
+            &rnd(dim * qd),
+        );
+        add(
+            &mut infos,
+            &mut data,
+            &mut count,
+            &format!("{p}.attn_output.weight"),
+            &[qd as u64, dim as u64],
+            &rnd(qd * dim),
+        );
+        add(
+            &mut infos,
+            &mut data,
+            &mut count,
+            &format!("{p}.ffn_norm.weight"),
+            &[dim as u64],
+            &vec![1.0; dim],
+        );
+        add(
+            &mut infos,
+            &mut data,
+            &mut count,
+            &format!("{p}.ffn_gate.weight"),
+            &[dim as u64, ffn as u64],
+            &rnd(dim * ffn),
+        );
+        add(
+            &mut infos,
+            &mut data,
+            &mut count,
+            &format!("{p}.ffn_up.weight"),
+            &[dim as u64, ffn as u64],
+            &rnd(dim * ffn),
+        );
+        add(
+            &mut infos,
+            &mut data,
+            &mut count,
+            &format!("{p}.ffn_down.weight"),
+            &[ffn as u64, dim as u64],
+            &rnd(ffn * dim),
+        );
     }
-    add(&mut infos, &mut data, &mut count, "output_norm.weight", &[dim as u64], &vec![1.0; dim]);
-    add(&mut infos, &mut data, &mut count, "output.weight", &[dim as u64, vocab as u64], &rnd(dim * vocab));
+    add(
+        &mut infos,
+        &mut data,
+        &mut count,
+        "output_norm.weight",
+        &[dim as u64],
+        &vec![1.0; dim],
+    );
+    add(
+        &mut infos,
+        &mut data,
+        &mut count,
+        "output.weight",
+        &[dim as u64, vocab as u64],
+        &rnd(dim * vocab),
+    );
 
     let toks = ["h", "i", " ", "a", "b", "c", "d", "e", "f", "g"];
     let mut meta = Vec::new();
@@ -155,7 +244,10 @@ fn gguf_finetune_checkpoint_resume_pipeline() {
     for _ in 0..12 {
         last = tr.finetune_epoch(&tokens, seq, batch, &mut rng).unwrap();
     }
-    assert!(last < first * 0.8, "fine-tune did not reduce loss: {first:.4} → {last:.4}");
+    assert!(
+        last < first * 0.8,
+        "fine-tune did not reduce loss: {first:.4} → {last:.4}"
+    );
     let trained = tr.model_snapshot();
     let trained_steps = tr.step_count();
 
@@ -170,7 +262,11 @@ fn gguf_finetune_checkpoint_resume_pipeline() {
     let mut tr2 = LlamaTrainer::new(base2).unwrap();
     let bytes = std::fs::read(&cpath).unwrap();
     let _resumed_rng = tr2.load_checkpoint_into(&bytes).unwrap();
-    assert_eq!(tr2.step_count(), trained_steps, "resumed step counter mismatch");
+    assert_eq!(
+        tr2.step_count(),
+        trained_steps,
+        "resumed step counter mismatch"
+    );
     let resumed = tr2.model_snapshot();
     assert_eq!(resumed.len(), trained.len());
     for (a, b) in trained.iter().zip(&resumed) {
@@ -180,10 +276,19 @@ fn gguf_finetune_checkpoint_resume_pipeline() {
     // 5. The resumed model generates in-vocab, deterministic tokens.
     let params = SamplingParams::with_temperature(0.8);
     let prompt = [1usize, 2, 3];
-    let out = tr2.model.generate(&prompt, 8, &params, Some(9), &mut Rng::new(7)).unwrap();
+    let out = tr2
+        .model
+        .generate(&prompt, 8, &params, Some(9), &mut Rng::new(7))
+        .unwrap();
     assert!(out.iter().all(|&t| t < tr2.model.cfg.vocab_size));
-    let again = tr2.model.generate(&prompt, 8, &params, Some(9), &mut Rng::new(7)).unwrap();
-    assert_eq!(out, again, "generation must be deterministic for a fixed seed");
+    let again = tr2
+        .model
+        .generate(&prompt, 8, &params, Some(9), &mut Rng::new(7))
+        .unwrap();
+    assert_eq!(
+        out, again,
+        "generation must be deterministic for a fixed seed"
+    );
 
     let _ = std::fs::remove_file(&gpath);
     let _ = std::fs::remove_file(&cpath);

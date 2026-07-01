@@ -27,7 +27,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Filter out --verbose/-v flags for positional arg parsing
-    let positional: Vec<&String> = args.iter()
+    let positional: Vec<&String> = args
+        .iter()
         .filter(|a| *a != "--verbose" && *a != "-v")
         .collect();
 
@@ -39,7 +40,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_path = positional[2];
     let ds_name = positional.get(3).map(|s| s.as_str()).unwrap_or("Dataset");
     let hidden: usize = positional.get(4).and_then(|s| s.parse().ok()).unwrap_or(64);
-    let epochs: usize = positional.get(5).and_then(|s| s.parse().ok()).unwrap_or(500);
+    let epochs: usize = positional
+        .get(5)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500);
 
     // ── Load ─────────────────────────────────────────────────────────────────
     let raw =

@@ -29,7 +29,13 @@ impl Activation {
         }?;
         if verbose::is_verbose() {
             let (vmin, vmax, vmean) = verbose::stats(&result.data);
-            vprintln!("[activation::apply] {:?} output: min={:.6}, max={:.6}, mean={:.6}", self, vmin, vmax, vmean);
+            vprintln!(
+                "[activation::apply] {:?} output: min={:.6}, max={:.6}, mean={:.6}",
+                self,
+                vmin,
+                vmax,
+                vmean
+            );
             verbose::check_nan_inf(&result.data, &format!("Activation::{:?}", self));
         }
         Ok(result)

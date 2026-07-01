@@ -1,15 +1,15 @@
 //! Generic offline Edge Generative SLM Library Engine.
-use crate::error::{InferError, Result};
 use crate::csv::{CsvDataset, ModelMetadata, Normalizer, TaskType};
-use crate::rng::Rng;
-use crate::optim::{Adam, Sgd};
-use crate::train::{Net, train_epoch};
-use crate::train_transformer::{train_transformer_epoch_threaded, TransformerNet};
+use crate::error::{InferError, Result};
 use crate::layer::{Embedding, KvCache, TransformerBlock};
+use crate::loader::{from_bytes, to_bytes};
 use crate::model::Sequential;
-use crate::loader::{to_bytes, from_bytes};
+use crate::optim::{Adam, Sgd};
+use crate::rng::Rng;
 use crate::tensor::Tensor;
 use crate::tokenizer::ByteBpeTokenizer;
+use crate::train::{train_epoch, Net};
+use crate::train_transformer::{train_transformer_epoch_threaded, TransformerNet};
 use crate::verbose;
 use std::collections::HashSet;
 
@@ -109,7 +109,12 @@ pub struct SamplingParams {
 
 impl Default for SamplingParams {
     fn default() -> Self {
-        Self { temperature: 1.0, top_k: 0, top_p: 1.0, repetition_penalty: 1.0 }
+        Self {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+        }
     }
 }
 
@@ -117,7 +122,10 @@ impl SamplingParams {
     /// Temperature-only sampling (top-k / top-p / repetition penalty disabled) —
     /// identical to the pre-I2 sampler.
     pub fn with_temperature(temperature: f32) -> Self {
-        Self { temperature, ..Self::default() }
+        Self {
+            temperature,
+            ..Self::default()
+        }
     }
 }
 
@@ -136,7 +144,10 @@ pub struct ValidationConfig {
 
 impl Default for ValidationConfig {
     fn default() -> Self {
-        Self { val_fraction: 0.1, patience: 0 }
+        Self {
+            val_fraction: 0.1,
+            patience: 0,
+        }
     }
 }
 
@@ -162,8 +173,12 @@ pub struct GenerativeSLM {
 impl GenerativeSLM {
     /// Construct a new instance manually from sequential layers, normalizer, and metadata.
     pub fn new(model: Sequential, norm: Normalizer, meta: ModelMetadata) -> Self {
-        vprintln!("[slm::GenerativeSLM::new] Creating SLM with {} layers, input_dim={}, output_dim={}",
-            model.len(), meta.input_dim, meta.output_dim);
+        vprintln!(
+            "[slm::GenerativeSLM::new] Creating SLM with {} layers, input_dim={}, output_dim={}",
+            model.len(),
+            meta.input_dim,
+            meta.output_dim
+        );
         Self { model, norm, meta }
     }
 
@@ -208,52 +223,106 @@ impl GenerativeSLM {
     where
         F: FnMut(usize, f32),
     {
-        vprintln!("[slm::GenerativeSLM::train_with_callback] ═══════════════════════════════════════");
+        vprintln!(
+            "[slm::GenerativeSLM::train_with_callback] ═══════════════════════════════════════"
+        );
         vprintln!("[slm::GenerativeSLM::train_with_callback] Starting SLM training:");
-        vprintln!("[slm::GenerativeSLM::train_with_callback]   corpus length:  {} chars", corpus.len());
-        vprintln!("[slm::GenerativeSLM::train_with_callback]   context_len:    {}", context_len);
-        vprintln!("[slm::GenerativeSLM::train_with_callback]   hidden_size:    {}", hidden_size);
-        vprintln!("[slm::GenerativeSLM::train_with_callback]   epochs:         {}", epochs);
-        vprintln!("[slm::GenerativeSLM::train_with_callback]   lr:             {}", lr);
-        vprintln!("[slm::GenerativeSLM::train_with_callback]   momentum:       {}", momentum);
-        vprintln!("[slm::GenerativeSLM::train_with_callback]   batch_size:     {}", batch_size);
-        vprintln!("[slm::GenerativeSLM::train_with_callback] ═══════════════════════════════════════");
+        vprintln!(
+            "[slm::GenerativeSLM::train_with_callback]   corpus length:  {} chars",
+            corpus.len()
+        );
+        vprintln!(
+            "[slm::GenerativeSLM::train_with_callback]   context_len:    {}",
+            context_len
+        );
+        vprintln!(
+            "[slm::GenerativeSLM::train_with_callback]   hidden_size:    {}",
+            hidden_size
+        );
+        vprintln!(
+            "[slm::GenerativeSLM::train_with_callback]   epochs:         {}",
+            epochs
+        );
+        vprintln!(
+            "[slm::GenerativeSLM::train_with_callback]   lr:             {}",
+            lr
+        );
+        vprintln!(
+            "[slm::GenerativeSLM::train_with_callback]   momentum:       {}",
+            momentum
+        );
+        vprintln!(
+            "[slm::GenerativeSLM::train_with_callback]   batch_size:     {}",
+            batch_size
+        );
+        vprintln!(
+            "[slm::GenerativeSLM::train_with_callback] ═══════════════════════════════════════"
+        );
 
         vprintln!("[slm::train] Building CSV dataset from corpus...");
         let csv_build_start = std::time::Instant::now();
         let csv_data = build_csv_dataset(corpus, context_len)?;
-        vprintln!("[slm::train] CSV dataset built in {:.1}ms, size={} bytes",
-            csv_build_start.elapsed().as_secs_f64() * 1000.0, csv_data.len());
+        vprintln!(
+            "[slm::train] CSV dataset built in {:.1}ms, size={} bytes",
+            csv_build_start.elapsed().as_secs_f64() * 1000.0,
+            csv_data.len()
+        );
 
         vprintln!("[slm::train] Parsing CSV dataset...");
         let parse_start = std::time::Instant::now();
         // Register the full sorted vocabulary explicitly so class indices
         // cover every character (even ones never appearing as a target) in
         // exact sorted order — no padding rows needed.
-        let class_names: Vec<String> = corpus_vocab(corpus).iter().map(|&ch| char_to_hex(ch)).collect();
+        let class_names: Vec<String> = corpus_vocab(corpus)
+            .iter()
+            .map(|&ch| char_to_hex(ch))
+            .collect();
         let ds = CsvDataset::from_str_with_classes(&csv_data, &class_names)?;
-        vprintln!("[slm::train] Parsed in {:.1}ms: rows={}, features={}, classes={}",
-            parse_start.elapsed().as_secs_f64() * 1000.0, ds.len(), ds.num_features, ds.num_classes);
+        vprintln!(
+            "[slm::train] Parsed in {:.1}ms: rows={}, features={}, classes={}",
+            parse_start.elapsed().as_secs_f64() * 1000.0,
+            ds.len(),
+            ds.num_features,
+            ds.num_classes
+        );
 
         vprintln!("[slm::train] Converting to tensors...");
         let (x_raw, y_cls, _) = ds.to_tensors()?;
-        vprintln!("[slm::train] Tensor shapes: x={:?}, y_len={}", x_raw.shape, y_cls.len());
+        vprintln!(
+            "[slm::train] Tensor shapes: x={:?}, y_len={}",
+            x_raw.shape,
+            y_cls.len()
+        );
 
         vprintln!("[slm::train] Fitting normalizer (identity for SLM)...");
         let mut norm = Normalizer::fit(&x_raw)?;
-        for m in &mut norm.means { *m = 0.0; }
-        for s in &mut norm.stds { *s = 1.0; }
+        for m in &mut norm.means {
+            *m = 0.0;
+        }
+        for s in &mut norm.stds {
+            *s = 1.0;
+        }
         let x_train = norm.transform(&x_raw)?;
-        vprintln!("[slm::train] Normalizer applied, x_train shape={:?}", x_train.shape);
+        vprintln!(
+            "[slm::train] Normalizer applied, x_train shape={:?}",
+            x_train.shape
+        );
 
         vprintln!("[slm::train] Creating trainable MLP (QAT enabled)...");
         let mut net = Net::mlp(ds.num_features, hidden_size, ds.num_classes, rng);
         net.set_qat(true);
         let opt = Sgd::with_momentum(lr, momentum);
-        vprintln!("[slm::train] Network: {} params, optimizer: lr={}, momentum={}",
-            net.num_params(), lr, momentum);
+        vprintln!(
+            "[slm::train] Network: {} params, optimizer: lr={}, momentum={}",
+            net.num_params(),
+            lr,
+            momentum
+        );
 
-        vprintln!("[slm::train] ── Beginning training loop ({} epochs) ──", epochs);
+        vprintln!(
+            "[slm::train] ── Beginning training loop ({} epochs) ──",
+            epochs
+        );
         let train_start = std::time::Instant::now();
 
         for ep in 1..=epochs {
@@ -270,15 +339,27 @@ impl GenerativeSLM {
                 0.0
             };
 
-            vprintln!("[slm::train] Epoch {}/{}: loss={:.6}, time={:.1}ms, ETA={:.1}s",
-                ep, epochs, loss, ep_ms, eta_secs);
+            vprintln!(
+                "[slm::train] Epoch {}/{}: loss={:.6}, time={:.1}ms, ETA={:.1}s",
+                ep,
+                epochs,
+                loss,
+                ep_ms,
+                eta_secs
+            );
 
             if verbose::is_verbose() {
                 if loss.is_nan() {
-                    crate::verbose::log_line(&format!("[ferrum_core::WARN] ⚠️  NaN loss at epoch {}! Training is diverging!", ep));
+                    crate::verbose::log_line(&format!(
+                        "[ferrum_core::WARN] ⚠️  NaN loss at epoch {}! Training is diverging!",
+                        ep
+                    ));
                 }
                 if loss.is_infinite() {
-                    crate::verbose::log_line(&format!("[ferrum_core::WARN] ⚠️  Infinite loss at epoch {}! Training is diverging!", ep));
+                    crate::verbose::log_line(&format!(
+                        "[ferrum_core::WARN] ⚠️  Infinite loss at epoch {}! Training is diverging!",
+                        ep
+                    ));
                 }
                 if loss > 1e6 {
                     crate::verbose::log_line(&format!("[ferrum_core::WARN] ⚠️  Very large loss ({:.2}) at epoch {} — possible explosion!", loss, ep));
@@ -289,7 +370,10 @@ impl GenerativeSLM {
         }
 
         let total_train_time = train_start.elapsed().as_secs_f64();
-        vprintln!("[slm::train] ── Training complete in {:.2}s ──", total_train_time);
+        vprintln!(
+            "[slm::train] ── Training complete in {:.2}s ──",
+            total_train_time
+        );
 
         vprintln!("[slm::train] Converting to inference model...");
         let model = net.to_inference_task(TaskType::Classification)?;
@@ -308,8 +392,12 @@ impl GenerativeSLM {
             // One-hot MLP path is always character-level (no BPE tokenizer).
             tokenizer_state: String::new(),
         };
-        vprintln!("[slm::train] Metadata: input_dim={}, output_dim={}, vocab={}",
-            meta.input_dim, meta.output_dim, meta.class_names.len());
+        vprintln!(
+            "[slm::train] Metadata: input_dim={}, output_dim={}, vocab={}",
+            meta.input_dim,
+            meta.output_dim,
+            meta.class_names.len()
+        );
 
         Ok(Self { model, norm, meta })
     }
@@ -340,8 +428,18 @@ impl GenerativeSLM {
         rng: &mut Rng,
     ) -> Result<Self> {
         Self::train_transformer_with_callback(
-            corpus, context_len, embed_dim, num_heads, num_blocks, hidden_dim,
-            epochs, lr, batch_size, vocab_size, rng, |_, _| {},
+            corpus,
+            context_len,
+            embed_dim,
+            num_heads,
+            num_blocks,
+            hidden_dim,
+            epochs,
+            lr,
+            batch_size,
+            vocab_size,
+            rng,
+            |_, _| {},
         )
     }
 
@@ -366,8 +464,21 @@ impl GenerativeSLM {
     {
         // `threads = 1` is the serial path, bit-for-bit identical to before.
         Self::train_transformer_inner(
-            corpus, context_len, embed_dim, num_heads, num_blocks, hidden_dim,
-            epochs, lr, batch_size, vocab_size, 0.0, 0.0, 1, rng, progress_callback,
+            corpus,
+            context_len,
+            embed_dim,
+            num_heads,
+            num_blocks,
+            hidden_dim,
+            epochs,
+            lr,
+            batch_size,
+            vocab_size,
+            0.0,
+            0.0,
+            1,
+            rng,
+            progress_callback,
         )
     }
 
@@ -399,10 +510,27 @@ impl GenerativeSLM {
     where
         F: FnMut(usize, f32),
     {
-        let threads = if threads == 0 { crate::parallel::num_threads() } else { threads };
+        let threads = if threads == 0 {
+            crate::parallel::num_threads()
+        } else {
+            threads
+        };
         Self::train_transformer_inner(
-            corpus, context_len, embed_dim, num_heads, num_blocks, hidden_dim,
-            epochs, lr, batch_size, vocab_size, 0.0, 0.0, threads, rng, progress_callback,
+            corpus,
+            context_len,
+            embed_dim,
+            num_heads,
+            num_blocks,
+            hidden_dim,
+            epochs,
+            lr,
+            batch_size,
+            vocab_size,
+            0.0,
+            0.0,
+            threads,
+            rng,
+            progress_callback,
         )
     }
 
@@ -435,7 +563,13 @@ impl GenerativeSLM {
             context_len, embed_dim, num_heads, num_blocks, hidden_dim, threads);
 
         let mut net = TransformerNet::new(
-            model_vocab, context_len, embed_dim, num_heads, hidden_dim, num_blocks, rng,
+            model_vocab,
+            context_len,
+            embed_dim,
+            num_heads,
+            hidden_dim,
+            num_blocks,
+            rng,
         )?;
         net.set_qat(true);
         net.set_weight_decay(weight_decay);
@@ -448,7 +582,12 @@ impl GenerativeSLM {
             let loss = train_transformer_epoch_threaded(
                 &mut net, &tc.tokens, batch_size, &adam, rng, threads,
             )?;
-            vprintln!("[slm::train_transformer] epoch {}/{}: loss={:.6}", ep, epochs, loss);
+            vprintln!(
+                "[slm::train_transformer] epoch {}/{}: loss={:.6}",
+                ep,
+                epochs,
+                loss
+            );
             progress_callback(ep, loss);
         }
 
@@ -476,7 +615,10 @@ impl GenerativeSLM {
             output_dim: model_vocab,
             tokenizer_state: tc.tokenizer_state.clone(),
         };
-        let norm = Normalizer { means: vec![], stds: vec![] };
+        let norm = Normalizer {
+            means: vec![],
+            stds: vec![],
+        };
         Ok(Self { model, norm, meta })
     }
 
@@ -505,8 +647,17 @@ impl GenerativeSLM {
         rng: &mut Rng,
     ) -> Result<Self> {
         Self::train_embedded_with_callback(
-            corpus, context_len, embed_dim, hidden_size, epochs, lr, momentum,
-            batch_size, vocab_size, rng, |_, _| {},
+            corpus,
+            context_len,
+            embed_dim,
+            hidden_size,
+            epochs,
+            lr,
+            momentum,
+            batch_size,
+            vocab_size,
+            rng,
+            |_, _| {},
         )
     }
 
@@ -545,16 +696,30 @@ impl GenerativeSLM {
         let x = Tensor::matrix(n_windows, context_len, x_data)?;
 
         let mut net = Net::embedding_mlp(
-            model_vocab, context_len, embed_dim, hidden_size, model_vocab, rng,
+            model_vocab,
+            context_len,
+            embed_dim,
+            hidden_size,
+            model_vocab,
+            rng,
         );
         net.set_qat(true);
         let opt = Sgd::with_momentum(lr, momentum);
-        vprintln!("[slm::train_embedded] {} params, SGD lr={}, momentum={}",
-            net.num_params(), lr, momentum);
+        vprintln!(
+            "[slm::train_embedded] {} params, SGD lr={}, momentum={}",
+            net.num_params(),
+            lr,
+            momentum
+        );
 
         for ep in 1..=epochs {
             let loss = train_epoch(&mut net, &x, &y, batch_size, &opt, rng)?;
-            vprintln!("[slm::train_embedded] epoch {}/{}: loss={:.6}", ep, epochs, loss);
+            vprintln!(
+                "[slm::train_embedded] epoch {}/{}: loss={:.6}",
+                ep,
+                epochs,
+                loss
+            );
             progress_callback(ep, loss);
         }
 
@@ -573,7 +738,10 @@ impl GenerativeSLM {
             output_dim: model_vocab,
             tokenizer_state: tc.tokenizer_state,
         };
-        let norm = Normalizer { means: vec![], stds: vec![] };
+        let norm = Normalizer {
+            means: vec![],
+            stds: vec![],
+        };
         Ok(Self { model, norm, meta })
     }
 
@@ -581,7 +749,10 @@ impl GenerativeSLM {
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         vprintln!("[slm::GenerativeSLM::to_bytes] Serializing model...");
         let bytes = to_bytes(&self.model, &self.norm, &self.meta)?;
-        vprintln!("[slm::GenerativeSLM::to_bytes] Serialized to {} bytes", bytes.len());
+        vprintln!(
+            "[slm::GenerativeSLM::to_bytes] Serialized to {} bytes",
+            bytes.len()
+        );
         Ok(bytes)
     }
 
@@ -589,7 +760,10 @@ impl GenerativeSLM {
     pub fn to_bytes_quantized(&self) -> Result<Vec<u8>> {
         vprintln!("[slm::GenerativeSLM::to_bytes_quantized] Serializing quantized model...");
         let bytes = crate::loader::to_bytes_quantized(&self.model, &self.norm, &self.meta)?;
-        vprintln!("[slm::GenerativeSLM::to_bytes_quantized] Serialized to {} bytes", bytes.len());
+        vprintln!(
+            "[slm::GenerativeSLM::to_bytes_quantized] Serialized to {} bytes",
+            bytes.len()
+        );
         Ok(bytes)
     }
 
@@ -600,7 +774,10 @@ impl GenerativeSLM {
     pub fn to_bytes_quantized_int4(&self) -> Result<Vec<u8>> {
         vprintln!("[slm::GenerativeSLM::to_bytes_quantized_int4] Serializing int4 model...");
         let bytes = crate::loader::to_bytes_quantized_int4(&self.model, &self.norm, &self.meta)?;
-        vprintln!("[slm::GenerativeSLM::to_bytes_quantized_int4] Serialized to {} bytes", bytes.len());
+        vprintln!(
+            "[slm::GenerativeSLM::to_bytes_quantized_int4] Serialized to {} bytes",
+            bytes.len()
+        );
         Ok(bytes)
     }
 
@@ -648,7 +825,11 @@ impl GenerativeSLM {
     where
         F: FnMut(usize, f32),
     {
-        let threads = if threads == 0 { crate::parallel::num_threads() } else { threads };
+        let threads = if threads == 0 {
+            crate::parallel::num_threads()
+        } else {
+            threads
+        };
         Self::train_transformer_inner(
             corpus,
             cfg.context_len,
@@ -699,7 +880,11 @@ impl GenerativeSLM {
                 "val_fraction must be in the open interval (0, 1)".into(),
             ));
         }
-        let threads = if threads == 0 { crate::parallel::num_threads() } else { threads };
+        let threads = if threads == 0 {
+            crate::parallel::num_threads()
+        } else {
+            threads
+        };
 
         // Split the corpus by character: head = train, tail = validation.
         let chars: Vec<char> = corpus.chars().collect();
@@ -712,11 +897,22 @@ impl GenerativeSLM {
 
         let tc = tokenize_for_lm(&train_text, cfg.context_len, cfg.vocab_size)?;
         let model_vocab = tc.vocab_size;
-        vprintln!("[slm::train_validated] train={} chars, val={} chars, vocab={}, patience={}",
-            train_text.chars().count(), val_text.chars().count(), model_vocab, val.patience);
+        vprintln!(
+            "[slm::train_validated] train={} chars, val={} chars, vocab={}, patience={}",
+            train_text.chars().count(),
+            val_text.chars().count(),
+            model_vocab,
+            val.patience
+        );
 
         let mut net = TransformerNet::new(
-            model_vocab, cfg.context_len, cfg.embed_dim, cfg.num_heads, cfg.hidden_dim, cfg.num_blocks, rng,
+            model_vocab,
+            cfg.context_len,
+            cfg.embed_dim,
+            cfg.num_heads,
+            cfg.hidden_dim,
+            cfg.num_blocks,
+            rng,
         )?;
         net.set_qat(true);
         net.set_weight_decay(cfg.weight_decay);
@@ -729,7 +925,12 @@ impl GenerativeSLM {
 
         for ep in 1..=cfg.epochs {
             let train_loss = train_transformer_epoch_threaded(
-                &mut net, &tc.tokens, cfg.batch_size, &adam, rng, threads,
+                &mut net,
+                &tc.tokens,
+                cfg.batch_size,
+                &adam,
+                rng,
+                threads,
             )?;
 
             // Score the in-progress model on the held-out split.
@@ -773,7 +974,11 @@ impl GenerativeSLM {
             }
         }
         std::fs::write(model_path, &bytes)?;
-        vprintln!("[slm::GenerativeSLM::save] Wrote {} bytes → {}", bytes.len(), model_path);
+        vprintln!(
+            "[slm::GenerativeSLM::save] Wrote {} bytes → {}",
+            bytes.len(),
+            model_path
+        );
         Ok(())
     }
 
@@ -792,7 +997,11 @@ impl GenerativeSLM {
             }
         }
         std::fs::write(model_path, &bytes)?;
-        vprintln!("[slm::GenerativeSLM::save_int4] Wrote {} bytes → {}", bytes.len(), model_path);
+        vprintln!(
+            "[slm::GenerativeSLM::save_int4] Wrote {} bytes → {}",
+            bytes.len(),
+            model_path
+        );
         Ok(())
     }
 
@@ -819,7 +1028,10 @@ impl GenerativeSLM {
         F: FnMut(usize, f32),
     {
         if std::path::Path::new(model_path).exists() {
-            vprintln!("[slm::load_or_train] Found {} — loading instead of retraining", model_path);
+            vprintln!(
+                "[slm::load_or_train] Found {} — loading instead of retraining",
+                model_path
+            );
             return Ok((Self::load(model_path)?, true));
         }
         let slm = Self::train_transformer_config(corpus, cfg, rng, progress_callback)?;
@@ -829,10 +1041,17 @@ impl GenerativeSLM {
 
     /// Load a trained Generative SLM model from self-contained FINF v4 bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        vprintln!("[slm::GenerativeSLM::from_bytes] Deserializing from {} bytes...", bytes.len());
+        vprintln!(
+            "[slm::GenerativeSLM::from_bytes] Deserializing from {} bytes...",
+            bytes.len()
+        );
         let (model, norm, meta) = from_bytes(bytes)?;
-        vprintln!("[slm::GenerativeSLM::from_bytes] Loaded: {} layers, input_dim={}, output_dim={}",
-            model.len(), meta.input_dim, meta.output_dim);
+        vprintln!(
+            "[slm::GenerativeSLM::from_bytes] Loaded: {} layers, input_dim={}, output_dim={}",
+            model.len(),
+            meta.input_dim,
+            meta.output_dim
+        );
         Ok(Self { model, norm, meta })
     }
 
@@ -843,7 +1062,13 @@ impl GenerativeSLM {
     /// `seed` followed by exactly `num_chars` newly generated characters
     /// (fewer only if generation is cut short). Character-level models keep the
     /// original per-character behaviour.
-    pub fn generate(&self, seed: &str, num_chars: usize, temp: f32, rng: &mut Rng) -> Result<String> {
+    pub fn generate(
+        &self,
+        seed: &str,
+        num_chars: usize,
+        temp: f32,
+        rng: &mut Rng,
+    ) -> Result<String> {
         // The full-string API is the streaming API with a no-op sink.
         self.generate_stream(seed, num_chars, temp, rng, |_| {})
     }
@@ -892,7 +1117,13 @@ impl GenerativeSLM {
     where
         F: FnMut(&str),
     {
-        self.generate_stream_with(seed, num_chars, &SamplingParams::with_temperature(temp), rng, on_text)
+        self.generate_stream_with(
+            seed,
+            num_chars,
+            &SamplingParams::with_temperature(temp),
+            rng,
+            on_text,
+        )
     }
 
     /// Streaming generation with full decoding control (I2) — the implementation
@@ -975,18 +1206,35 @@ impl GenerativeSLM {
         // Transformer models take context_len token IDs; the MLP takes a
         // flattened one-hot context of context_len × vocab_size values.
         let is_transformer = self.meta.task == TaskType::TransformerSLM;
-        let context_len = if is_transformer { input_dim } else { input_dim / vocab_size };
+        let context_len = if is_transformer {
+            input_dim
+        } else {
+            input_dim / vocab_size
+        };
 
-        vprintln!("[slm::generate] vocab_size={}, input_dim={}, context_len={}, transformer={}",
-            vocab_size, input_dim, context_len, is_transformer);
+        vprintln!(
+            "[slm::generate] vocab_size={}, input_dim={}, context_len={}, transformer={}",
+            vocab_size,
+            input_dim,
+            context_len,
+            is_transformer
+        );
 
         // Fast path: genuine transformer models generate token-at-a-time with a
         // per-block KV cache (O(context) per token). Models without transformer
         // blocks (the embedded-MLP family) fall through to the full-forward loop.
         if is_transformer {
             if let Some(cached) = CachedTransformer::try_new(&self.model) {
-                return self
-                    .generate_char_cached_stream(seed, num_chars, params, stop, rng, on_text, cached, context_len);
+                return self.generate_char_cached_stream(
+                    seed,
+                    num_chars,
+                    params,
+                    stop,
+                    rng,
+                    on_text,
+                    cached,
+                    context_len,
+                );
             }
         }
 
@@ -997,22 +1245,38 @@ impl GenerativeSLM {
         for step in 0..num_chars {
             let current_len = generated.chars().count();
             if current_len < context_len {
-                vprintln!("[slm::generate] Step {}: generated length {} < context_len {}, stopping", step, current_len, context_len);
+                vprintln!(
+                    "[slm::generate] Step {}: generated length {} < context_len {}, stopping",
+                    step,
+                    current_len,
+                    context_len
+                );
                 break;
             }
-            let context_chars: Vec<char> = generated.chars().skip(current_len - context_len).collect();
+            let context_chars: Vec<char> =
+                generated.chars().skip(current_len - context_len).collect();
 
-            vprintln!("[slm::generate] Step {}: context=\"{}\"",
-                step, context_chars.iter().collect::<String>());
+            vprintln!(
+                "[slm::generate] Step {}: context=\"{}\"",
+                step,
+                context_chars.iter().collect::<String>()
+            );
 
             let char_idx = |ch: char| -> usize {
                 let hex = char_to_hex(ch);
-                self.meta.class_names.iter().position(|s| s == &hex).unwrap_or(0)
+                self.meta
+                    .class_names
+                    .iter()
+                    .position(|s| s == &hex)
+                    .unwrap_or(0)
             };
 
             let next_dist: Vec<f32> = if is_transformer {
                 // Token-ID input → [T, vocab] probabilities; keep the last row.
-                let ids: Vec<f32> = context_chars.iter().map(|&ch| char_idx(ch) as f32).collect();
+                let ids: Vec<f32> = context_chars
+                    .iter()
+                    .map(|&ch| char_idx(ch) as f32)
+                    .collect();
                 let input = Tensor::matrix(1, context_len, ids)?;
                 let out = self.model.forward(&input)?;
                 let (rows, cols) = out.matrix_dims()?;
@@ -1038,8 +1302,13 @@ impl GenerativeSLM {
 
             if verbose::is_verbose() {
                 let (lmin, lmax, lmean) = verbose::stats(&next_dist);
-                vprintln!("[slm::generate] Step {}: logits stats: min={:.4}, max={:.4}, mean={:.4}",
-                    step, lmin, lmax, lmean);
+                vprintln!(
+                    "[slm::generate] Step {}: logits stats: min={:.4}, max={:.4}, mean={:.4}",
+                    step,
+                    lmin,
+                    lmax,
+                    lmean
+                );
             }
 
             // Sample with the full decoding controls; the repetition penalty
@@ -1051,8 +1320,13 @@ impl GenerativeSLM {
             let predicted_hex = &self.meta.class_names[next_idx];
             let next_char = hex_to_char(predicted_hex);
 
-            vprintln!("[slm::generate] Step {}: sampled idx={}, hex=\"{}\", char='{}'",
-                step, next_idx, predicted_hex, next_char);
+            vprintln!(
+                "[slm::generate] Step {}: sampled idx={}, hex=\"{}\", char='{}'",
+                step,
+                next_idx,
+                predicted_hex,
+                next_char
+            );
 
             generated.push(next_char);
             // Stop early at a natural boundary (I3): the newest char may have
@@ -1103,7 +1377,11 @@ impl GenerativeSLM {
 
         let char_idx = |ch: char| -> usize {
             let hex = char_to_hex(ch);
-            self.meta.class_names.iter().position(|s| s == &hex).unwrap_or(0)
+            self.meta
+                .class_names
+                .iter()
+                .position(|s| s == &hex)
+                .unwrap_or(0)
         };
 
         // The window holds the token IDs currently represented in the cache.
@@ -1151,7 +1429,10 @@ impl GenerativeSLM {
             }
         }
 
-        vprintln!("[slm::generate_cached] Generated {} total chars", generated.chars().count());
+        vprintln!(
+            "[slm::generate_cached] Generated {} total chars",
+            generated.chars().count()
+        );
         Ok(generated)
     }
 
@@ -1191,8 +1472,12 @@ impl GenerativeSLM {
         let target_chars = seed_chars + num_chars;
 
         let mut ids: Vec<usize> = tok.encode(seed);
-        vprintln!("[slm::generate_bpe] seed encoded to {} tokens, ctx={}, target_chars={}",
-            ids.len(), context_len, target_chars);
+        vprintln!(
+            "[slm::generate_bpe] seed encoded to {} tokens, ctx={}, target_chars={}",
+            ids.len(),
+            context_len,
+            target_chars
+        );
 
         // Number of continuation characters already streamed (never includes the
         // seed). Emit a delta after every token so output is incremental, capped
@@ -1303,8 +1588,12 @@ impl GenerativeSLM {
         let full = tok.decode(&ids);
         flush(&full, false, budget, &mut on_text);
         let trimmed: String = full.chars().take(seed_chars + budget).collect();
-        vprintln!("[slm::generate_bpe] generated {} tokens → {} chars (trimmed to {})",
-            ids.len(), full.chars().count(), trimmed.chars().count());
+        vprintln!(
+            "[slm::generate_bpe] generated {} tokens → {} chars (trimmed to {})",
+            ids.len(),
+            full.chars().count(),
+            trimmed.chars().count()
+        );
         Ok(trimmed)
     }
 
@@ -1360,7 +1649,10 @@ impl GenerativeSLM {
     /// prediction can be scored and a [`InferError::DimMismatch`] is returned.
     /// Use a corpus the model was **not** trained on to measure generalization.
     pub fn evaluate(&self, text: &str) -> Result<Evaluation> {
-        vprintln!("[slm::evaluate] scoring {} chars of held-out text", text.chars().count());
+        vprintln!(
+            "[slm::evaluate] scoring {} chars of held-out text",
+            text.chars().count()
+        );
 
         if !self.meta.tokenizer_state.is_empty() {
             let tok = ByteBpeTokenizer::from_state(&self.meta.tokenizer_state)?;
@@ -1371,14 +1663,22 @@ impl GenerativeSLM {
         let vocab_size = self.meta.output_dim;
         let input_dim = self.meta.input_dim;
         let is_transformer = self.meta.task == TaskType::TransformerSLM;
-        let context_len = if is_transformer { input_dim } else { input_dim / vocab_size };
+        let context_len = if is_transformer {
+            input_dim
+        } else {
+            input_dim / vocab_size
+        };
 
         let chars: Vec<char> = text.chars().filter(|&c| c != '\r').collect();
         let ids: Vec<usize> = chars
             .iter()
             .map(|&ch| {
                 let hex = char_to_hex(ch);
-                self.meta.class_names.iter().position(|s| s == &hex).unwrap_or(0)
+                self.meta
+                    .class_names
+                    .iter()
+                    .position(|s| s == &hex)
+                    .unwrap_or(0)
             })
             .collect();
 
@@ -1417,7 +1717,12 @@ impl GenerativeSLM {
     /// Accumulate held-out cross-entropy for the one-hot MLP path: the context
     /// is encoded as a flattened `context_len × vocab_size` one-hot row and the
     /// single output row holds the next-token probabilities.
-    fn score_onehot(&self, ids: &[usize], context_len: usize, vocab_size: usize) -> Result<Evaluation> {
+    fn score_onehot(
+        &self,
+        ids: &[usize],
+        context_len: usize,
+        vocab_size: usize,
+    ) -> Result<Evaluation> {
         if ids.len() <= context_len {
             return Err(InferError::DimMismatch(
                 "evaluation text must contain more than context_len tokens".into(),
@@ -1444,7 +1749,11 @@ impl GenerativeSLM {
 
 /// Turn an accumulated negative-log-likelihood sum into an [`Evaluation`].
 fn finish_evaluation(total_nll: f64, count: usize) -> Evaluation {
-    let ce = if count == 0 { 0.0 } else { (total_nll / count as f64) as f32 };
+    let ce = if count == 0 {
+        0.0
+    } else {
+        (total_nll / count as f64) as f32
+    };
     Evaluation {
         num_predictions: count,
         cross_entropy: ce,
@@ -1516,8 +1825,12 @@ fn tokenize_for_lm(corpus: &str, context_len: usize, vocab_size: usize) -> Resul
             "BPE-tokenized corpus must be longer than the context window".into(),
         ));
     }
-    vprintln!("[slm::tokenize_for_lm] BPE: target vocab={}, actual vocab={}, {} tokens",
-        vocab_size, tok.vocab_size(), tokens.len());
+    vprintln!(
+        "[slm::tokenize_for_lm] BPE: target vocab={}, actual vocab={}, {} tokens",
+        vocab_size,
+        tok.vocab_size(),
+        tokens.len()
+    );
     Ok(LmTokens {
         vocab_size: tok.vocab_size(),
         tokens,
@@ -1545,20 +1858,32 @@ pub fn tokenize_corpus(corpus: &str, context_len: usize) -> Result<(Vec<char>, V
 
 /// Builds a clean hex-encoded sliding window CSV dataset for causal character sequence training with one-hot encoded inputs.
 pub fn build_csv_dataset(corpus: &str, context_len: usize) -> Result<String> {
-    vprintln!("[slm::build_csv_dataset] corpus_len={}, context_len={}", corpus.len(), context_len);
+    vprintln!(
+        "[slm::build_csv_dataset] corpus_len={}, context_len={}",
+        corpus.len(),
+        context_len
+    );
 
     let chars: Vec<char> = corpus.chars().filter(|&c| c != '\r').collect();
     if chars.len() < context_len {
-        return Err(InferError::DimMismatch("Corpus length shorter than context window".into()));
+        return Err(InferError::DimMismatch(
+            "Corpus length shorter than context window".into(),
+        ));
     }
-    
+
     let vocab_vec = corpus_vocab(corpus);
     let v_size = vocab_vec.len();
 
-    vprintln!("[slm::build_csv_dataset] chars={}, vocab_size={}, sliding_windows={}",
-        chars.len(), v_size, chars.len().saturating_sub(context_len));
-    vprintln!("[slm::build_csv_dataset] input_dim={} (context_len × vocab_size)",
-        context_len * v_size);
+    vprintln!(
+        "[slm::build_csv_dataset] chars={}, vocab_size={}, sliding_windows={}",
+        chars.len(),
+        v_size,
+        chars.len().saturating_sub(context_len)
+    );
+    vprintln!(
+        "[slm::build_csv_dataset] input_dim={} (context_len × vocab_size)",
+        context_len * v_size
+    );
 
     let mut csv = String::new();
     // Header row
@@ -1575,7 +1900,10 @@ pub fn build_csv_dataset(corpus: &str, context_len: usize) -> Result<String> {
 
     // Sliding windows
     let window_count = chars.len().saturating_sub(context_len);
-    vprintln!("[slm::build_csv_dataset] Writing {} sliding window rows", window_count);
+    vprintln!(
+        "[slm::build_csv_dataset] Writing {} sliding window rows",
+        window_count
+    );
     for i in 0..window_count {
         let context = &chars[i..i + context_len];
         let target = chars[i + context_len];
@@ -1593,8 +1921,11 @@ pub fn build_csv_dataset(corpus: &str, context_len: usize) -> Result<String> {
         csv.push_str(&format!("{}\n", char_to_hex(target)));
     }
 
-    vprintln!("[slm::build_csv_dataset] CSV built: {} bytes, {} total rows",
-        csv.len(), window_count);
+    vprintln!(
+        "[slm::build_csv_dataset] CSV built: {} bytes, {} total rows",
+        csv.len(),
+        window_count
+    );
 
     Ok(csv)
 }
@@ -1639,7 +1970,12 @@ impl<'a> CachedTransformer<'a> {
         if caches.is_empty() {
             None
         } else {
-            Some(Self { model, caches, pos: 0, capacity })
+            Some(Self {
+                model,
+                caches,
+                pos: 0,
+                capacity,
+            })
         }
     }
 
@@ -1719,7 +2055,11 @@ pub(crate) fn sample_with_params(
     if (params.repetition_penalty - 1.0).abs() > f32::EPSILON && params.repetition_penalty > 0.0 {
         for &tok in recent {
             if let Some(l) = work.get_mut(tok) {
-                *l = if *l > 0.0 { *l / params.repetition_penalty } else { *l * params.repetition_penalty };
+                *l = if *l > 0.0 {
+                    *l / params.repetition_penalty
+                } else {
+                    *l * params.repetition_penalty
+                };
             }
         }
     }
@@ -1732,7 +2072,10 @@ pub(crate) fn sample_with_params(
     // the random fallback (equivalent to the previous `!(sum > 1e-10)`).
     if sum.is_nan() || sum <= 1e-10 {
         let fallback = rng.next_u64() as usize % n;
-        vprintln!("[slm::sample] ⚠️  Near-zero softmax sum, random fallback idx={}", fallback);
+        vprintln!(
+            "[slm::sample] ⚠️  Near-zero softmax sum, random fallback idx={}",
+            fallback
+        );
         return fallback;
     }
     for p in &mut probs {
@@ -1872,7 +2215,10 @@ mod tests {
     fn cached_prime_matches_full_forward_bpe_vocab() {
         let mut rng = Rng::new(19);
         // vocab=300 (BPE base 256 + merges), context=6, embed=8, heads=2, 2 blocks
-        let model = TransformerNet::new(300, 6, 8, 2, 16, 2, &mut rng).unwrap().to_inference().unwrap();
+        let model = TransformerNet::new(300, 6, 8, 2, 16, 2, &mut rng)
+            .unwrap()
+            .to_inference()
+            .unwrap();
         let context_len = 6;
         let ids = [257usize, 12, 299, 0, 130, 256]; // spans the byte base and merges
 
@@ -1902,17 +2248,27 @@ mod tests {
             let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let mut p: Vec<f32> = logits.iter().map(|&l| ((l - max) / t).exp()).collect();
             let sum: f32 = p.iter().sum();
-            for v in &mut p { *v /= sum; }
+            for v in &mut p {
+                *v /= sum;
+            }
             let r = rng.next_f32();
             let mut c = 0.0;
-            for (i, &pi) in p.iter().enumerate() { c += pi; if r <= c { return i; } }
+            for (i, &pi) in p.iter().enumerate() {
+                c += pi;
+                if r <= c {
+                    return i;
+                }
+            }
             p.len() - 1
         };
         let params = SamplingParams::with_temperature(temp);
         let mut r1 = Rng::new(42);
         let mut r2 = Rng::new(42);
         for _ in 0..200 {
-            assert_eq!(legacy(&logits, &mut r1), sample_with_params(&logits, &params, &[], &mut r2));
+            assert_eq!(
+                legacy(&logits, &mut r1),
+                sample_with_params(&logits, &params, &[], &mut r2)
+            );
         }
     }
 
@@ -1920,11 +2276,19 @@ mod tests {
     fn top_k_restricts_support_to_k_tokens() {
         // One clearly-dominant pair; top_k=2 must never sample outside them.
         let logits = [5.0f32, 4.0, -2.0, -3.0, -5.0];
-        let params = SamplingParams { temperature: 1.0, top_k: 2, top_p: 1.0, repetition_penalty: 1.0 };
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 2,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+        };
         let mut rng = Rng::new(7);
         for _ in 0..500 {
             let idx = sample_with_params(&logits, &params, &[], &mut rng);
-            assert!(idx == 0 || idx == 1, "top_k=2 sampled out-of-support idx {idx}");
+            assert!(
+                idx == 0 || idx == 1,
+                "top_k=2 sampled out-of-support idx {idx}"
+            );
         }
     }
 
@@ -1932,7 +2296,12 @@ mod tests {
     fn top_p_nucleus_keeps_minimal_high_prob_set() {
         // Token 0 alone exceeds p=0.5, so nucleus sampling must always pick it.
         let logits = [10.0f32, 1.0, 0.5, 0.0];
-        let params = SamplingParams { temperature: 1.0, top_k: 0, top_p: 0.5, repetition_penalty: 1.0 };
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 0.5,
+            repetition_penalty: 1.0,
+        };
         let mut rng = Rng::new(3);
         for _ in 0..500 {
             assert_eq!(sample_with_params(&logits, &params, &[], &mut rng), 0);
@@ -1944,7 +2313,12 @@ mod tests {
         // Token 0 dominates; penalising it (present in `recent`) shifts mass to 1.
         let logits = [4.0f32, 3.0, -2.0];
         let recent = [0usize];
-        let penalised = SamplingParams { temperature: 1.0, top_k: 0, top_p: 1.0, repetition_penalty: 100.0 };
+        let penalised = SamplingParams {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 100.0,
+        };
         let mut rng = Rng::new(11);
         let mut ones = 0;
         for _ in 0..1000 {
@@ -1954,7 +2328,10 @@ mod tests {
         }
         // Without the penalty token 0 wins ~73% of the time; with a heavy penalty
         // token 1 should dominate.
-        assert!(ones > 800, "repetition penalty did not redirect mass: {ones}/1000 → token 1");
+        assert!(
+            ones > 800,
+            "repetition penalty did not redirect mass: {ones}/1000 → token 1"
+        );
     }
 
     #[test]
@@ -1963,11 +2340,31 @@ mod tests {
         // extra knobs and stays deterministic / seed-preserving.
         let mut rng = Rng::new(7);
         let slm = GenerativeSLM::train_transformer(
-            "abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc", 4, 8, 2, 1, 16, 30, 0.01, 8, 0, &mut rng,
-        ).unwrap();
-        let params = SamplingParams { temperature: 0.7, top_k: 3, top_p: 0.9, repetition_penalty: 1.2 };
-        let a = slm.generate_with("abca", 10, &params, &mut Rng::new(99)).unwrap();
-        let b = slm.generate_with("abca", 10, &params, &mut Rng::new(99)).unwrap();
+            "abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc",
+            4,
+            8,
+            2,
+            1,
+            16,
+            30,
+            0.01,
+            8,
+            0,
+            &mut rng,
+        )
+        .unwrap();
+        let params = SamplingParams {
+            temperature: 0.7,
+            top_k: 3,
+            top_p: 0.9,
+            repetition_penalty: 1.2,
+        };
+        let a = slm
+            .generate_with("abca", 10, &params, &mut Rng::new(99))
+            .unwrap();
+        let b = slm
+            .generate_with("abca", 10, &params, &mut Rng::new(99))
+            .unwrap();
         assert_eq!(a, b, "generation must be deterministic for a fixed RNG");
         assert!(a.starts_with("abca"));
         assert_eq!(a.chars().count(), 4 + 10);
@@ -1982,10 +2379,9 @@ mod tests {
         let mut rng = Rng::new(7);
         // dim 32 / 1 block keeps the test cheap while the [32,32] projections are
         // still well above QUANT_MIN_LEN, so int4 packing genuinely engages.
-        let slm = GenerativeSLM::train_transformer(
-            &corpus, 8, 32, 4, 1, 64, 8, 0.01, 8, 0, &mut rng,
-        )
-        .unwrap();
+        let slm =
+            GenerativeSLM::train_transformer(&corpus, 8, 32, 4, 1, 64, 8, 0.01, 8, 0, &mut rng)
+                .unwrap();
 
         let bytes = slm.to_bytes_quantized_int4().unwrap();
         // FINF v5.
@@ -2003,8 +2399,12 @@ mod tests {
         assert_eq!(qw.kind, crate::quant::QKind::Int4);
 
         // Generation runs and is deterministic for a fixed RNG.
-        let a = loaded.generate("the quick", 20, 0.7, &mut Rng::new(99)).unwrap();
-        let b = loaded.generate("the quick", 20, 0.7, &mut Rng::new(99)).unwrap();
+        let a = loaded
+            .generate("the quick", 20, 0.7, &mut Rng::new(99))
+            .unwrap();
+        let b = loaded
+            .generate("the quick", 20, 0.7, &mut Rng::new(99))
+            .unwrap();
         assert_eq!(a, b);
         assert!(a.starts_with("the quick"));
         assert_eq!(a.chars().count(), "the quick".chars().count() + 20);
@@ -2014,9 +2414,17 @@ mod tests {
 
     fn t5_cfg(epochs: usize) -> TransformerConfig {
         TransformerConfig {
-            context_len: 4, embed_dim: 8, num_heads: 2, num_blocks: 1,
-            hidden_dim: 16, epochs, lr: 0.02, batch_size: 8, vocab_size: 0,
-            weight_decay: 0.0, dropout: 0.0,
+            context_len: 4,
+            embed_dim: 8,
+            num_heads: 2,
+            num_blocks: 1,
+            hidden_dim: 16,
+            epochs,
+            lr: 0.02,
+            batch_size: 8,
+            vocab_size: 0,
+            weight_decay: 0.0,
+            dropout: 0.0,
         }
     }
 
@@ -2027,17 +2435,31 @@ mod tests {
     fn validated_training_returns_best_checkpoint() {
         let corpus: String = "abcd".repeat(80); // 320 chars, periodic
         let frac = 0.2f32;
-        let vcfg = ValidationConfig { val_fraction: frac, patience: 0 };
+        let vcfg = ValidationConfig {
+            val_fraction: frac,
+            patience: 0,
+        };
         let mut evals: Vec<(usize, f32, bool)> = Vec::new();
         let mut rng = Rng::new(7);
         let slm = GenerativeSLM::train_transformer_config_validated(
-            &corpus, &t5_cfg(12), 1, &vcfg, &mut rng,
+            &corpus,
+            &t5_cfg(12),
+            1,
+            &vcfg,
+            &mut rng,
             |p| evals.push((p.epoch, p.val.cross_entropy, p.is_best)),
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(evals.len(), 12, "patience=0 runs every epoch");
-        assert!(evals.iter().any(|&(_, _, best)| best), "no epoch was ever best");
-        let min_ce = evals.iter().map(|&(_, ce, _)| ce).fold(f32::INFINITY, f32::min);
+        assert!(
+            evals.iter().any(|&(_, _, best)| best),
+            "no epoch was ever best"
+        );
+        let min_ce = evals
+            .iter()
+            .map(|&(_, ce, _)| ce)
+            .fold(f32::INFINITY, f32::min);
 
         // Reconstruct the validation split exactly as the trainer does.
         let chars: Vec<char> = corpus.chars().collect();
@@ -2047,8 +2469,10 @@ mod tests {
         let val_text: String = chars[total - val_chars..].iter().collect();
 
         let returned_ce = slm.evaluate(&val_text).unwrap().cross_entropy;
-        assert!((returned_ce - min_ce).abs() < 1e-4,
-            "returned model CE {returned_ce} is not the best {min_ce}");
+        assert!(
+            (returned_ce - min_ce).abs() < 1e-4,
+            "returned model CE {returned_ce} is not the best {min_ce}"
+        );
     }
 
     /// Early stopping halts training once validation stops improving for
@@ -2057,23 +2481,46 @@ mod tests {
     #[test]
     fn validated_training_early_stops_on_plateau() {
         let corpus: String = "abcd".repeat(80);
-        let vcfg = ValidationConfig { val_fraction: 0.2, patience: 3 };
+        let vcfg = ValidationConfig {
+            val_fraction: 0.2,
+            patience: 3,
+        };
         let mut count = 0usize;
         let mut rng = Rng::new(3);
         let _ = GenerativeSLM::train_transformer_config_validated(
-            &corpus, &t5_cfg(200), 1, &vcfg, &mut rng, |_| count += 1,
-        ).unwrap();
-        assert!(count < 200, "early stopping never triggered (ran {count} epochs)");
-        assert!(count >= 4, "must run at least patience+1 epochs (ran {count})");
+            &corpus,
+            &t5_cfg(200),
+            1,
+            &vcfg,
+            &mut rng,
+            |_| count += 1,
+        )
+        .unwrap();
+        assert!(
+            count < 200,
+            "early stopping never triggered (ran {count} epochs)"
+        );
+        assert!(
+            count >= 4,
+            "must run at least patience+1 epochs (ran {count})"
+        );
     }
 
     #[test]
     fn validated_training_rejects_bad_fraction() {
         let mut rng = Rng::new(1);
         for f in [0.0f32, 1.0, -0.1, 1.5] {
-            let vcfg = ValidationConfig { val_fraction: f, patience: 0 };
+            let vcfg = ValidationConfig {
+                val_fraction: f,
+                patience: 0,
+            };
             let r = GenerativeSLM::train_transformer_config_validated(
-                "abcdabcdabcdabcd", &t5_cfg(2), 1, &vcfg, &mut rng, |_| {},
+                "abcdabcdabcdabcd",
+                &t5_cfg(2),
+                1,
+                &vcfg,
+                &mut rng,
+                |_| {},
             );
             assert!(r.is_err(), "val_fraction {f} should be rejected");
         }
@@ -2085,23 +2532,31 @@ mod tests {
     fn generate_until_stops_at_boundary_char_level() {
         let corpus: String = "abc".repeat(40);
         let mut rng = Rng::new(7);
-        let slm = GenerativeSLM::train_transformer(
-            &corpus, 4, 8, 2, 1, 16, 40, 0.01, 8, 0, &mut rng,
-        ).unwrap();
+        let slm =
+            GenerativeSLM::train_transformer(&corpus, 4, 8, 2, 1, 16, 40, 0.01, 8, 0, &mut rng)
+                .unwrap();
         let params = SamplingParams::with_temperature(0.1); // near-greedy
 
-        let out = slm.generate_until("abca", 30, "c", &params, &mut Rng::new(2)).unwrap();
+        let out = slm
+            .generate_until("abca", 30, "c", &params, &mut Rng::new(2))
+            .unwrap();
         assert!(out.starts_with("abca"));
         assert!(out.ends_with('c'), "should stop right after a 'c': {out:?}");
         assert!(out.chars().count() < 4 + 30, "did not stop early: {out:?}");
 
         // Deterministic for a fixed RNG.
-        let a = slm.generate_until("abca", 30, "c", &params, &mut Rng::new(5)).unwrap();
-        let b = slm.generate_until("abca", 30, "c", &params, &mut Rng::new(5)).unwrap();
+        let a = slm
+            .generate_until("abca", 30, "c", &params, &mut Rng::new(5))
+            .unwrap();
+        let b = slm
+            .generate_until("abca", 30, "c", &params, &mut Rng::new(5))
+            .unwrap();
         assert_eq!(a, b);
 
         // Empty stop disables early stopping → exactly the full budget.
-        let full = slm.generate_until("abca", 12, "", &params, &mut Rng::new(5)).unwrap();
+        let full = slm
+            .generate_until("abca", 12, "", &params, &mut Rng::new(5))
+            .unwrap();
         assert_eq!(full.chars().count(), 4 + 12);
     }
 
@@ -2109,17 +2564,22 @@ mod tests {
     fn generate_stream_until_fragments_match_continuation() {
         let corpus: String = "abc".repeat(40);
         let mut rng = Rng::new(7);
-        let slm = GenerativeSLM::train_transformer(
-            &corpus, 4, 8, 2, 1, 16, 40, 0.01, 8, 0, &mut rng,
-        ).unwrap();
+        let slm =
+            GenerativeSLM::train_transformer(&corpus, 4, 8, 2, 1, 16, 40, 0.01, 8, 0, &mut rng)
+                .unwrap();
         let params = SamplingParams::with_temperature(0.1);
 
         let mut streamed = String::new();
         let full = slm
-            .generate_stream_until("abca", 30, "c", &params, &mut Rng::new(9), |f| streamed.push_str(f))
+            .generate_stream_until("abca", 30, "c", &params, &mut Rng::new(9), |f| {
+                streamed.push_str(f)
+            })
             .unwrap();
         let cont: String = full.chars().skip("abca".chars().count()).collect();
-        assert_eq!(streamed, cont, "streamed fragments must equal the stopped continuation");
+        assert_eq!(
+            streamed, cont,
+            "streamed fragments must equal the stopped continuation"
+        );
         assert!(full.ends_with('c'));
     }
 
@@ -2128,22 +2588,31 @@ mod tests {
         let corpus = "the quick brown fox jumps over the lazy dog. the quick brown fox \
             jumps over the lazy dog. the quick brown fox jumps over the lazy dog. ";
         let mut rng = Rng::new(11);
-        let slm = GenerativeSLM::train_transformer(
-            corpus, 8, 16, 2, 1, 32, 30, 0.01, 8, 300, &mut rng,
-        ).unwrap();
+        let slm =
+            GenerativeSLM::train_transformer(corpus, 8, 16, 2, 1, 32, 30, 0.01, 8, 300, &mut rng)
+                .unwrap();
         let params = SamplingParams::with_temperature(0.5);
         let seed = "the quick";
 
-        let out = slm.generate_until(seed, 40, " ", &params, &mut Rng::new(3)).unwrap();
+        let out = slm
+            .generate_until(seed, 40, " ", &params, &mut Rng::new(3))
+            .unwrap();
         assert!(out.starts_with(seed));
         let n = out.chars().count();
         // If it stopped before the budget, it must have stopped right after a space.
         if n < seed.chars().count() + 40 {
-            assert!(out.ends_with(' '), "stopped but not at the boundary: {out:?}");
+            assert!(
+                out.ends_with(' '),
+                "stopped but not at the boundary: {out:?}"
+            );
         }
         // Deterministic.
-        let a = slm.generate_until(seed, 40, " ", &params, &mut Rng::new(8)).unwrap();
-        let b = slm.generate_until(seed, 40, " ", &params, &mut Rng::new(8)).unwrap();
+        let a = slm
+            .generate_until(seed, 40, " ", &params, &mut Rng::new(8))
+            .unwrap();
+        let b = slm
+            .generate_until(seed, 40, " ", &params, &mut Rng::new(8))
+            .unwrap();
         assert_eq!(a, b);
     }
 
@@ -2154,7 +2623,9 @@ mod tests {
     fn try_new_declines_non_transformer_models() {
         let mut rng = Rng::new(1);
         let net = Net::embedding_mlp(6, 4, 8, 16, 6, &mut rng);
-        let model = net.to_inference_task(crate::csv::TaskType::TransformerSLM).unwrap();
+        let model = net
+            .to_inference_task(crate::csv::TaskType::TransformerSLM)
+            .unwrap();
         assert!(CachedTransformer::try_new(&model).is_none());
     }
 }

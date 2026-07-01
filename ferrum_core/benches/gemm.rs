@@ -144,7 +144,9 @@ fn main() {
     println!();
 
     // ── 2. Decode GEMV: m=1 ⇒ serial, bandwidth-bound ────────────────────────
-    println!("== Decode GEMV   c[1×n] = a[1×k]·W[k×n]   (m=1 ⇒ SERIAL on one core; bandwidth-bound) ==");
+    println!(
+        "== Decode GEMV   c[1×n] = a[1×k]·W[k×n]   (m=1 ⇒ SERIAL on one core; bandwidth-bound) =="
+    );
     let shapes = [
         (2048usize, 2048usize, "attn q/k/v/o proj"),
         (2048, 8192, "ffn up"),
@@ -227,24 +229,42 @@ fn main() {
             let (best, iters) = time_best(budget, || {
                 black_box(ops::qlinear(black_box(&a), black_box(&qw), &bias).unwrap());
             });
-            qgemv_row(label, if kind == QKind::Int8 { "int8" } else { "int4" }, packed, best, iters);
+            qgemv_row(
+                label,
+                if kind == QKind::Int8 { "int8" } else { "int4" },
+                packed,
+                best,
+                iters,
+            );
         }
     }
     println!();
 
     // Synthesized int4 ~1B decode step — directly comparable to §3's f32 figure.
     println!("== Synthesized int4 decode step   d_model={D_MODEL}, d_ff={D_FF}, layers={LAYERS}, vocab={VOCAB} ==");
-    let q_proj = Arc::new(QWeight::from_f32(&w_proj.data, D_MODEL, D_MODEL, QKind::Int4));
+    let q_proj = Arc::new(QWeight::from_f32(
+        &w_proj.data,
+        D_MODEL,
+        D_MODEL,
+        QKind::Int4,
+    ));
     let q_up = Arc::new(QWeight::from_f32(&w_up.data, D_MODEL, D_FF, QKind::Int4));
     let q_down = Arc::new(QWeight::from_f32(&w_down.data, D_FF, D_MODEL, QKind::Int4));
-    let q_logits = Arc::new(QWeight::from_f32(&w_logits.data, D_MODEL, VOCAB, QKind::Int4));
+    let q_logits = Arc::new(QWeight::from_f32(
+        &w_logits.data,
+        D_MODEL,
+        VOCAB,
+        QKind::Int4,
+    ));
     let b_dmodel = vec![0.0f32; D_MODEL];
     let b_dff = vec![0.0f32; D_FF];
     let b_vocab = vec![0.0f32; VOCAB];
     let (best, iters) = time_best(Duration::from_millis(2000), || {
         for _ in 0..LAYERS {
             for _ in 0..4 {
-                black_box(ops::qlinear(black_box(&a_dmodel), black_box(&q_proj), &b_dmodel).unwrap());
+                black_box(
+                    ops::qlinear(black_box(&a_dmodel), black_box(&q_proj), &b_dmodel).unwrap(),
+                );
             }
             black_box(ops::qlinear(black_box(&a_dmodel), black_box(&q_up), &b_dff).unwrap());
             black_box(ops::qlinear(black_box(&a_dff), black_box(&q_down), &b_dmodel).unwrap());

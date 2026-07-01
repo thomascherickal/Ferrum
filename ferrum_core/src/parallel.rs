@@ -28,9 +28,9 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::{channel, Sender};
-use std::sync::OnceLock;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 static NUM_THREADS: OnceLock<usize> = OnceLock::new();
 
@@ -253,9 +253,7 @@ where
 /// Whether a 1-D output of `total` elements with `per_element` scalar work each
 /// is worth splitting across the pool (the GEMV/decode gate).
 pub fn should_parallelize_1d(total: usize, per_element: usize) -> bool {
-    total >= 2
-        && total.saturating_mul(per_element) >= PARALLEL_THRESHOLD
-        && num_threads() > 1
+    total >= 2 && total.saturating_mul(per_element) >= PARALLEL_THRESHOLD && num_threads() > 1
 }
 
 #[cfg(test)]
@@ -288,7 +286,10 @@ mod tests {
 
     #[test]
     fn should_parallelize_gates_on_size() {
-        assert!(!should_parallelize(1, usize::MAX), "single row stays serial");
+        assert!(
+            !should_parallelize(1, usize::MAX),
+            "single row stays serial"
+        );
         assert!(!should_parallelize(1000, 0), "trivial work stays serial");
         if num_threads() > 1 {
             assert!(should_parallelize(1000, PARALLEL_THRESHOLD));
@@ -323,7 +324,10 @@ mod tests {
 
     #[test]
     fn should_parallelize_1d_gates() {
-        assert!(!should_parallelize_1d(1, usize::MAX), "single element stays serial");
+        assert!(
+            !should_parallelize_1d(1, usize::MAX),
+            "single element stays serial"
+        );
         assert!(!should_parallelize_1d(1000, 0), "no work stays serial");
         if num_threads() > 1 {
             assert!(should_parallelize_1d(PARALLEL_THRESHOLD, 1));

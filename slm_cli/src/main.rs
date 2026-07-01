@@ -64,14 +64,32 @@ impl Args {
         let mut verbose = false;
         // Flags that take a value rather than acting as a boolean switch.
         const VALUE_FLAGS: &[&str] = &[
-            "context", "embed", "heads", "blocks", "hidden", "epochs",
-            "lr", "batch", "seed", "chars", "temp", "gen-seed", "vocab", "threads",
+            "context",
+            "embed",
+            "heads",
+            "blocks",
+            "hidden",
+            "epochs",
+            "lr",
+            "batch",
+            "seed",
+            "chars",
+            "temp",
+            "gen-seed",
+            "vocab",
+            "threads",
             // AdamW / regularization (exposing the engine's existing knobs).
-            "weight_decay", "dropout",
+            "weight_decay",
+            "dropout",
             // run-gguf options.
-            "quant", "max", "ids",
+            "quant",
+            "max",
+            "ids",
             // finetune-gguf options.
-            "seq", "warmup", "clip", "resume",
+            "seq",
+            "warmup",
+            "clip",
+            "resume",
         ];
         let mut i = 0;
         while i < raw.len() {
@@ -92,11 +110,19 @@ impl Args {
             }
             i += 1;
         }
-        Args { positional, verbose, flags, bools }
+        Args {
+            positional,
+            verbose,
+            flags,
+            bools,
+        }
     }
 
     fn get<T: std::str::FromStr>(&self, key: &str, default: T) -> T {
-        self.flags.get(key).and_then(|s| s.parse().ok()).unwrap_or(default)
+        self.flags
+            .get(key)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default)
     }
     fn has(&self, key: &str) -> bool {
         self.bools.contains(key)
@@ -212,8 +238,8 @@ fn print_usage() {
 }
 
 fn read_corpus(path: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let corpus = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read corpus {path}: {e}"))?;
+    let corpus =
+        std::fs::read_to_string(path).map_err(|e| format!("cannot read corpus {path}: {e}"))?;
     if corpus.trim().is_empty() {
         return Err(format!("corpus {path} is empty").into());
     }
@@ -243,11 +269,21 @@ fn train_and_save(
     } else {
         format!("byte-level BPE (vocab {})", cfg.vocab_size)
     };
-    println!("  Context : {}   Embed: {}   Hidden: {}", cfg.context_len, cfg.embed_dim, cfg.hidden_dim);
+    println!(
+        "  Context : {}   Embed: {}   Hidden: {}",
+        cfg.context_len, cfg.embed_dim, cfg.hidden_dim
+    );
     println!("  Heads   : {}   Blocks: {}", cfg.num_heads, cfg.num_blocks);
     println!("  Tokenizer: {tok_desc}");
-    println!("  Epochs  : {}   LR: {}   Batch: {}   Seed: {seed}", cfg.epochs, cfg.lr, cfg.batch_size);
-    let resolved_threads = if threads == 0 { ferrum_core::num_threads() } else { threads };
+    println!(
+        "  Epochs  : {}   LR: {}   Batch: {}   Seed: {seed}",
+        cfg.epochs, cfg.lr, cfg.batch_size
+    );
+    let resolved_threads = if threads == 0 {
+        ferrum_core::num_threads()
+    } else {
+        threads
+    };
     println!("  Threads : {resolved_threads} (data-parallel minibatch training)");
     println!("╚══════════════════════════════════════════════════════════╝\n");
 
@@ -260,16 +296,19 @@ fn train_and_save(
         }
     };
 
-    let slm = GenerativeSLM::train_transformer_config_threaded(corpus, &cfg, threads, &mut rng, progress)?;
+    let slm = GenerativeSLM::train_transformer_config_threaded(
+        corpus, &cfg, threads, &mut rng, progress,
+    )?;
 
     println!("\nTrained in {:.2}s.", t0.elapsed().as_secs_f32());
-    let vocab_kind = if slm.meta.tokenizer_state.is_empty() { "chars" } else { "BPE tokens" };
+    let vocab_kind = if slm.meta.tokenizer_state.is_empty() {
+        "chars"
+    } else {
+        "BPE tokens"
+    };
     println!(
         "  vocab = {} {}   context = {}   output_dim = {}",
-        slm.meta.output_dim,
-        vocab_kind,
-        slm.meta.input_dim,
-        slm.meta.output_dim
+        slm.meta.output_dim, vocab_kind, slm.meta.input_dim, slm.meta.output_dim
     );
 
     slm.save(model_path)?;
@@ -282,12 +321,13 @@ fn train_and_save(
     Ok(reloaded)
 }
 
-fn print_sample(
-    slm: &GenerativeSLM,
-    corpus: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn print_sample(slm: &GenerativeSLM, corpus: &str) -> Result<(), Box<dyn std::error::Error>> {
     let context_len = slm.meta.input_dim;
-    let seed_text: String = corpus.chars().filter(|&c| c != '\r').take(context_len).collect();
+    let seed_text: String = corpus
+        .chars()
+        .filter(|&c| c != '\r')
+        .take(context_len)
+        .collect();
     let mut g_rng = Rng::new(time_seed());
     let sample = slm.generate(&seed_text, 120, 0.7, &mut g_rng)?;
     println!("\n── sample ──\n{sample}\n────────────");
@@ -423,7 +463,10 @@ fn cmd_eval(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let eval = slm.evaluate(&text)?;
     println!("Model        : {model_path}");
-    println!("Held-out text: {text_path}  ({} chars)", text.chars().count());
+    println!(
+        "Held-out text: {text_path}  ({} chars)",
+        text.chars().count()
+    );
     println!("Predictions  : {}", eval.num_predictions);
     println!("Cross-entropy: {:.4} nats/token", eval.cross_entropy);
     println!("Bits/token   : {:.4}", eval.bits_per_token);
@@ -436,8 +479,8 @@ fn cmd_info(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         return Err("usage: train_transformer info <model.bin>".into());
     }
     let model_path = &args.positional[0];
-    let bytes = std::fs::read(model_path)
-        .map_err(|e| format!("cannot read model {model_path}: {e}"))?;
+    let bytes =
+        std::fs::read(model_path).map_err(|e| format!("cannot read model {model_path}: {e}"))?;
     let version = if bytes.len() >= 8 {
         u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]])
     } else {
@@ -448,17 +491,31 @@ fn cmd_info(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     println!("Model     : {model_path}  ({} bytes)", bytes.len());
     println!(
         "Format    : FINF v{version}{}",
-        if version == 5 { " (int8-quantized)" } else { " (f32)" }
+        if version == 5 {
+            " (int8-quantized)"
+        } else {
+            " (f32)"
+        }
     );
     println!("Name      : {}", m.dataset_name);
     println!("Task      : {:?}", m.task);
     println!("Input dim : {}", m.input_dim);
     println!("Output dim: {}", m.output_dim);
     if m.tokenizer_state.is_empty() {
-        println!("Tokenizer : character-level ({} chars)", m.class_names.len());
+        println!(
+            "Tokenizer : character-level ({} chars)",
+            m.class_names.len()
+        );
     } else {
-        let merges = m.tokenizer_state.split(';').filter(|s| !s.is_empty()).count();
-        println!("Tokenizer : byte-level BPE ({} tokens, {} merges)", m.output_dim, merges);
+        let merges = m
+            .tokenizer_state
+            .split(';')
+            .filter(|s| !s.is_empty())
+            .count();
+        println!(
+            "Tokenizer : byte-level BPE ({} tokens, {} merges)",
+            m.output_dim, merges
+        );
     }
     println!("Layers    : {}", slm.model.len());
     Ok(())
@@ -518,7 +575,11 @@ fn cmd_run_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // A fine-tune checkpoint holds f32 weights, so applying one forces an f32
     // load regardless of --quant.
     let resume = args.flags.get("resume").cloned();
-    let quant = args.flags.get("quant").map(String::as_str).unwrap_or("int4");
+    let quant = args
+        .flags
+        .get("quant")
+        .map(String::as_str)
+        .unwrap_or("int4");
     let prec = if resume.is_some() {
         if quant != "int4" && quant != "f32" && quant != "none" {
             eprintln!("note: --resume applies f32 fine-tuned weights; ignoring --quant {quant}");
@@ -536,11 +597,18 @@ fn cmd_run_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // Streamed open: parse the header without reading the whole file.
     println!("Opening {path} (streamed)…");
     let g = Gguf::open(path).map_err(|e| format!("cannot open GGUF {path}: {e}"))?;
-    println!("  GGUF v{}   architecture = {}", g.version, g.architecture().unwrap_or("?"));
+    println!(
+        "  GGUF v{}   architecture = {}",
+        g.version,
+        g.architecture().unwrap_or("?")
+    );
 
     // Memory guard before the (potentially multi-GB) load.
     let est = estimate_resident_bytes(&g, prec);
-    println!("  estimated resident ≈ {:.2} GB  (--quant {quant})", est as f64 / 1e9);
+    println!(
+        "  estimated resident ≈ {:.2} GB  (--quant {quant})",
+        est as f64 / 1e9
+    );
     if let Some(avail) = available_memory_bytes() {
         println!("  available memory   ≈ {:.2} GB", avail as f64 / 1e9);
         if (est as f64) > 0.9 * avail as f64 && !args.has("force") {
@@ -563,7 +631,9 @@ fn cmd_run_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Loading weights…");
     let t0 = Instant::now();
-    let mut model = g.load_llama_prec(prec).map_err(|e| format!("cannot load model: {e}"))?;
+    let mut model = g
+        .load_llama_prec(prec)
+        .map_err(|e| format!("cannot load model: {e}"))?;
     println!(
         "  loaded in {:.2}s: {} layers, dim {}, vocab {}, ctx {}",
         t0.elapsed().as_secs_f32(),
@@ -576,7 +646,8 @@ fn cmd_run_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // Overlay fine-tuned weights from a checkpoint, if requested.
     if let Some(ckpt) = &resume {
         use ferrum_core::LlamaTrainer;
-        let bytes = std::fs::read(ckpt).map_err(|e| format!("cannot read checkpoint {ckpt}: {e}"))?;
+        let bytes =
+            std::fs::read(ckpt).map_err(|e| format!("cannot read checkpoint {ckpt}: {e}"))?;
         let mut tr = LlamaTrainer::new(model).map_err(|e| format!("cannot wrap model: {e}"))?;
         tr.load_checkpoint_into(&bytes)
             .map_err(|e| format!("cannot apply checkpoint {ckpt}: {e}"))?;
@@ -586,7 +657,9 @@ fn cmd_run_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // Build the prompt token IDs (explicit --ids win; else encode the text).
     let prompt_ids: Vec<usize> = if let Some(ids) = args.flags.get("ids") {
-        ids.split_whitespace().filter_map(|s| s.parse().ok()).collect()
+        ids.split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect()
     } else if let Some(t) = &tok {
         let mut ids = Vec::new();
         if let Some(bos) = t.bos() {
@@ -595,7 +668,9 @@ fn cmd_run_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         ids.extend(t.encode(&prompt_text));
         ids
     } else {
-        return Err("this GGUF has no tokenizer; pass --ids \"<space-separated token ids>\"".into());
+        return Err(
+            "this GGUF has no tokenizer; pass --ids \"<space-separated token ids>\"".into(),
+        );
     };
     if prompt_ids.is_empty() {
         return Err("empty prompt — provide text (with a tokenizer) or --ids".into());
@@ -608,7 +683,10 @@ fn cmd_run_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let params = SamplingParams::with_temperature(temp);
     let mut rng = Rng::new(gen_seed);
 
-    println!("\nPrefilling {} prompt tokens, generating up to {max_new} (temp {temp})…", prompt_ids.len());
+    println!(
+        "\nPrefilling {} prompt tokens, generating up to {max_new} (temp {temp})…",
+        prompt_ids.len()
+    );
     let t1 = Instant::now();
     let out_ids = model.generate(&prompt_ids, max_new, &params, eos, &mut rng)?;
     let dt = t1.elapsed().as_secs_f32();
@@ -639,16 +717,16 @@ fn cmd_run_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 /// checkpoint that `run-gguf --resume` (or a later `finetune-gguf --resume`) can
 /// apply back over the base GGUF.
 fn cmd_finetune_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    use ferrum_core::{
-        Adam, Gguf, GgufTokenizer, LlamaTrainer, LrSchedule, Rng, SamplingParams,
-    };
+    use ferrum_core::{Adam, Gguf, GgufTokenizer, LlamaTrainer, LrSchedule, Rng, SamplingParams};
 
     if args.positional.len() < 3 {
-        return Err("usage: train_transformer finetune-gguf <model.gguf> <corpus.txt> <out.flck> \
+        return Err(
+            "usage: train_transformer finetune-gguf <model.gguf> <corpus.txt> <out.flck> \
                     [--epochs N] [--lr F] [--batch N] [--seq N] [--warmup N] [--clip F] \
                     [--weight_decay F] [--dropout F] [--threads N] [--qat] [--seed N] \
                     [--resume ckpt.flck] [--sample]"
-            .into());
+                .into(),
+        );
     }
     let gguf_path = &args.positional[0];
     let corpus_path = &args.positional[1];
@@ -657,14 +735,21 @@ fn cmd_finetune_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Open + f32-load the base model (training needs full-precision masters).
     println!("Opening {gguf_path} (streamed)…");
     let g = Gguf::open(gguf_path).map_err(|e| format!("cannot open GGUF {gguf_path}: {e}"))?;
-    println!("  GGUF v{}   architecture = {}", g.version, g.architecture().unwrap_or("?"));
+    println!(
+        "  GGUF v{}   architecture = {}",
+        g.version,
+        g.architecture().unwrap_or("?")
+    );
     let est = estimate_resident_bytes(&g, None); // f32
     println!("  estimated resident (f32) ≈ {:.2} GB", est as f64 / 1e9);
     if let Some(avail) = available_memory_bytes() {
         println!("  available memory         ≈ {:.2} GB", avail as f64 / 1e9);
         // Training also needs grads + 2 Adam moments (≈4× the f32 weights again).
         let train_est = est.saturating_mul(4);
-        println!("  estimated training RAM   ≈ {:.2} GB (weights + grad + Adam m/v)", train_est as f64 / 1e9);
+        println!(
+            "  estimated training RAM   ≈ {:.2} GB (weights + grad + Adam m/v)",
+            train_est as f64 / 1e9
+        );
         if (train_est as f64) > 0.9 * avail as f64 && !args.has("force") {
             return Err(format!(
                 "estimated training memory ({:.2} GB) exceeds 90% of available ({:.2} GB) — \
@@ -678,15 +763,24 @@ fn cmd_finetune_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let tok = GgufTokenizer::from_gguf(&g)
         .map_err(|_| "this GGUF has no tokenizer; text fine-tuning needs one")?;
-    println!("  tokenizer = {:?}  (vocab {})", tok.model(), tok.vocab_size());
+    println!(
+        "  tokenizer = {:?}  (vocab {})",
+        tok.model(),
+        tok.vocab_size()
+    );
 
     println!("Loading weights (f32)…");
     let t0 = Instant::now();
-    let model = g.load_llama_prec(None).map_err(|e| format!("cannot load model: {e}"))?;
+    let model = g
+        .load_llama_prec(None)
+        .map_err(|e| format!("cannot load model: {e}"))?;
     println!(
         "  loaded in {:.2}s: {} layers, dim {}, vocab {}, ctx {}",
         t0.elapsed().as_secs_f32(),
-        model.cfg.n_layers, model.cfg.model_dim, model.cfg.vocab_size, model.cfg.context_len,
+        model.cfg.n_layers,
+        model.cfg.model_dim,
+        model.cfg.vocab_size,
+        model.cfg.context_len,
     );
 
     // 2. Read + tokenize the corpus.
@@ -711,7 +805,11 @@ fn cmd_finetune_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let qat = args.has("qat");
     let seed: u64 = args.get("seed", 1337);
     let threads_req: usize = args.get("threads", 0);
-    let threads = if threads_req == 0 { ferrum_core::num_threads() } else { threads_req };
+    let threads = if threads_req == 0 {
+        ferrum_core::num_threads()
+    } else {
+        threads_req
+    };
 
     if tokens.len() < seq {
         return Err(format!(
@@ -734,8 +832,10 @@ fn cmd_finetune_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // 5. Resume optimizer state if requested (continues where a prior run stopped).
     let mut rng = if let Some(ckpt) = args.flags.get("resume") {
-        let bytes = std::fs::read(ckpt).map_err(|e| format!("cannot read checkpoint {ckpt}: {e}"))?;
-        let r = tr.load_checkpoint_into(&bytes)
+        let bytes =
+            std::fs::read(ckpt).map_err(|e| format!("cannot read checkpoint {ckpt}: {e}"))?;
+        let r = tr
+            .load_checkpoint_into(&bytes)
             .map_err(|e| format!("cannot resume from {ckpt}: {e}"))?;
         println!("  resumed from {ckpt} at step {}", tr.step_count());
         r
@@ -747,13 +847,21 @@ fn cmd_finetune_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // resumed run does not start past total_steps — which would pin the LR at 0.
     if warmup > 0 {
         let total = tr.step_count() + steps_per_epoch * epochs as u64;
-        tr.set_lr_schedule(Some(LrSchedule::warmup_cosine(lr, warmup, total.max(warmup + 1))));
+        tr.set_lr_schedule(Some(LrSchedule::warmup_cosine(
+            lr,
+            warmup,
+            total.max(warmup + 1),
+        )));
     }
 
     println!(
         "\nFine-tuning: {epochs} epochs · seq {seq} · batch {batch} · lr {lr} · \
          wd {weight_decay} · dropout {dropout} · clip {clip} · {}{} · {threads} threads",
-        if warmup > 0 { format!("warmup {warmup} ") } else { String::new() },
+        if warmup > 0 {
+            format!("warmup {warmup} ")
+        } else {
+            String::new()
+        },
         if qat { "QAT int8" } else { "f32" },
     );
     println!("  {num_windows} windows · {steps_per_epoch} steps/epoch");
@@ -770,7 +878,9 @@ fn cmd_finetune_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             loss.exp(),
             secs,
             toks / secs.max(1e-6),
-            tr.lr_schedule().map(|s| s.lr_at(tr.step_count())).unwrap_or(lr),
+            tr.lr_schedule()
+                .map(|s| s.lr_at(tr.step_count()))
+                .unwrap_or(lr),
         );
     }
 
@@ -786,11 +896,17 @@ fn cmd_finetune_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // 8. Optional sample generation from the fine-tuned model.
     if args.has("sample") {
         let prompt = tok.bos().into_iter().collect::<Vec<_>>();
-        let prompt = if prompt.is_empty() { vec![tokens[0]] } else { prompt };
+        let prompt = if prompt.is_empty() {
+            vec![tokens[0]]
+        } else {
+            prompt
+        };
         let params = SamplingParams::with_temperature(args.get("temp", 0.8));
         let eos = tok.eos();
         let mut grng = Rng::new(time_seed());
-        let out = tr.model.generate(&prompt, args.get("max", 48), &params, eos, &mut grng)?;
+        let out = tr
+            .model
+            .generate(&prompt, args.get("max", 48), &params, eos, &mut grng)?;
         println!("\n── sample ──\n{}\n────────────", tok.decode(&out));
     }
     Ok(())

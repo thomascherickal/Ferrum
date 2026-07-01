@@ -7,11 +7,7 @@ use ferrum_core::{
 };
 
 fn make_test_bundle() -> (Sequential, Normalizer, ModelMetadata) {
-    let l1 = Linear::new(
-        2, 4,
-        vec![0.1; 8],
-        vec![0.0; 4],
-    ).unwrap();
+    let l1 = Linear::new(2, 4, vec![0.1; 8], vec![0.0; 4]).unwrap();
     let model = Sequential::new()
         .with(Box::new(l1))
         .with(Box::new(ActivationLayer::new(Activation::ReLU)));

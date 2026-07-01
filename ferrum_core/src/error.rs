@@ -52,7 +52,10 @@ mod tests {
 
     #[test]
     fn display_shape_mismatch() {
-        let e = InferError::ShapeMismatch { expected: 4, got: 3 };
+        let e = InferError::ShapeMismatch {
+            expected: 4,
+            got: 3,
+        };
         let s = e.to_string();
         assert!(s.contains("expected 4") && s.contains("got 3"));
     }
@@ -117,4 +120,3 @@ mod tests {
         assert_eq!(a, b);
     }
 }
-

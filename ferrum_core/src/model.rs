@@ -34,7 +34,11 @@ impl Sequential {
     }
 
     pub fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        vprintln!("[model::Sequential::forward] input shape={:?}, {} layers", input.shape, self.layers.len());
+        vprintln!(
+            "[model::Sequential::forward] input shape={:?}, {} layers",
+            input.shape,
+            self.layers.len()
+        );
         let mut cur = input.clone();
         for (i, l) in self.layers.iter().enumerate() {
             cur = l.forward(&cur)?;
@@ -42,7 +46,10 @@ impl Sequential {
                 let (vmin, vmax, vmean) = verbose::stats(&cur.data);
                 vprintln!("[model::Sequential::forward]   [{}/{}] {} → shape={:?}, stats: min={:.6}, max={:.6}, mean={:.6}",
                     i+1, self.layers.len(), l.name(), cur.shape, vmin, vmax, vmean);
-                verbose::check_nan_inf(&cur.data, &format!("Sequential::forward layer[{}] {}", i, l.name()));
+                verbose::check_nan_inf(
+                    &cur.data,
+                    &format!("Sequential::forward layer[{}] {}", i, l.name()),
+                );
             }
         }
         Ok(cur)

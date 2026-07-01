@@ -48,7 +48,13 @@ impl Linear {
                 bias.len()
             )));
         }
-        vprintln!("[layer::Linear::new] in={}, out={}, weight_len={}, bias_len={}", in_f, out_f, weight.len(), bias.len());
+        vprintln!(
+            "[layer::Linear::new] in={}, out={}, weight_len={}, bias_len={}",
+            in_f,
+            out_f,
+            weight.len(),
+            bias.len()
+        );
         Ok(Self {
             weight: Tensor::matrix(in_f, out_f, weight)?,
             bias: Tensor::vector(bias),
@@ -74,10 +80,18 @@ impl Linear {
                 qw.rows, qw.cols
             )));
         }
-        vprintln!("[layer::Linear::quantized] in={}, out={}, kind={:?}, resident={} bytes",
-            in_f, out_f, qw.kind, qw.resident_bytes());
+        vprintln!(
+            "[layer::Linear::quantized] in={}, out={}, kind={:?}, resident={} bytes",
+            in_f,
+            out_f,
+            qw.kind,
+            qw.resident_bytes()
+        );
         Ok(Self {
-            weight: Tensor { shape: vec![0], data: vec![] },
+            weight: Tensor {
+                shape: vec![0],
+                data: vec![],
+            },
             bias: Tensor::vector(bias),
             qweight: Some(Arc::new(qw)),
             in_f,
@@ -90,7 +104,10 @@ impl Linear {
     pub fn quantize(mut self, kind: QKind) -> Self {
         if self.qweight.is_none() {
             let qw = QWeight::from_f32(&self.weight.data, self.in_f, self.out_f, kind);
-            self.weight = Tensor { shape: vec![0], data: vec![] };
+            self.weight = Tensor {
+                shape: vec![0],
+                data: vec![],
+            };
             self.qweight = Some(Arc::new(qw));
         }
         self
@@ -126,15 +143,29 @@ impl Layer for Linear {
                 self.in_f
             )));
         }
-        vprintln!("[layer::Linear::forward] input={:?}, weight=[{},{}]", input.shape, self.in_f, self.out_f);
+        vprintln!(
+            "[layer::Linear::forward] input={:?}, weight=[{},{}]",
+            input.shape,
+            self.in_f,
+            self.out_f
+        );
         let result = match &self.qweight {
             Some(qw) => ops::qlinear(input, qw, &self.bias.data)?,
             None => ops::linear_forward(input, &self.weight, &self.bias.data)?,
         };
         if verbose::is_verbose() {
             let (vmin, vmax, vmean) = verbose::stats(&result.data);
-            vprintln!("[layer::Linear::forward]   output={:?}, stats: min={:.6}, max={:.6}, mean={:.6}", result.shape, vmin, vmax, vmean);
-            verbose::check_nan_inf(&result.data, &format!("Linear({}→{}) output", self.in_f, self.out_f));
+            vprintln!(
+                "[layer::Linear::forward]   output={:?}, stats: min={:.6}, max={:.6}, mean={:.6}",
+                result.shape,
+                vmin,
+                vmax,
+                vmean
+            );
+            verbose::check_nan_inf(
+                &result.data,
+                &format!("Linear({}→{}) output", self.in_f, self.out_f),
+            );
         }
         Ok(result)
     }
@@ -193,7 +224,11 @@ impl Flatten {
 
 impl Layer for Flatten {
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        vprintln!("[layer::Flatten::forward] {:?} → [1, {}]", input.shape, input.data.len());
+        vprintln!(
+            "[layer::Flatten::forward] {:?} → [1, {}]",
+            input.shape,
+            input.data.len()
+        );
         Tensor::matrix(1, input.data.len(), input.data.clone())
     }
     fn name(&self) -> String {
@@ -219,7 +254,10 @@ impl LayerNorm {
     pub fn new(dim: usize, gamma: Vec<f32>, beta: Vec<f32>) -> Result<Self> {
         if gamma.len() != dim || beta.len() != dim {
             return Err(InferError::DimMismatch(format!(
-                "LayerNorm weights len {}/{} != dim {}", gamma.len(), beta.len(), dim
+                "LayerNorm weights len {}/{} != dim {}",
+                gamma.len(),
+                beta.len(),
+                dim
             )));
         }
         vprintln!("[layer::LayerNorm::new] dim={}", dim);
@@ -239,7 +277,8 @@ impl Layer for LayerNorm {
         let (rows, cols) = input.matrix_dims()?;
         if cols != self.dim {
             return Err(InferError::DimMismatch(format!(
-                "LayerNorm expects width {}, got {}", self.dim, cols
+                "LayerNorm expects width {}, got {}",
+                self.dim, cols
             )));
         }
         vprintln!("[layer::LayerNorm::forward] [{},{}]", rows, cols);
@@ -252,11 +291,18 @@ impl Layer for LayerNorm {
             let std = (var + 1e-5).sqrt();
 
             if verbose::is_verbose() && rows <= 8 {
-                vprintln!("[layer::LayerNorm::forward]   row[{}]: mean={:.6}, var={:.6}, std={:.6}", r, mean, var, std);
+                vprintln!(
+                    "[layer::LayerNorm::forward]   row[{}]: mean={:.6}, var={:.6}, std={:.6}",
+                    r,
+                    mean,
+                    var,
+                    std
+                );
             }
 
             for c in 0..cols {
-                out[base + c] = ((row_slice[c] - mean) / std) * self.gamma.data[c] + self.beta.data[c];
+                out[base + c] =
+                    ((row_slice[c] - mean) / std) * self.gamma.data[c] + self.beta.data[c];
             }
         }
         if verbose::is_verbose() {
@@ -294,12 +340,23 @@ impl Embedding {
         pos_weight: Vec<f32>,
     ) -> Result<Self> {
         if token_weight.len() != vocab_size * embedding_dim {
-            return Err(InferError::ShapeMismatch { expected: vocab_size * embedding_dim, got: token_weight.len() });
+            return Err(InferError::ShapeMismatch {
+                expected: vocab_size * embedding_dim,
+                got: token_weight.len(),
+            });
         }
         if pos_weight.len() != max_seq_len * embedding_dim {
-            return Err(InferError::ShapeMismatch { expected: max_seq_len * embedding_dim, got: pos_weight.len() });
+            return Err(InferError::ShapeMismatch {
+                expected: max_seq_len * embedding_dim,
+                got: pos_weight.len(),
+            });
         }
-        vprintln!("[layer::Embedding::new] vocab={}, max_seq={}, dim={}", vocab_size, max_seq_len, embedding_dim);
+        vprintln!(
+            "[layer::Embedding::new] vocab={}, max_seq={}, dim={}",
+            vocab_size,
+            max_seq_len,
+            embedding_dim
+        );
         Ok(Self {
             token_weight: Tensor::matrix(vocab_size, embedding_dim, token_weight)?,
             pos_weight: Tensor::matrix(max_seq_len, embedding_dim, pos_weight)?,
@@ -324,12 +381,14 @@ impl Embedding {
     pub fn embed_one(&self, token: usize, pos: usize) -> Result<Tensor> {
         if token >= self.vocab_size {
             return Err(InferError::DimMismatch(format!(
-                "Token index {} out of bounds for vocab_size {}", token, self.vocab_size
+                "Token index {} out of bounds for vocab_size {}",
+                token, self.vocab_size
             )));
         }
         if pos >= self.max_seq_len {
             return Err(InferError::DimMismatch(format!(
-                "Position {} exceeds max_seq_len {}", pos, self.max_seq_len
+                "Position {} exceeds max_seq_len {}",
+                pos, self.max_seq_len
             )));
         }
         let d = self.embedding_dim;
@@ -348,15 +407,25 @@ impl Layer for Embedding {
         let (batch, seq_len) = match input.shape.as_slice() {
             [s] => (1, *s),
             [b, s] => (*b, *s),
-            _ => return Err(InferError::DimMismatch("Embedding expects rank-1 or rank-2 inputs".into())),
+            _ => {
+                return Err(InferError::DimMismatch(
+                    "Embedding expects rank-1 or rank-2 inputs".into(),
+                ))
+            }
         };
         if seq_len > self.max_seq_len {
             return Err(InferError::DimMismatch(format!(
-                "Sequence length {} exceeds max_seq_len {}", seq_len, self.max_seq_len
+                "Sequence length {} exceeds max_seq_len {}",
+                seq_len, self.max_seq_len
             )));
         }
-        vprintln!("[layer::Embedding::forward] batch={}, seq_len={}, vocab={}, dim={}",
-            batch, seq_len, self.vocab_size, self.embedding_dim);
+        vprintln!(
+            "[layer::Embedding::forward] batch={}, seq_len={}, vocab={}, dim={}",
+            batch,
+            seq_len,
+            self.vocab_size,
+            self.embedding_dim
+        );
 
         let out_cols = self.embedding_dim;
         let mut out_data = vec![0.0f32; batch * seq_len * out_cols];
@@ -365,14 +434,16 @@ impl Layer for Embedding {
                 let tok_idx = input.data[b * seq_len + t].round() as usize;
                 if tok_idx >= self.vocab_size {
                     return Err(InferError::DimMismatch(format!(
-                        "Token index {} out of bounds for vocab_size {}", tok_idx, self.vocab_size
+                        "Token index {} out of bounds for vocab_size {}",
+                        tok_idx, self.vocab_size
                     )));
                 }
                 let tok_base = tok_idx * self.embedding_dim;
                 let pos_base = t * self.embedding_dim;
                 let out_base = (b * seq_len + t) * self.embedding_dim;
                 for d in 0..self.embedding_dim {
-                    out_data[out_base + d] = self.token_weight.data[tok_base + d] + self.pos_weight.data[pos_base + d];
+                    out_data[out_base + d] =
+                        self.token_weight.data[tok_base + d] + self.pos_weight.data[pos_base + d];
                 }
             }
         }
@@ -384,7 +455,10 @@ impl Layer for Embedding {
         Tensor::matrix(batch * seq_len, out_cols, out_data)
     }
     fn name(&self) -> String {
-        format!("Embedding(vocab={}, dim={})", self.vocab_size, self.embedding_dim)
+        format!(
+            "Embedding(vocab={}, dim={})",
+            self.vocab_size, self.embedding_dim
+        )
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -465,14 +539,22 @@ impl TransformerBlock {
         context_len: usize,
         num_heads: usize,
         embedding_dim: usize,
-        ln1_g: Vec<f32>, ln1_b: Vec<f32>,
-        q_w: Vec<f32>, q_b: Vec<f32>,
-        k_w: Vec<f32>, k_b: Vec<f32>,
-        v_w: Vec<f32>, v_b: Vec<f32>,
-        out_w: Vec<f32>, out_b: Vec<f32>,
-        ln2_g: Vec<f32>, ln2_b: Vec<f32>,
-        ffn1_w: Vec<f32>, ffn1_b: Vec<f32>,
-        ffn2_w: Vec<f32>, ffn2_b: Vec<f32>,
+        ln1_g: Vec<f32>,
+        ln1_b: Vec<f32>,
+        q_w: Vec<f32>,
+        q_b: Vec<f32>,
+        k_w: Vec<f32>,
+        k_b: Vec<f32>,
+        v_w: Vec<f32>,
+        v_b: Vec<f32>,
+        out_w: Vec<f32>,
+        out_b: Vec<f32>,
+        ln2_g: Vec<f32>,
+        ln2_b: Vec<f32>,
+        ffn1_w: Vec<f32>,
+        ffn1_b: Vec<f32>,
+        ffn2_w: Vec<f32>,
+        ffn2_b: Vec<f32>,
     ) -> Result<Self> {
         if context_len == 0 {
             return Err(InferError::DimMismatch("context_len must be > 0".into()));
@@ -482,8 +564,13 @@ impl TransformerBlock {
                 "embedding_dim {embedding_dim} must be divisible by num_heads {num_heads}"
             )));
         }
-        vprintln!("[layer::TransformerBlock::new] ctx={}, heads={}, dim={}, hidden={}",
-            context_len, num_heads, embedding_dim, ffn1_b.len());
+        vprintln!(
+            "[layer::TransformerBlock::new] ctx={}, heads={}, dim={}, hidden={}",
+            context_len,
+            num_heads,
+            embedding_dim,
+            ffn1_b.len()
+        );
 
         let ln1 = LayerNorm::new(embedding_dim, ln1_g, ln1_b)?;
         let q_proj = Linear::new(embedding_dim, embedding_dim, q_w, q_b)?;
@@ -581,12 +668,14 @@ impl TransformerBlock {
         let (rows, c) = x.matrix_dims()?;
         if rows != 1 || c != self.embedding_dim {
             return Err(InferError::DimMismatch(format!(
-                "forward_with_cache expects [1,{}], got {:?}", self.embedding_dim, x.shape
+                "forward_with_cache expects [1,{}], got {:?}",
+                self.embedding_dim, x.shape
             )));
         }
         if cache.dim != c {
             return Err(InferError::DimMismatch(format!(
-                "KvCache dim {} ≠ block embedding_dim {}", cache.dim, c
+                "KvCache dim {} ≠ block embedding_dim {}",
+                cache.dim, c
             )));
         }
         if cache.is_full() {
@@ -656,19 +745,28 @@ impl Layer for TransformerBlock {
         let (m, c) = input.matrix_dims()?;
         if c != self.embedding_dim {
             return Err(InferError::DimMismatch(format!(
-                "TransformerBlock expects dim {}, got {}", self.embedding_dim, c
+                "TransformerBlock expects dim {}, got {}",
+                self.embedding_dim, c
             )));
         }
         let t = self.context_len;
         if m % t != 0 {
             return Err(InferError::DimMismatch(format!(
-                "Input rows {} must be divisible by context_len {}", m, t
+                "Input rows {} must be divisible by context_len {}",
+                m, t
             )));
         }
         let b = m / t;
 
-        vprintln!("[layer::TransformerBlock::forward] input=[{},{}], batch={}, ctx={}, heads={}, dim={}",
-            m, c, b, t, self.num_heads, self.embedding_dim);
+        vprintln!(
+            "[layer::TransformerBlock::forward] input=[{},{}], batch={}, ctx={}, heads={}, dim={}",
+            m,
+            c,
+            b,
+            t,
+            self.num_heads,
+            self.embedding_dim
+        );
 
         // ── 1. LayerNorm 1 ───────────────────────────────────────────────────────
         vprintln!("[layer::TransformerBlock::forward]   ┌─ LayerNorm1");
@@ -688,17 +786,35 @@ impl Layer for TransformerBlock {
             let (qmin, qmax, qmean) = verbose::stats(&q.data);
             let (kmin, kmax, kmean) = verbose::stats(&k.data);
             let (vmin, vmax, vmean) = verbose::stats(&v.data);
-            vprintln!("[layer::TransformerBlock::forward]   │  Q: min={:.6}, max={:.6}, mean={:.6}", qmin, qmax, qmean);
-            vprintln!("[layer::TransformerBlock::forward]   │  K: min={:.6}, max={:.6}, mean={:.6}", kmin, kmax, kmean);
-            vprintln!("[layer::TransformerBlock::forward]   │  V: min={:.6}, max={:.6}, mean={:.6}", vmin, vmax, vmean);
+            vprintln!(
+                "[layer::TransformerBlock::forward]   │  Q: min={:.6}, max={:.6}, mean={:.6}",
+                qmin,
+                qmax,
+                qmean
+            );
+            vprintln!(
+                "[layer::TransformerBlock::forward]   │  K: min={:.6}, max={:.6}, mean={:.6}",
+                kmin,
+                kmax,
+                kmean
+            );
+            vprintln!(
+                "[layer::TransformerBlock::forward]   │  V: min={:.6}, max={:.6}, mean={:.6}",
+                vmin,
+                vmax,
+                vmean
+            );
             verbose::check_nan_inf(&q.data, "TransformerBlock Q");
             verbose::check_nan_inf(&k.data, "TransformerBlock K");
             verbose::check_nan_inf(&v.data, "TransformerBlock V");
         }
 
         // ── 3. Multi-Head Attention ──────────────────────────────────────────────
-        vprintln!("[layer::TransformerBlock::forward]   ├─ Multi-Head Attention ({} heads, head_dim={})",
-            self.num_heads, self.embedding_dim / self.num_heads);
+        vprintln!(
+            "[layer::TransformerBlock::forward]   ├─ Multi-Head Attention ({} heads, head_dim={})",
+            self.num_heads,
+            self.embedding_dim / self.num_heads
+        );
         let num_heads = self.num_heads;
         let head_dim = self.embedding_dim / num_heads;
         let head_scale = 1.0 / (head_dim as f32).sqrt();
@@ -718,9 +834,12 @@ impl Layer for TransformerBlock {
                     let head_start = head_idx * head_dim;
                     let src_idx = src_row * self.embedding_dim + head_start;
                     let dst_idx = r * head_dim;
-                    q_head[dst_idx..dst_idx + head_dim].copy_from_slice(&q.data[src_idx..src_idx + head_dim]);
-                    k_head[dst_idx..dst_idx + head_dim].copy_from_slice(&k.data[src_idx..src_idx + head_dim]);
-                    v_head[dst_idx..dst_idx + head_dim].copy_from_slice(&v.data[src_idx..src_idx + head_dim]);
+                    q_head[dst_idx..dst_idx + head_dim]
+                        .copy_from_slice(&q.data[src_idx..src_idx + head_dim]);
+                    k_head[dst_idx..dst_idx + head_dim]
+                        .copy_from_slice(&k.data[src_idx..src_idx + head_dim]);
+                    v_head[dst_idx..dst_idx + head_dim]
+                        .copy_from_slice(&v.data[src_idx..src_idx + head_dim]);
                 }
 
                 // Compute causal self-attention scores: S = Q * K^T
@@ -757,7 +876,13 @@ impl Layer for TransformerBlock {
                     let (amin, amax, amean) = verbose::stats(&s);
                     vprintln!("[layer::TransformerBlock::forward]   │  batch[{}] head[{}]: attn_weights: min={:.6}, max={:.6}, mean={:.6}",
                         batch_idx, head_idx, amin, amax, amean);
-                    verbose::check_nan_inf(&s, &format!("TransformerBlock attn_weights batch={} head={}", batch_idx, head_idx));
+                    verbose::check_nan_inf(
+                        &s,
+                        &format!(
+                            "TransformerBlock attn_weights batch={} head={}",
+                            batch_idx, head_idx
+                        ),
+                    );
                 }
 
                 // Store attention weights for visualization
@@ -773,7 +898,8 @@ impl Layer for TransformerBlock {
                     let head_start = head_idx * head_dim;
                     let dst_idx = dst_row * self.embedding_dim + head_start;
                     let src_idx = r * head_dim;
-                    attn_out[dst_idx..dst_idx + head_dim].copy_from_slice(&o[src_idx..src_idx + head_dim]);
+                    attn_out[dst_idx..dst_idx + head_dim]
+                        .copy_from_slice(&o[src_idx..src_idx + head_dim]);
                 }
             }
         }
@@ -786,7 +912,9 @@ impl Layer for TransformerBlock {
         let projected = self.out_proj.forward(&attn_out_tensor)?;
 
         // Residual connection
-        vprintln!("[layer::TransformerBlock::forward]   ├─ Residual connection 1 (input + attention)");
+        vprintln!(
+            "[layer::TransformerBlock::forward]   ├─ Residual connection 1 (input + attention)"
+        );
         let x_attn_data: Vec<f32> = input
             .data
             .iter()
@@ -810,8 +938,12 @@ impl Layer for TransformerBlock {
         let ffn_hidden = ff1.map(|x| x.max(0.0));
         if verbose::is_verbose() {
             let zeros = ffn_hidden.data.iter().filter(|&&v| v == 0.0).count();
-            vprintln!("[layer::TransformerBlock::forward]   │  FFN ReLU: {}/{} zeros ({:.1}% dead)",
-                zeros, ffn_hidden.data.len(), 100.0 * zeros as f32 / ffn_hidden.data.len() as f32);
+            vprintln!(
+                "[layer::TransformerBlock::forward]   │  FFN ReLU: {}/{} zeros ({:.1}% dead)",
+                zeros,
+                ffn_hidden.data.len(),
+                100.0 * zeros as f32 / ffn_hidden.data.len() as f32
+            );
         }
         let ff2 = self.ffn2.forward(&ffn_hidden)?;
 
@@ -834,7 +966,9 @@ impl Layer for TransformerBlock {
     fn name(&self) -> String {
         format!(
             "TransformerBlock(heads={}, dim={}, hidden={})",
-            self.num_heads, self.embedding_dim, self.hidden_dim()
+            self.num_heads,
+            self.embedding_dim,
+            self.hidden_dim()
         )
     }
 
@@ -847,7 +981,15 @@ impl Layer for TransformerBlock {
 
 /// Rows `r0..r1` of `A·Bᵀ` (A is `[m, k]`, B is `[n, k]`) into a locally-indexed
 /// `out`. Shared by the serial and pooled paths.
-fn transpose_b_block(a: &[f32], b: &[f32], k: usize, n: usize, r0: usize, r1: usize, out: &mut [f32]) {
+fn transpose_b_block(
+    a: &[f32],
+    b: &[f32],
+    k: usize,
+    n: usize,
+    r0: usize,
+    r1: usize,
+    out: &mut [f32],
+) {
     for i in r0..r1 {
         let a_row = i * k;
         let o_row = (i - r0) * n;
@@ -862,7 +1004,13 @@ fn transpose_b_block(a: &[f32], b: &[f32], k: usize, n: usize, r0: usize, r1: us
     }
 }
 
-pub(crate) fn matmul_transpose_b_helper(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+pub(crate) fn matmul_transpose_b_helper(
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Vec<f32> {
     let cost = m.saturating_mul(n).saturating_mul(k);
     if crate::parallel::should_parallelize(m, cost) {
         let a_arc = std::sync::Arc::<[f32]>::from(a);
@@ -919,7 +1067,9 @@ mod tests {
 
     fn identity_linear(n: usize) -> Linear {
         let mut w = vec![0.0f32; n * n];
-        for i in 0..n { w[i * n + i] = 1.0; }
+        for i in 0..n {
+            w[i * n + i] = 1.0;
+        }
         Linear::new(n, n, w, vec![0.0; n]).unwrap()
     }
 
@@ -928,16 +1078,27 @@ mod tests {
         let c = dim;
         let h = hidden;
         TransformerBlock::new(
-            ctx, heads, dim,
-            vec![1.0; c], vec![0.0; c],       // ln1
-            vec![scale; c*c], vec![0.0; c],   // q
-            vec![scale; c*c], vec![0.0; c],   // k
-            vec![scale; c*c], vec![0.0; c],   // v
-            vec![scale; c*c], vec![0.0; c],   // out
-            vec![1.0; c], vec![0.0; c],       // ln2
-            vec![scale; c*h], vec![0.0; h],   // ffn1
-            vec![scale; h*c], vec![0.0; c],   // ffn2
-        ).unwrap()
+            ctx,
+            heads,
+            dim,
+            vec![1.0; c],
+            vec![0.0; c], // ln1
+            vec![scale; c * c],
+            vec![0.0; c], // q
+            vec![scale; c * c],
+            vec![0.0; c], // k
+            vec![scale; c * c],
+            vec![0.0; c], // v
+            vec![scale; c * c],
+            vec![0.0; c], // out
+            vec![1.0; c],
+            vec![0.0; c], // ln2
+            vec![scale; c * h],
+            vec![0.0; h], // ffn1
+            vec![scale; h * c],
+            vec![0.0; c], // ffn2
+        )
+        .unwrap()
     }
 
     // ── Linear ───────────────────────────────────────────────────────────────
@@ -1011,10 +1172,7 @@ mod tests {
 
     #[test]
     fn layernorm_preserves_mean_and_var() {
-        let x = Tensor::matrix(2, 4, vec![
-            1.0, 2.0, 3.0, 4.0,
-            10.0, -10.0, 20.0, -20.0,
-        ]).unwrap();
+        let x = Tensor::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 10.0, -10.0, 20.0, -20.0]).unwrap();
         let ln = LayerNorm::new(4, vec![1.0; 4], vec![0.0; 4]).unwrap();
         let y = ln.forward(&x).unwrap();
         assert_eq!(y.shape, vec![2, 4]);
@@ -1035,7 +1193,9 @@ mod tests {
         let ln = LayerNorm::new(4, vec![2.0; 4], vec![1.0; 4]).unwrap();
         let y = ln.forward(&x).unwrap();
         // Each output should be near beta=1 (normalised×gamma=0)
-        for &v in &y.data { assert!((v - 1.0).abs() < 1e-3, "got {v}"); }
+        for &v in &y.data {
+            assert!((v - 1.0).abs() < 1e-3, "got {v}");
+        }
     }
 
     #[test]
@@ -1072,10 +1232,13 @@ mod tests {
     #[test]
     fn embedding_lookup_and_positional_addition() {
         let emb = Embedding::new(
-            3, 4, 2,
+            3,
+            4,
+            2,
             vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0],
             vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
-        ).unwrap();
+        )
+        .unwrap();
         let x = Tensor::matrix(2, 3, vec![0.0, 2.0, 1.0, 1.0, 0.0, 2.0]).unwrap();
         let y = emb.forward(&x).unwrap();
         assert_eq!(y.shape, vec![6, 2]);
@@ -1086,8 +1249,7 @@ mod tests {
 
     #[test]
     fn embedding_rank1_input_accepted() {
-        let emb = Embedding::new(4, 8, 2,
-            vec![0.0; 8], vec![0.0; 16]).unwrap();
+        let emb = Embedding::new(4, 8, 2, vec![0.0; 8], vec![0.0; 16]).unwrap();
         let x = Tensor::vector(vec![0.0, 1.0, 2.0]);
         // rank-1 = single sequence of 3 tokens
         assert!(emb.forward(&x).is_ok());
@@ -1230,8 +1392,10 @@ mod tests {
             for qi in 0..t {
                 let base = (h * t + qi) * t;
                 let row_sum: f32 = attn[base..base + t].iter().sum();
-                assert!((row_sum - 1.0).abs() < 1e-5,
-                    "head {h} row {qi}: attn sum = {row_sum}");
+                assert!(
+                    (row_sum - 1.0).abs() < 1e-5,
+                    "head {h} row {qi}: attn sum = {row_sum}"
+                );
             }
         }
     }
@@ -1259,20 +1423,30 @@ mod tests {
         use crate::rng::Rng;
         let (t, heads, dim, hidden) = (6, 2, 8, 16);
         let mut rng = Rng::new(11);
-        let mut randn = |n: usize| -> Vec<f32> {
-            (0..n).map(|_| rng.next_normal() * 0.2).collect()
-        };
+        let mut randn =
+            |n: usize| -> Vec<f32> { (0..n).map(|_| rng.next_normal() * 0.2).collect() };
         let block = TransformerBlock::new(
-            t, heads, dim,
-            vec![1.0; dim], vec![0.0; dim],
-            randn(dim * dim), randn(dim),
-            randn(dim * dim), randn(dim),
-            randn(dim * dim), randn(dim),
-            randn(dim * dim), randn(dim),
-            vec![1.0; dim], vec![0.0; dim],
-            randn(dim * hidden), randn(hidden),
-            randn(hidden * dim), randn(dim),
-        ).unwrap();
+            t,
+            heads,
+            dim,
+            vec![1.0; dim],
+            vec![0.0; dim],
+            randn(dim * dim),
+            randn(dim),
+            randn(dim * dim),
+            randn(dim),
+            randn(dim * dim),
+            randn(dim),
+            randn(dim * dim),
+            randn(dim),
+            vec![1.0; dim],
+            vec![0.0; dim],
+            randn(dim * hidden),
+            randn(hidden),
+            randn(hidden * dim),
+            randn(dim),
+        )
+        .unwrap();
 
         let x_data = randn(t * dim);
         let x = Tensor::matrix(t, dim, x_data.clone()).unwrap();
@@ -1306,10 +1480,13 @@ mod tests {
     #[test]
     fn embed_one_matches_batch_forward() {
         let emb = Embedding::new(
-            3, 4, 2,
+            3,
+            4,
+            2,
             vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0],
             vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
-        ).unwrap();
+        )
+        .unwrap();
         let x = Tensor::matrix(1, 3, vec![0.0, 2.0, 1.0]).unwrap();
         let batch = emb.forward(&x).unwrap();
         for pos in 0..3 {
@@ -1319,25 +1496,37 @@ mod tests {
                 assert!((one.data[d] - batch.data[pos * 2 + d]).abs() < 1e-6);
             }
         }
-        assert!(emb.embed_one(9, 0).is_err());  // token OOB
-        assert!(emb.embed_one(0, 9).is_err());  // position OOB
+        assert!(emb.embed_one(9, 0).is_err()); // token OOB
+        assert!(emb.embed_one(0, 9).is_err()); // position OOB
     }
 
     #[test]
     fn transformer_block_invalid_heads_rejected() {
         // 3 heads do not divide dim=8; 0 heads is invalid; 0 context invalid.
         let c = 8usize;
-        let mk = |ctx: usize, heads: usize| TransformerBlock::new(
-            ctx, heads, c,
-            vec![1.0; c], vec![0.0; c],
-            vec![0.0; c*c], vec![0.0; c],
-            vec![0.0; c*c], vec![0.0; c],
-            vec![0.0; c*c], vec![0.0; c],
-            vec![0.0; c*c], vec![0.0; c],
-            vec![1.0; c], vec![0.0; c],
-            vec![0.0; c*c], vec![0.0; c],
-            vec![0.0; c*c], vec![0.0; c],
-        );
+        let mk = |ctx: usize, heads: usize| {
+            TransformerBlock::new(
+                ctx,
+                heads,
+                c,
+                vec![1.0; c],
+                vec![0.0; c],
+                vec![0.0; c * c],
+                vec![0.0; c],
+                vec![0.0; c * c],
+                vec![0.0; c],
+                vec![0.0; c * c],
+                vec![0.0; c],
+                vec![0.0; c * c],
+                vec![0.0; c],
+                vec![1.0; c],
+                vec![0.0; c],
+                vec![0.0; c * c],
+                vec![0.0; c],
+                vec![0.0; c * c],
+                vec![0.0; c],
+            )
+        };
         assert!(mk(4, 3).is_err());
         assert!(mk(4, 0).is_err());
         assert!(mk(0, 2).is_err());

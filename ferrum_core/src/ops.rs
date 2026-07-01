@@ -59,7 +59,15 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
             "matmul: [{m},{ka}] × [{kb},{n}] — inner dims disagree"
         )));
     }
-    vprintln!("[ops::matmul] [{},{}] × [{},{}] → [{},{}]", m, ka, kb, n, m, n);
+    vprintln!(
+        "[ops::matmul] [{},{}] × [{},{}] → [{},{}]",
+        m,
+        ka,
+        kb,
+        n,
+        m,
+        n
+    );
     // Split the output rows across the persistent CPU worker pool when the
     // workload is large enough; otherwise compute serially with no Arc clone.
     // Each output row depends only on `a`'s matching row and all of `b`, so the
@@ -231,7 +239,9 @@ pub fn qlinear(input: &Tensor, w: &Arc<QWeight>, bias: &[f32]) -> Result<Tensor>
             }
             qaccum_cols(&a_arc, &w, j0, j1, block);
         })
-    } else if m >= 2 && crate::parallel::should_parallelize(m, m.saturating_mul(k).saturating_mul(n)) {
+    } else if m >= 2
+        && crate::parallel::should_parallelize(m, m.saturating_mul(k).saturating_mul(n))
+    {
         let a_arc = Arc::<[f32]>::from(a.as_slice());
         let bias_arc = Arc::<[f32]>::from(bias);
         let w = Arc::clone(w);
@@ -478,8 +488,12 @@ mod tests {
         // straightforward serial reference bit-for-bit, regardless of how many
         // threads the row split used.
         let (m, k, n) = (200usize, 80usize, 160usize);
-        let a_data: Vec<f32> = (0..m * k).map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.1).collect();
-        let b_data: Vec<f32> = (0..k * n).map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.1).collect();
+        let a_data: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.1)
+            .collect();
+        let b_data: Vec<f32> = (0..k * n)
+            .map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.1)
+            .collect();
         let a = Tensor::matrix(m, k, a_data.clone()).unwrap();
         let b = Tensor::matrix(k, n, b_data.clone()).unwrap();
 
@@ -495,7 +509,10 @@ mod tests {
                 }
             }
         }
-        assert_eq!(got.data, want, "parallel matmul diverged from serial reference");
+        assert_eq!(
+            got.data, want,
+            "parallel matmul diverged from serial reference"
+        );
     }
 
     // ── Fused Linear + quantized kernels (Opt#1/#2/#3) ────────────────────────
@@ -520,10 +537,17 @@ mod tests {
         let input = Tensor::matrix(m, k, det_data(m * k, 1)).unwrap();
         let weight = Tensor::matrix(k, n, det_data(k * n, 2)).unwrap();
         let bias = det_data(n, 3);
-        let want = add_bias(&matmul(&input, &weight).unwrap(), &Tensor::vector(bias.clone())).unwrap();
+        let want = add_bias(
+            &matmul(&input, &weight).unwrap(),
+            &Tensor::vector(bias.clone()),
+        )
+        .unwrap();
         let got = linear_forward(&input, &weight, &bias).unwrap();
         assert_eq!(got.shape, want.shape);
-        assert_eq!(got.data, want.data, "fused linear diverged from add_bias(matmul)");
+        assert_eq!(
+            got.data, want.data,
+            "fused linear diverged from add_bias(matmul)"
+        );
     }
 
     #[test]
@@ -612,7 +636,12 @@ mod tests {
         }
         let q4 = Arc::new(QWeight::from_f32(&wdata, k, n, QKind::Int4));
         let got4 = qlinear(&input, &q4, &bias).unwrap();
-        let mae: f32 = reference.data.iter().zip(&got4.data).map(|(a, b)| (a - b).abs()).sum::<f32>()
+        let mae: f32 = reference
+            .data
+            .iter()
+            .zip(&got4.data)
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
             / (m * n) as f32;
         assert!(mae < 0.6, "int4 prefill mae {mae}");
     }

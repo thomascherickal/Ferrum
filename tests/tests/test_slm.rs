@@ -15,22 +15,36 @@ fn test_slm_pipeline_and_causal_attention() {
     let h = hidden_dim;
 
     let emb = Embedding::new(
-        vocab_size, max_seq_len, embedding_dim,
+        vocab_size,
+        max_seq_len,
+        embedding_dim,
         vec![0.1; vocab_size * embedding_dim],
         vec![0.01; max_seq_len * embedding_dim],
-    ).unwrap();
+    )
+    .unwrap();
 
     let tb = TransformerBlock::new(
-        max_seq_len, 2, embedding_dim,
-        vec![1.0; c], vec![0.0; c],
-        vec![0.1; c*c], vec![0.0; c],
-        vec![0.1; c*c], vec![0.0; c],
-        vec![0.1; c*c], vec![0.0; c],
-        vec![0.1; c*c], vec![0.0; c],
-        vec![1.0; c], vec![0.0; c],
-        vec![0.1; c*h], vec![0.0; h],
-        vec![0.1; h*c], vec![0.0; c],
-    ).unwrap();
+        max_seq_len,
+        2,
+        embedding_dim,
+        vec![1.0; c],
+        vec![0.0; c],
+        vec![0.1; c * c],
+        vec![0.0; c],
+        vec![0.1; c * c],
+        vec![0.0; c],
+        vec![0.1; c * c],
+        vec![0.0; c],
+        vec![0.1; c * c],
+        vec![0.0; c],
+        vec![1.0; c],
+        vec![0.0; c],
+        vec![0.1; c * h],
+        vec![0.0; h],
+        vec![0.1; h * c],
+        vec![0.0; c],
+    )
+    .unwrap();
 
     let model = Sequential::new()
         .with(Box::new(emb))
@@ -47,7 +61,10 @@ fn test_slm_pipeline_and_causal_attention() {
     assert!((sum - 4.0).abs() < 1e-4);
 
     // Let's retrieve attention weights from tb
-    let tb_ref = model.layers()[1].as_any().downcast_ref::<TransformerBlock>().unwrap();
+    let tb_ref = model.layers()[1]
+        .as_any()
+        .downcast_ref::<TransformerBlock>()
+        .unwrap();
     let att_borrow = tb_ref.last_attention.borrow();
     let att = &*att_borrow;
     // 2 heads, seq_len=4, so 2 * 4 * 4 = 32 weights

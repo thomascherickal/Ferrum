@@ -309,8 +309,12 @@ impl CsvDataset {
         force_task: Option<TaskType>,
         preset_classes: Option<&[String]>,
     ) -> Result<Self> {
-        vprintln!("[csv::CsvDataset::parse] Parsing CSV ({} bytes), force_task={:?}, preset_classes={}",
-            text.len(), force_task, preset_classes.map(|c| c.len()).unwrap_or(0));
+        vprintln!(
+            "[csv::CsvDataset::parse] Parsing CSV ({} bytes), force_task={:?}, preset_classes={}",
+            text.len(),
+            force_task,
+            preset_classes.map(|c| c.len()).unwrap_or(0)
+        );
         let mut lines = text.lines().peekable();
         while lines.peek().map(|l| l.trim().is_empty()) == Some(true) {
             lines.next();
@@ -395,8 +399,12 @@ impl CsvDataset {
             }
         });
 
-        vprintln!("[csv::CsvDataset] Detected task: {:?}, {} distinct targets, all_numeric={}",
-            task, distinct_targets.len(), all_numeric);
+        vprintln!(
+            "[csv::CsvDataset] Detected task: {:?}, {} distinct targets, all_numeric={}",
+            task,
+            distinct_targets.len(),
+            all_numeric
+        );
 
         // Build feature ranges
         let mut feat_min = vec![f32::MAX; num_features];
@@ -419,7 +427,8 @@ impl CsvDataset {
 
         // Build rows
         let mut class_index: std::collections::HashMap<String, usize> = Default::default();
-        let mut class_names: Vec<String> = preset_classes.map(<[String]>::to_vec).unwrap_or_default();
+        let mut class_names: Vec<String> =
+            preset_classes.map(<[String]>::to_vec).unwrap_or_default();
         let mut rows: Vec<CsvRow> = Vec::new();
         let mut tgt_min = f32::MAX;
         let mut tgt_max = f32::MIN;
@@ -439,29 +448,30 @@ impl CsvDataset {
                     (0, v)
                 }
                 TaskType::Classification => {
-                    let idx = match preset_classes {
-                        // Explicit registration: index by position in the
-                        // registered list; unknown labels are an error.
-                        Some(classes) => classes
-                            .iter()
-                            .position(|c| c == &label_str)
-                            .ok_or_else(|| {
-                                InferError::Format(format!(
-                                    "unregistered class label {label_str:?}"
-                                ))
-                            })?,
-                        None => *class_index.entry(label_str.clone()).or_insert_with(|| {
-                            let i = class_names.len();
-                            class_names.push(label_str);
-                            i
-                        }),
-                    };
+                    let idx =
+                        match preset_classes {
+                            // Explicit registration: index by position in the
+                            // registered list; unknown labels are an error.
+                            Some(classes) => classes
+                                .iter()
+                                .position(|c| c == &label_str)
+                                .ok_or_else(|| {
+                                    InferError::Format(format!(
+                                        "unregistered class label {label_str:?}"
+                                    ))
+                                })?,
+                            None => *class_index.entry(label_str.clone()).or_insert_with(|| {
+                                let i = class_names.len();
+                                class_names.push(label_str);
+                                i
+                            }),
+                        };
                     (idx, idx as f32)
                 }
                 // SLM datasets are not loaded through CsvDataset
                 TaskType::TransformerSLM => {
                     return Err(InferError::Format(
-                        "TransformerSLM task cannot be loaded through CsvDataset".into()
+                        "TransformerSLM task cannot be loaded through CsvDataset".into(),
                     ));
                 }
             };
@@ -526,7 +536,11 @@ pub struct Normalizer {
 impl Normalizer {
     pub fn fit(x: &Tensor) -> Result<Self> {
         let (rows, cols) = x.matrix_dims()?;
-        vprintln!("[csv::Normalizer::fit] Fitting on [{},{}] matrix", rows, cols);
+        vprintln!(
+            "[csv::Normalizer::fit] Fitting on [{},{}] matrix",
+            rows,
+            cols
+        );
         if rows == 0 {
             return Err(InferError::Format("cannot fit on 0 rows".into()));
         }
@@ -556,7 +570,12 @@ impl Normalizer {
         vprintln!("[csv::Normalizer::fit] Computed {} column stats", cols);
         if verbose::is_verbose() {
             for c in 0..cols.min(8) {
-                vprintln!("[csv::Normalizer::fit]   col[{}]: mean={:.6}, std={:.6}", c, means[c], stds[c]);
+                vprintln!(
+                    "[csv::Normalizer::fit]   col[{}]: mean={:.6}, std={:.6}",
+                    c,
+                    means[c],
+                    stds[c]
+                );
             }
             if cols > 8 {
                 vprintln!("[csv::Normalizer::fit]   ... ({} more columns)", cols - 8);
@@ -652,7 +671,11 @@ pub fn train_val_split(
     val_fraction: f32,
     rng: &mut crate::rng::Rng,
 ) -> (CsvDataset, CsvDataset) {
-    vprintln!("[csv::train_val_split] total={}, val_fraction={:.2}", ds.rows.len(), val_fraction);
+    vprintln!(
+        "[csv::train_val_split] total={}, val_fraction={:.2}",
+        ds.rows.len(),
+        val_fraction
+    );
     let n = ds.rows.len();
     let mut idx: Vec<usize> = (0..n).collect();
     for i in (1..n).rev() {
@@ -671,7 +694,11 @@ pub fn train_val_split(
         feature_ranges: ds.feature_ranges.clone(),
         target_range: ds.target_range,
     };
-    vprintln!("[csv::train_val_split] train={}, val={}", train_idx.len(), val_idx.len());
+    vprintln!(
+        "[csv::train_val_split] train={}, val={}",
+        train_idx.len(),
+        val_idx.len()
+    );
     (make(train_idx), make(val_idx))
 }
 
@@ -928,4 +955,3 @@ x1,x2,price
         assert_eq!(norm.stds.len(), 1);
     }
 }
-

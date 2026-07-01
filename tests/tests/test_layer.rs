@@ -6,7 +6,13 @@ use ferrum_core::{
 
 #[test]
 fn test_linear_forward() {
-    let lin = Linear::new(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![0.1, 0.2, 0.3]).unwrap();
+    let lin = Linear::new(
+        2,
+        3,
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        vec![0.1, 0.2, 0.3],
+    )
+    .unwrap();
     let x = Tensor::matrix(1, 2, vec![0.5, 1.5]).unwrap();
     let out = lin.forward(&x).unwrap();
     assert_eq!(out.shape, vec![1, 3]);
@@ -41,11 +47,7 @@ fn test_layernorm_forward() {
 
 #[test]
 fn test_embedding_forward() {
-    let emb = Embedding::new(
-        5, 4, 3,
-        vec![0.1; 15],
-        vec![0.01; 12],
-    ).unwrap();
+    let emb = Embedding::new(5, 4, 3, vec![0.1; 15], vec![0.01; 12]).unwrap();
     let x = Tensor::matrix(1, 4, vec![0.0, 1.0, 2.0, 3.0]).unwrap();
     let out = emb.forward(&x).unwrap();
     assert_eq!(out.shape, vec![4, 3]);
@@ -61,16 +63,27 @@ fn test_transformer_block_forward() {
     let h = hidden_dim;
 
     let tb = TransformerBlock::new(
-        context_len, num_heads, embedding_dim,
-        vec![1.0; c], vec![0.0; c],
-        vec![0.1; c*c], vec![0.0; c],
-        vec![0.1; c*c], vec![0.0; c],
-        vec![0.1; c*c], vec![0.0; c],
-        vec![0.1; c*c], vec![0.0; c],
-        vec![1.0; c], vec![0.0; c],
-        vec![0.1; c*h], vec![0.0; h],
-        vec![0.1; h*c], vec![0.0; c],
-    ).unwrap();
+        context_len,
+        num_heads,
+        embedding_dim,
+        vec![1.0; c],
+        vec![0.0; c],
+        vec![0.1; c * c],
+        vec![0.0; c],
+        vec![0.1; c * c],
+        vec![0.0; c],
+        vec![0.1; c * c],
+        vec![0.0; c],
+        vec![0.1; c * c],
+        vec![0.0; c],
+        vec![1.0; c],
+        vec![0.0; c],
+        vec![0.1; c * h],
+        vec![0.0; h],
+        vec![0.1; h * c],
+        vec![0.0; c],
+    )
+    .unwrap();
 
     let x = Tensor::matrix(4, embedding_dim, vec![0.5; 4 * embedding_dim]).unwrap();
     let out = tb.forward(&x).unwrap();

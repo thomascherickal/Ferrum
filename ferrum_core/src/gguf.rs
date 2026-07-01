@@ -52,7 +52,7 @@ const GGML_Q6_K: u32 = 14;
 
 const QK: usize = 32; // GGML block length for the legacy quant formats
 const QK_K: usize = 256; // super-block length for the k-quant formats
-// On-disk bytes per k-quant super-block of QK_K weights (must match ggml).
+                         // On-disk bytes per k-quant super-block of QK_K weights (must match ggml).
 const Q4_K_BLOCK: usize = 2 + 2 + 12 + QK_K / 2; // d, dmin, 6-bit scales, 4-bit qs = 144
 const Q5_K_BLOCK: usize = 2 + 2 + 12 + QK_K / 8 + QK_K / 2; // + qh high bits = 176
 const Q6_K_BLOCK: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2; // ql, qh, scales, d = 210
@@ -171,7 +171,10 @@ impl<'a> Cur<'a> {
         Self { b, pos: 0 }
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self.pos.checked_add(n).ok_or_else(|| fmt("offset overflow"))?;
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or_else(|| fmt("offset overflow"))?;
         if end > self.b.len() {
             return Err(fmt(&format!("GGUF EOF at +{}: need {n}", self.pos)));
         }
@@ -192,7 +195,9 @@ impl<'a> Cur<'a> {
     }
     fn u64(&mut self) -> Result<u64> {
         let b = self.take(8)?;
-        Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+        Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
     }
     fn i8(&mut self) -> Result<i8> {
         Ok(self.u8()? as i8)
@@ -310,14 +315,18 @@ fn type_nbytes(ggml_type: u32, n: usize) -> Result<usize> {
     Ok(match ggml_type {
         GGML_F32 => n * 4,
         GGML_F16 => n * 2,
-        GGML_Q8_0 => blocks()? * (2 + QK),      // f16 d + 32×i8
-        GGML_Q8_1 => blocks()? * (2 + 2 + QK),  // f16 d + f16 s + 32×i8
-        GGML_Q4_0 => blocks()? * (2 + QK / 2),  // f16 d + 16 bytes
+        GGML_Q8_0 => blocks()? * (2 + QK),         // f16 d + 32×i8
+        GGML_Q8_1 => blocks()? * (2 + 2 + QK),     // f16 d + f16 s + 32×i8
+        GGML_Q4_0 => blocks()? * (2 + QK / 2),     // f16 d + 16 bytes
         GGML_Q4_1 => blocks()? * (2 + 2 + QK / 2), // f16 d + f16 m + 16 bytes
         GGML_Q4_K => kblocks()? * Q4_K_BLOCK,
         GGML_Q5_K => kblocks()? * Q5_K_BLOCK,
         GGML_Q6_K => kblocks()? * Q6_K_BLOCK,
-        other => return Err(fmt(&format!("GGUF tensor type {other} is unsupported for sizing"))),
+        other => {
+            return Err(fmt(&format!(
+                "GGUF tensor type {other} is unsupported for sizing"
+            )))
+        }
     })
 }
 
@@ -342,7 +351,9 @@ fn parse_header(b: &[u8]) -> Result<ParsedHeader> {
     }
     let version = c.u32()?;
     if version != 2 && version != 3 {
-        return Err(fmt(&format!("unsupported GGUF version {version} (need 2 or 3)")));
+        return Err(fmt(&format!(
+            "unsupported GGUF version {version} (need 2 or 3)"
+        )));
     }
     let tensor_count = c.u64()? as usize;
     let kv_count = c.u64()? as usize;
@@ -360,7 +371,9 @@ fn parse_header(b: &[u8]) -> Result<ParsedHeader> {
         let name = c.string()?;
         let n_dims = c.u32()? as usize;
         if n_dims > 8 {
-            return Err(fmt(&format!("tensor '{name}' has implausible {n_dims} dims")));
+            return Err(fmt(&format!(
+                "tensor '{name}' has implausible {n_dims} dims"
+            )));
         }
         let mut dims = Vec::with_capacity(n_dims);
         for _ in 0..n_dims {
@@ -368,7 +381,12 @@ fn parse_header(b: &[u8]) -> Result<ParsedHeader> {
         }
         let ggml_type = c.u32()?;
         let offset = c.u64()?;
-        tensors.push(TensorInfo { name, dims, ggml_type, offset });
+        tensors.push(TensorInfo {
+            name,
+            dims,
+            ggml_type,
+            offset,
+        });
     }
 
     let alignment = metadata
@@ -435,7 +453,10 @@ impl Gguf {
                         metadata,
                         tensors,
                         data_offset,
-                        source: Source::Streamed { file: Mutex::new(file), len },
+                        source: Source::Streamed {
+                            file: Mutex::new(file),
+                            len,
+                        },
                     });
                 }
                 // The header didn't fit in the prefix yet: read a bigger one.
@@ -454,12 +475,20 @@ impl Gguf {
         if data_offset > bytes.len() {
             return Err(fmt("GGUF tensor-data section begins past EOF"));
         }
-        Ok(Self { version, metadata, tensors, data_offset, source: Source::Memory(bytes) })
+        Ok(Self {
+            version,
+            metadata,
+            tensors,
+            data_offset,
+            source: Source::Memory(bytes),
+        })
     }
 
     /// The model architecture string (`general.architecture`), e.g. `"llama"`.
     pub fn architecture(&self) -> Option<&str> {
-        self.metadata.get("general.architecture").and_then(|v| v.as_str())
+        self.metadata
+            .get("general.architecture")
+            .and_then(|v| v.as_str())
     }
 
     /// Look up a metadata value by exact key.
@@ -481,7 +510,9 @@ impl Gguf {
             .data_offset
             .checked_add(t.offset as usize)
             .ok_or_else(|| fmt("tensor offset overflow"))?;
-        let end = start.checked_add(len).ok_or_else(|| fmt("tensor length overflow"))?;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| fmt("tensor length overflow"))?;
         match &self.source {
             Source::Memory(bytes) => {
                 if end > bytes.len() {
@@ -560,7 +591,10 @@ impl Gguf {
         self.metadata.get(key).and_then(|v| v.as_usize())
     }
     fn meta_f32_or(&self, key: &str, default: f32) -> f32 {
-        self.metadata.get(key).and_then(|v| v.as_f32()).unwrap_or(default)
+        self.metadata
+            .get(key)
+            .and_then(|v| v.as_f32())
+            .unwrap_or(default)
     }
 
     fn dequant_named(&self, name: &str) -> Result<Vec<f32>> {
@@ -577,7 +611,12 @@ impl Gguf {
     /// avoids re-quantizing an already-quantized GGUF onto Ferrum's coarser
     /// per-row grid, at the cost of resident RAM. An optional bias is loaded if
     /// present.
-    fn linear_from(&self, name: &str, bias_name: Option<&str>, prec: Option<QKind>) -> Result<Linear> {
+    fn linear_from(
+        &self,
+        name: &str,
+        bias_name: Option<&str>,
+        prec: Option<QKind>,
+    ) -> Result<Linear> {
         let t = self
             .tensor(name)
             .ok_or_else(|| fmt(&format!("GGUF tensor '{name}' not found")))?
@@ -597,7 +636,9 @@ impl Gguf {
             return Err(fmt(&format!("bias for '{name}' has wrong length")));
         }
         match prec {
-            Some(kind) => Linear::quantized(n_in, n_out, QWeight::from_f32(&w, n_in, n_out, kind), bias),
+            Some(kind) => {
+                Linear::quantized(n_in, n_out, QWeight::from_f32(&w, n_in, n_out, kind), bias)
+            }
             None => Linear::new(n_in, n_out, w, bias),
         }
     }
@@ -665,18 +706,47 @@ impl Gguf {
         let mut blocks = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
             let p = format!("blk.{i}");
-            let attn_norm = RmsNorm::new(self.dequant_named(&format!("{p}.attn_norm.weight"))?, eps);
+            let attn_norm =
+                RmsNorm::new(self.dequant_named(&format!("{p}.attn_norm.weight"))?, eps);
             // Qwen2 carries q/k/v biases; Llama does not (loaded only if present).
-            let wq = self.linear_from(&format!("{p}.attn_q.weight"), Some(&format!("{p}.attn_q.bias")), prec)?;
-            let wk = self.linear_from(&format!("{p}.attn_k.weight"), Some(&format!("{p}.attn_k.bias")), prec)?;
-            let wv = self.linear_from(&format!("{p}.attn_v.weight"), Some(&format!("{p}.attn_v.bias")), prec)?;
+            let wq = self.linear_from(
+                &format!("{p}.attn_q.weight"),
+                Some(&format!("{p}.attn_q.bias")),
+                prec,
+            )?;
+            let wk = self.linear_from(
+                &format!("{p}.attn_k.weight"),
+                Some(&format!("{p}.attn_k.bias")),
+                prec,
+            )?;
+            let wv = self.linear_from(
+                &format!("{p}.attn_v.weight"),
+                Some(&format!("{p}.attn_v.bias")),
+                prec,
+            )?;
             let wo = self.linear_from(&format!("{p}.attn_output.weight"), None, prec)?;
-            let attn = Attention::new(wq, wk, wv, wo, n_heads, n_kv, head_dim, rope_dim, rope_base, RopeType::Norm)?;
+            let attn = Attention::new(
+                wq,
+                wk,
+                wv,
+                wo,
+                n_heads,
+                n_kv,
+                head_dim,
+                rope_dim,
+                rope_base,
+                RopeType::Norm,
+            )?;
             let ffn_norm = RmsNorm::new(self.dequant_named(&format!("{p}.ffn_norm.weight"))?, eps);
             let gate = self.linear_from(&format!("{p}.ffn_gate.weight"), None, prec)?;
             let up = self.linear_from(&format!("{p}.ffn_up.weight"), None, prec)?;
             let down = self.linear_from(&format!("{p}.ffn_down.weight"), None, prec)?;
-            blocks.push(LlamaBlock { attn_norm, attn, ffn_norm, ffn: FeedForward::new(gate, up, down) });
+            blocks.push(LlamaBlock {
+                attn_norm,
+                attn,
+                ffn_norm,
+                ffn: FeedForward::new(gate, up, down),
+            });
         }
 
         let final_norm = RmsNorm::new(self.dequant_named("output_norm.weight")?, eps);
@@ -686,9 +756,12 @@ impl Gguf {
         } else {
             let w = transpose_2d(&tok_emb, vocab, dim); // [vocab,dim] → [dim,vocab]
             match prec {
-                Some(kind) => {
-                    Linear::quantized(dim, vocab, QWeight::from_f32(&w, dim, vocab, kind), vec![0.0; vocab])?
-                }
+                Some(kind) => Linear::quantized(
+                    dim,
+                    vocab,
+                    QWeight::from_f32(&w, dim, vocab, kind),
+                    vec![0.0; vocab],
+                )?,
                 None => Linear::new(dim, vocab, w, vec![0.0; vocab])?,
             }
         };
@@ -707,7 +780,13 @@ impl Gguf {
             norm_eps: eps,
             context_len: ctx,
         };
-        Ok(LlamaModel { cfg, tok_emb, blocks, final_norm, lm_head })
+        Ok(LlamaModel {
+            cfg,
+            tok_emb,
+            blocks,
+            final_norm,
+            lm_head,
+        })
     }
 }
 
@@ -889,9 +968,12 @@ fn dequant_q6_k(raw: &[u8], n: usize) -> Result<Vec<f32>> {
             for l in 0..32 {
                 let is = l / 16;
                 let q1 = ((ql[qlo + l] & 0x0F) as i32 | ((qh[qho + l] & 3) as i32) << 4) - 32;
-                let q2 = ((ql[qlo + l + 32] & 0x0F) as i32 | (((qh[qho + l] >> 2) & 3) as i32) << 4) - 32;
+                let q2 = ((ql[qlo + l + 32] & 0x0F) as i32
+                    | (((qh[qho + l] >> 2) & 3) as i32) << 4)
+                    - 32;
                 let q3 = ((ql[qlo + l] >> 4) as i32 | (((qh[qho + l] >> 4) & 3) as i32) << 4) - 32;
-                let q4 = ((ql[qlo + l + 32] >> 4) as i32 | (((qh[qho + l] >> 6) & 3) as i32) << 4) - 32;
+                let q4 =
+                    ((ql[qlo + l + 32] >> 4) as i32 | (((qh[qho + l] >> 6) & 3) as i32) << 4) - 32;
                 let sc = |k: usize| (scales[sco + k] as i8) as f32;
                 out[oo + l] = d * sc(is) * q1 as f32;
                 out[oo + l + 32] = d * sc(is + 2) * q2 as f32;
@@ -953,7 +1035,9 @@ mod tests {
         let q8_vals: Vec<f32> = (0..QK as i32).map(|i| q8_d * (i - 16) as f32).collect();
         // Q4_0: d * (nibble-8), nibble 0..15 → value in [-8,7]·d.
         let q4_d = 0.25f32;
-        let q4_vals: Vec<f32> = (0..QK as i32).map(|i| q4_d * ((i % 15) - 8) as f32).collect();
+        let q4_vals: Vec<f32> = (0..QK as i32)
+            .map(|i| q4_d * ((i % 15) - 8) as f32)
+            .collect();
 
         let mut data = Vec::new();
         // F32 tensor.
@@ -1051,7 +1135,12 @@ mod tests {
         // Round-trips within the int4 step of each row.
         let back = qw.to_f32();
         let direct = g.dequantize(g.tensor("t_q8").unwrap()).unwrap();
-        let mae: f32 = back.iter().zip(&direct).map(|(a, b)| (a - b).abs()).sum::<f32>() / 32.0;
+        let mae: f32 = back
+            .iter()
+            .zip(&direct)
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
+            / 32.0;
         assert!(mae < 0.3, "int4 import mae {mae}");
     }
 
@@ -1117,7 +1206,11 @@ mod tests {
     }
     impl TBuf {
         fn new() -> Self {
-            Self { infos: Vec::new(), data: Vec::new(), count: 0 }
+            Self {
+                infos: Vec::new(),
+                data: Vec::new(),
+                count: 0,
+            }
         }
         /// Append an F32 tensor with GGUF dims `ne` (fastest axis first) and
         /// row-major values.
@@ -1158,38 +1251,98 @@ mod tests {
         };
 
         let mut t = TBuf::new();
-        t.add("token_embd.weight", &[dim as u64, vocab as u64], &rnd(vocab * dim));
+        t.add(
+            "token_embd.weight",
+            &[dim as u64, vocab as u64],
+            &rnd(vocab * dim),
+        );
         for i in 0..n_layers {
             let p = format!("blk.{i}");
-            t.add(&format!("{p}.attn_norm.weight"), &[dim as u64], &vec![1.0; dim]);
-            t.add(&format!("{p}.attn_q.weight"), &[dim as u64, qd as u64], &rnd(dim * qd));
-            t.add(&format!("{p}.attn_k.weight"), &[dim as u64, qd as u64], &rnd(dim * qd));
-            t.add(&format!("{p}.attn_v.weight"), &[dim as u64, qd as u64], &rnd(dim * qd));
+            t.add(
+                &format!("{p}.attn_norm.weight"),
+                &[dim as u64],
+                &vec![1.0; dim],
+            );
+            t.add(
+                &format!("{p}.attn_q.weight"),
+                &[dim as u64, qd as u64],
+                &rnd(dim * qd),
+            );
+            t.add(
+                &format!("{p}.attn_k.weight"),
+                &[dim as u64, qd as u64],
+                &rnd(dim * qd),
+            );
+            t.add(
+                &format!("{p}.attn_v.weight"),
+                &[dim as u64, qd as u64],
+                &rnd(dim * qd),
+            );
             if with_bias {
                 t.add(&format!("{p}.attn_q.bias"), &[qd as u64], &rnd(qd));
                 t.add(&format!("{p}.attn_k.bias"), &[qd as u64], &rnd(qd));
                 t.add(&format!("{p}.attn_v.bias"), &[qd as u64], &rnd(qd));
             }
-            t.add(&format!("{p}.attn_output.weight"), &[qd as u64, dim as u64], &rnd(qd * dim));
-            t.add(&format!("{p}.ffn_norm.weight"), &[dim as u64], &vec![1.0; dim]);
-            t.add(&format!("{p}.ffn_gate.weight"), &[dim as u64, ffn as u64], &rnd(dim * ffn));
-            t.add(&format!("{p}.ffn_up.weight"), &[dim as u64, ffn as u64], &rnd(dim * ffn));
-            t.add(&format!("{p}.ffn_down.weight"), &[ffn as u64, dim as u64], &rnd(ffn * dim));
+            t.add(
+                &format!("{p}.attn_output.weight"),
+                &[qd as u64, dim as u64],
+                &rnd(qd * dim),
+            );
+            t.add(
+                &format!("{p}.ffn_norm.weight"),
+                &[dim as u64],
+                &vec![1.0; dim],
+            );
+            t.add(
+                &format!("{p}.ffn_gate.weight"),
+                &[dim as u64, ffn as u64],
+                &rnd(dim * ffn),
+            );
+            t.add(
+                &format!("{p}.ffn_up.weight"),
+                &[dim as u64, ffn as u64],
+                &rnd(dim * ffn),
+            );
+            t.add(
+                &format!("{p}.ffn_down.weight"),
+                &[ffn as u64, dim as u64],
+                &rnd(ffn * dim),
+            );
         }
         t.add("output_norm.weight", &[dim as u64], &vec![1.0; dim]);
         if with_output {
-            t.add("output.weight", &[dim as u64, vocab as u64], &rnd(dim * vocab));
+            t.add(
+                "output.weight",
+                &[dim as u64, vocab as u64],
+                &rnd(dim * vocab),
+            );
         }
 
         let mut meta = Vec::new();
         kv_str(&mut meta, "general.architecture", arch);
         kv_u32(&mut meta, &format!("{arch}.embedding_length"), dim as u32);
         kv_u32(&mut meta, &format!("{arch}.block_count"), n_layers as u32);
-        kv_u32(&mut meta, &format!("{arch}.attention.head_count"), n_heads as u32);
-        kv_u32(&mut meta, &format!("{arch}.attention.head_count_kv"), n_heads as u32);
-        kv_u32(&mut meta, &format!("{arch}.feed_forward_length"), ffn as u32);
+        kv_u32(
+            &mut meta,
+            &format!("{arch}.attention.head_count"),
+            n_heads as u32,
+        );
+        kv_u32(
+            &mut meta,
+            &format!("{arch}.attention.head_count_kv"),
+            n_heads as u32,
+        );
+        kv_u32(
+            &mut meta,
+            &format!("{arch}.feed_forward_length"),
+            ffn as u32,
+        );
         kv_u32(&mut meta, &format!("{arch}.context_length"), 32);
-        kv_f32(&mut meta, &format!("{arch}.attention.layer_norm_rms_epsilon"), 1e-5);
+        kv_f32(
+            &mut meta,
+            &format!("{arch}.attention.layer_norm_rms_epsilon"),
+            1e-5,
+        );
         kv_f32(&mut meta, &format!("{arch}.rope.freq_base"), 10000.0);
         let n_meta = 9u64;
 
@@ -1231,14 +1384,22 @@ mod tests {
         for (ti, &tok) in tokens.iter().enumerate() {
             let step = model.forward_one(tok, &mut cache).unwrap();
             for (v, &s) in step.iter().enumerate() {
-                assert!((s - logits.data[ti * vocab + v]).abs() < 1e-2,
-                    "imported model cached vs full mismatch at {ti},{v}");
+                assert!(
+                    (s - logits.data[ti * vocab + v]).abs() < 1e-2,
+                    "imported model cached vs full mismatch at {ti},{v}"
+                );
             }
         }
 
         // Generation runs end to end.
         let out = model
-            .generate(&[1, 2], 6, &crate::llm::SamplingParams::with_temperature(0.8), None, &mut crate::rng::Rng::new(1))
+            .generate(
+                &[1, 2],
+                6,
+                &crate::llm::SamplingParams::with_temperature(0.8),
+                None,
+                &mut crate::rng::Rng::new(1),
+            )
             .unwrap();
         assert_eq!(out.len(), 6);
         assert!(out.iter().all(|&t| t < model.cfg.vocab_size));
@@ -1270,11 +1431,17 @@ mod tests {
         let lin = g.linear_from("w", None, Some(QKind::Int8)).unwrap();
         use crate::layer::Layer;
         let x = vec![0.3f32, -0.7, 0.2, 0.9];
-        let y = lin.forward(&crate::tensor::Tensor::matrix(1, n_in, x.clone()).unwrap()).unwrap();
+        let y = lin
+            .forward(&crate::tensor::Tensor::matrix(1, n_in, x.clone()).unwrap())
+            .unwrap();
         // Reference y[o] = Σ_i w_gguf[o*n_in + i] · x[i].
         for o in 0..n_out {
             let want: f32 = (0..n_in).map(|i| w_gguf[o * n_in + i] * x[i]).sum();
-            assert!((y.data[o] - want).abs() < 0.05, "y[{o}]={} want {want}", y.data[o]);
+            assert!(
+                (y.data[o] - want).abs() < 0.05,
+                "y[{o}]={} want {want}",
+                y.data[o]
+            );
         }
     }
 
@@ -1311,7 +1478,10 @@ mod tests {
         let pad = align_up(bytes.len(), DEFAULT_ALIGNMENT as usize) - bytes.len();
         bytes.extend(std::iter::repeat_n(0u8, pad));
         let g = Gguf::parse(bytes).unwrap();
-        assert!(g.load_llama(QKind::Int8).is_err(), "missing embedding_length must error");
+        assert!(
+            g.load_llama(QKind::Int8).is_err(),
+            "missing embedding_length must error"
+        );
     }
 
     // ── Block dequantizers Q8_1 / Q4_1 ────────────────────────────────────────
@@ -1435,7 +1605,8 @@ mod tests {
     #[test]
     fn streamed_open_matches_in_memory_parse() {
         let bytes = synth_llama();
-        let path = std::env::temp_dir().join(format!("ferrum_gguf_stream_{}.gguf", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("ferrum_gguf_stream_{}.gguf", std::process::id()));
         std::fs::write(&path, &bytes).unwrap();
 
         let mem = Gguf::parse(bytes).unwrap();
@@ -1446,12 +1617,20 @@ mod tests {
         // A tensor dequantizes identically whether held in memory or streamed.
         let tm = mem.tensor("token_embd.weight").unwrap().clone();
         let ts = streamed.tensor("token_embd.weight").unwrap().clone();
-        assert_eq!(mem.dequantize(&tm).unwrap(), streamed.dequantize(&ts).unwrap());
+        assert_eq!(
+            mem.dequantize(&tm).unwrap(),
+            streamed.dequantize(&ts).unwrap()
+        );
 
         // And a full model loads through the streamed path.
         let model = streamed.load_llama(QKind::Int8).unwrap();
         assert_eq!(model.cfg.vocab_size, 10);
-        assert!(model.forward_tokens(&[1, 2, 3]).unwrap().data.iter().all(|v| v.is_finite()));
+        assert!(model
+            .forward_tokens(&[1, 2, 3])
+            .unwrap()
+            .data
+            .iter()
+            .all(|v| v.is_finite()));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1500,8 +1679,8 @@ mod tests {
     fn parse_rejects_truncation() {
         let mut bytes = synth_llama();
         bytes.truncate(bytes.len() - 20); // chop tensor data
-        // Parse succeeds (directory intact) but dequantizing the last tensor
-        // must fail because its data ran off the end.
+                                          // Parse succeeds (directory intact) but dequantizing the last tensor
+                                          // must fail because its data ran off the end.
         let g = Gguf::parse(bytes);
         if let Ok(g) = g {
             let last = g.tensors.last().unwrap().clone();

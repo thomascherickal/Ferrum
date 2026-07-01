@@ -44,7 +44,16 @@ pub struct DatasetEntry {
 
 // Compact row builder for the static dataset catalog below.
 #[allow(clippy::too_many_arguments)]
-fn e(id: &str, name: &str, source: &str, desc: &str, mb: u32, repo: &str, file: &str, fmt: &str) -> DatasetEntry {
+fn e(
+    id: &str,
+    name: &str,
+    source: &str,
+    desc: &str,
+    mb: u32,
+    repo: &str,
+    file: &str,
+    fmt: &str,
+) -> DatasetEntry {
     DatasetEntry {
         id: id.into(),
         name: name.into(),
@@ -117,14 +126,21 @@ pub fn catalog() -> Vec<DatasetEntry> {
 
 /// The catalog filtered to entries within the CPU size budget.
 pub fn cpu_catalog() -> Vec<DatasetEntry> {
-    catalog().into_iter().filter(|d| d.approx_mb <= CPU_MAX_MB).collect()
+    catalog()
+        .into_iter()
+        .filter(|d| d.approx_mb <= CPU_MAX_MB)
+        .collect()
 }
 
 // ── URL builders ──────────────────────────────────────────────────────────────
 
 /// Public HuggingFace dataset file URL (`resolve` endpoint).
 pub fn hf_resolve_url(repo: &str, file: &str, revision: &str) -> String {
-    let rev = if revision.is_empty() { "main" } else { revision };
+    let rev = if revision.is_empty() {
+        "main"
+    } else {
+        revision
+    };
     format!("https://huggingface.co/datasets/{repo}/resolve/{rev}/{file}")
 }
 
@@ -156,12 +172,17 @@ pub fn parse_kaggle_json(s: &str) -> Option<KaggleCreds> {
 /// Resolve Kaggle credentials from the environment, then from
 /// `~/.kaggle/kaggle.json`.
 pub fn kaggle_creds() -> Option<KaggleCreds> {
-    if let (Ok(username), Ok(key)) = (std::env::var("KAGGLE_USERNAME"), std::env::var("KAGGLE_KEY")) {
+    if let (Ok(username), Ok(key)) = (
+        std::env::var("KAGGLE_USERNAME"),
+        std::env::var("KAGGLE_KEY"),
+    ) {
         if !username.is_empty() && !key.is_empty() {
             return Some(KaggleCreds { username, key });
         }
     }
-    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok()?;
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
     let path = Path::new(&home).join(".kaggle").join("kaggle.json");
     let s = std::fs::read_to_string(path).ok()?;
     parse_kaggle_json(&s)
@@ -181,14 +202,25 @@ pub fn base64_encode(input: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(B64[(n >> 18) as usize & 63] as char);
         out.push(B64[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { B64[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { B64[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            B64[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
 
 fn basic_auth_header(user: &str, key: &str) -> String {
-    format!("Basic {}", base64_encode(format!("{user}:{key}").as_bytes()))
+    format!(
+        "Basic {}",
+        base64_encode(format!("{user}:{key}").as_bytes())
+    )
 }
 
 // ── Destination path ──────────────────────────────────────────────────────────
@@ -248,7 +280,8 @@ fn download_to_file(
     }
     let resp = req.call().map_err(|e| format!("download failed: {e}"))?;
     let mut reader = resp.into_reader().take(DOWNLOAD_CAP as u64);
-    let mut file = std::fs::File::create(dest).map_err(|e| format!("cannot create {dest:?}: {e}"))?;
+    let mut file =
+        std::fs::File::create(dest).map_err(|e| format!("cannot create {dest:?}: {e}"))?;
     let n = std::io::copy(&mut reader, &mut file).map_err(|e| format!("write failed: {e}"))?;
     if n == 0 {
         let _ = std::fs::remove_file(dest);
@@ -287,12 +320,21 @@ pub async fn download_dataset(id: String, dest_dir: String) -> Result<DownloadRe
                      kaggle.json in ~/.kaggle/"
                         .to_string()
                 })?;
-                (kaggle_file_url(&entry.repo, &entry.file), Some(creds), None, "kaggle")
+                (
+                    kaggle_file_url(&entry.repo, &entry.file),
+                    Some(creds),
+                    None,
+                    "kaggle",
+                )
             }
             other => return Err(format!("unknown dataset source '{other}'")),
         };
         let bytes = download_to_file(&url, basic.as_ref(), bearer.as_deref(), &dest)?;
-        Ok(DownloadResult { path: dest.display().to_string(), bytes, source: source.into() })
+        Ok(DownloadResult {
+            path: dest.display().to_string(),
+            bytes,
+            source: source.into(),
+        })
     })
     .await
     .map_err(|e| format!("task error: {e}"))?
@@ -316,7 +358,11 @@ pub async fn download_hf_file(
         let dest = dest_path(&dest_dir, &file, "dataset.bin");
         let token = hf_token.or_else(|| std::env::var("HF_TOKEN").ok());
         let bytes = download_to_file(&url, None, token.as_deref(), &dest)?;
-        Ok(DownloadResult { path: dest.display().to_string(), bytes, source: "huggingface".into() })
+        Ok(DownloadResult {
+            path: dest.display().to_string(),
+            bytes,
+            source: "huggingface".into(),
+        })
     })
     .await
     .map_err(|e| format!("task error: {e}"))?
@@ -341,7 +387,11 @@ pub async fn download_kaggle_file(
         let url = kaggle_file_url(&owner_slug, &file);
         let dest = dest_path(&dest_dir, &file, "dataset.bin");
         let bytes = download_to_file(&url, Some(&creds), None, &dest)?;
-        Ok(DownloadResult { path: dest.display().to_string(), bytes, source: "kaggle".into() })
+        Ok(DownloadResult {
+            path: dest.display().to_string(),
+            bytes,
+            source: "kaggle".into(),
+        })
     })
     .await
     .map_err(|e| format!("task error: {e}"))?
@@ -357,7 +407,11 @@ mod tests {
         assert!(!c.is_empty());
         for d in &c {
             assert!(d.approx_mb <= CPU_MAX_MB, "{} exceeds CPU budget", d.id);
-            assert!(d.source == "huggingface" || d.source == "kaggle", "bad source for {}", d.id);
+            assert!(
+                d.source == "huggingface" || d.source == "kaggle",
+                "bad source for {}",
+                d.id
+            );
             assert!(!d.repo.is_empty() && !d.file.is_empty());
         }
         // ids are unique.
@@ -373,7 +427,13 @@ mod tests {
         // Every listed entry is within budget (all of ours are, but the filter
         // is what the command relies on).
         assert!(cpu_catalog().iter().all(|d| d.approx_mb <= CPU_MAX_MB));
-        assert_eq!(cpu_catalog().len(), catalog().iter().filter(|d| d.approx_mb <= CPU_MAX_MB).count());
+        assert_eq!(
+            cpu_catalog().len(),
+            catalog()
+                .iter()
+                .filter(|d| d.approx_mb <= CPU_MAX_MB)
+                .count()
+        );
     }
 
     #[test]
@@ -420,7 +480,10 @@ mod tests {
 
     #[test]
     fn safe_basename_strips_directories_and_traversal() {
-        assert_eq!(safe_basename("wikitext-2-raw/wiki.train.raw", "fb"), "wiki.train.raw");
+        assert_eq!(
+            safe_basename("wikitext-2-raw/wiki.train.raw", "fb"),
+            "wiki.train.raw"
+        );
         assert_eq!(safe_basename("a/b/c.txt", "fb"), "c.txt");
         assert_eq!(safe_basename("../../etc/passwd", "fb"), "passwd");
         assert_eq!(safe_basename("", "fallback"), "fallback");

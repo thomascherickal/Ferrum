@@ -7,8 +7,8 @@
 
 use crate::error::{InferError, Result};
 use crate::layer::{
-    matmul_naive_helper, matmul_transpose_b_helper, ActivationLayer, Embedding, LayerNorm,
-    Linear, TransformerBlock,
+    matmul_naive_helper, matmul_transpose_b_helper, ActivationLayer, Embedding, LayerNorm, Linear,
+    TransformerBlock,
 };
 use crate::model::Sequential;
 use crate::ops;
@@ -143,8 +143,7 @@ fn ln_bwd(
         let mean_dxhat_xhat = sum_dxhat_xhat / n;
         for c in 0..cols {
             let dxh = dy.data[base + c] * g.data[c];
-            dx[base + c] =
-                inv_std[r] * (dxh - mean_dxhat - xhat.data[base + c] * mean_dxhat_xhat);
+            dx[base + c] = inv_std[r] * (dxh - mean_dxhat - xhat.data[base + c] * mean_dxhat_xhat);
         }
     }
     Ok((
@@ -160,7 +159,16 @@ fn ln_bwd(
 /// independent and the sum over r keeps its original order, so the split is
 /// exact. Shared by the serial and pooled paths.
 #[allow(clippy::too_many_arguments)]
-fn transpose_a_block(a: &[f32], b: &[f32], m: usize, n: usize, k: usize, r0: usize, r1: usize, out: &mut [f32]) {
+fn transpose_a_block(
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    r0: usize,
+    r1: usize,
+    out: &mut [f32],
+) {
     for i in r0..r1 {
         let o_row = (i - r0) * n;
         for r in 0..k {
@@ -372,27 +380,43 @@ impl BlockT {
 
     fn params_mut(&mut self) -> [&mut Param; 16] {
         [
-            &mut self.ln1_g, &mut self.ln1_b,
-            &mut self.q_w, &mut self.q_b,
-            &mut self.k_w, &mut self.k_b,
-            &mut self.v_w, &mut self.v_b,
-            &mut self.o_w, &mut self.o_b,
-            &mut self.ln2_g, &mut self.ln2_b,
-            &mut self.f1_w, &mut self.f1_b,
-            &mut self.f2_w, &mut self.f2_b,
+            &mut self.ln1_g,
+            &mut self.ln1_b,
+            &mut self.q_w,
+            &mut self.q_b,
+            &mut self.k_w,
+            &mut self.k_b,
+            &mut self.v_w,
+            &mut self.v_b,
+            &mut self.o_w,
+            &mut self.o_b,
+            &mut self.ln2_g,
+            &mut self.ln2_b,
+            &mut self.f1_w,
+            &mut self.f1_b,
+            &mut self.f2_w,
+            &mut self.f2_b,
         ]
     }
 
     fn params(&self) -> [&Param; 16] {
         [
-            &self.ln1_g, &self.ln1_b,
-            &self.q_w, &self.q_b,
-            &self.k_w, &self.k_b,
-            &self.v_w, &self.v_b,
-            &self.o_w, &self.o_b,
-            &self.ln2_g, &self.ln2_b,
-            &self.f1_w, &self.f1_b,
-            &self.f2_w, &self.f2_b,
+            &self.ln1_g,
+            &self.ln1_b,
+            &self.q_w,
+            &self.q_b,
+            &self.k_w,
+            &self.k_b,
+            &self.v_w,
+            &self.v_b,
+            &self.o_w,
+            &self.o_b,
+            &self.ln2_g,
+            &self.ln2_b,
+            &self.f1_w,
+            &self.f1_b,
+            &self.f2_w,
+            &self.f2_b,
         ]
     }
 }
@@ -420,7 +444,9 @@ impl Cur<'_> {
     }
     fn u64(&mut self) -> Result<u64> {
         let b = self.take(8)?;
-        Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+        Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
     }
     fn u8(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
@@ -463,8 +489,8 @@ struct BlockCache {
     q: Tensor,
     k: Tensor,
     v: Tensor,
-    probs: Vec<f32>,  // [B·H·T·T]
-    concat: Tensor,   // attention head outputs before out_proj [M, C]
+    probs: Vec<f32>, // [B·H·T·T]
+    concat: Tensor,  // attention head outputs before out_proj [M, C]
     xhat2: Tensor,
     inv_std2: Vec<f32>,
     norm2: Tensor,
@@ -750,8 +776,12 @@ impl TransformerNet {
         out.extend_from_slice(b"FCKP");
         out.extend_from_slice(&1u32.to_le_bytes());
         for v in [
-            self.vocab_size, self.context_len, self.embed_dim,
-            self.num_heads, self.hidden_dim(), self.blocks.len(),
+            self.vocab_size,
+            self.context_len,
+            self.embed_dim,
+            self.num_heads,
+            self.hidden_dim(),
+            self.blocks.len(),
         ] {
             out.extend_from_slice(&(v as u32).to_le_bytes());
         }
@@ -779,7 +809,9 @@ impl TransformerNet {
         }
         let version = c.u32()?;
         if version != 1 {
-            return Err(InferError::Format(format!("unsupported checkpoint version {version}")));
+            return Err(InferError::Format(format!(
+                "unsupported checkpoint version {version}"
+            )));
         }
         let vocab = c.u32()? as usize;
         let ctx = c.u32()? as usize;
@@ -881,7 +913,11 @@ impl TransformerNet {
     /// v5 writer uses. 1-D parameters fall back to a single scale.
     pub(crate) fn fake_quantize_weights(&mut self) {
         for t in self.param_tensors_mut() {
-            let channels = if t.shape.len() >= 2 { t.shape[0].max(1) } else { 1 };
+            let channels = if t.shape.len() >= 2 {
+                t.shape[0].max(1)
+            } else {
+                1
+            };
             crate::quant::fake_quantize_int8_per_channel(&mut t.data, channels);
         }
     }
@@ -896,8 +932,8 @@ impl TransformerNet {
     pub fn num_params(&self) -> usize {
         let block = |b: &BlockT| -> usize {
             [
-                &b.ln1_g, &b.ln1_b, &b.q_w, &b.q_b, &b.k_w, &b.k_b, &b.v_w, &b.v_b,
-                &b.o_w, &b.o_b, &b.ln2_g, &b.ln2_b, &b.f1_w, &b.f1_b, &b.f2_w, &b.f2_b,
+                &b.ln1_g, &b.ln1_b, &b.q_w, &b.q_b, &b.k_w, &b.k_b, &b.v_w, &b.v_b, &b.o_w, &b.o_b,
+                &b.ln2_g, &b.ln2_b, &b.f1_w, &b.f1_b, &b.f2_w, &b.f2_b,
             ]
             .iter()
             .map(|p| p.data.numel())
@@ -927,7 +963,12 @@ impl TransformerNet {
     /// using a local generator seeded by `seed` (so the masks are deterministic
     /// for a given seed and a worker can reproduce them in `backward` from the
     /// cache). `dropout = 0` is the plain, deterministic forward.
-    pub fn forward_train(&self, tokens: &[usize], dropout: f32, seed: u64) -> Result<(Tensor, FwdCache)> {
+    pub fn forward_train(
+        &self,
+        tokens: &[usize],
+        dropout: f32,
+        seed: u64,
+    ) -> Result<(Tensor, FwdCache)> {
         let t = self.context_len;
         if tokens.is_empty() || !tokens.len().is_multiple_of(t) {
             return Err(InferError::DimMismatch(format!(
@@ -946,7 +987,8 @@ impl TransformerNet {
         for (r, &tok) in tokens.iter().enumerate() {
             if tok >= self.vocab_size {
                 return Err(InferError::DimMismatch(format!(
-                    "token {tok} out of range for vocab {}", self.vocab_size
+                    "token {tok} out of range for vocab {}",
+                    self.vocab_size
                 )));
             }
             let tb = tok * c;
@@ -977,9 +1019,20 @@ impl TransformerNet {
             let (h_ffn, ffn_dropout) = if dropout > 0.0 {
                 let scale = 1.0 / (1.0 - dropout);
                 let mask: Vec<f32> = (0..h_relu.data.len())
-                    .map(|_| if drng.next_f32() < dropout { 0.0 } else { scale })
+                    .map(|_| {
+                        if drng.next_f32() < dropout {
+                            0.0
+                        } else {
+                            scale
+                        }
+                    })
                     .collect();
-                let dropped: Vec<f32> = h_relu.data.iter().zip(&mask).map(|(&h, &m)| h * m).collect();
+                let dropped: Vec<f32> = h_relu
+                    .data
+                    .iter()
+                    .zip(&mask)
+                    .map(|(&h, &m)| h * m)
+                    .collect();
                 (Tensor::new(h_relu.shape.clone(), dropped)?, Some(mask))
             } else {
                 (h_relu, None)
@@ -1088,7 +1141,14 @@ impl TransformerNet {
             // x_attn = x + out_proj(concat)
             let (g_o_w, g_o_b, d_concat) = linear_bwd(&bc.concat, &blk.o_w.data, &d_xattn)?;
             let (dq, dk, dv) = attn_bwd(
-                &d_concat, &bc.q, &bc.k, &bc.v, &bc.probs, batch, t, self.num_heads,
+                &d_concat,
+                &bc.q,
+                &bc.k,
+                &bc.v,
+                &bc.probs,
+                batch,
+                t,
+                self.num_heads,
             )?;
             let (g_q_w, g_q_b, d_n1a) = linear_bwd(&bc.norm1, &blk.q_w.data, &dq)?;
             let (g_k_w, g_k_b, d_n1b) = linear_bwd(&bc.norm1, &blk.k_w.data, &dk)?;
@@ -1100,14 +1160,22 @@ impl TransformerNet {
             dx = ops::add(&d_xattn, &d_x_ln)?;
 
             block_grads[bi] = Some(BlockGrads {
-                ln1_g: g_ln1_g, ln1_b: g_ln1_b,
-                q_w: g_q_w, q_b: g_q_b,
-                k_w: g_k_w, k_b: g_k_b,
-                v_w: g_v_w, v_b: g_v_b,
-                o_w: g_o_w, o_b: g_o_b,
-                ln2_g: g_ln2_g, ln2_b: g_ln2_b,
-                f1_w: g_f1_w, f1_b: g_f1_b,
-                f2_w: g_f2_w, f2_b: g_f2_b,
+                ln1_g: g_ln1_g,
+                ln1_b: g_ln1_b,
+                q_w: g_q_w,
+                q_b: g_q_b,
+                k_w: g_k_w,
+                k_b: g_k_b,
+                v_w: g_v_w,
+                v_b: g_v_b,
+                o_w: g_o_w,
+                o_b: g_o_b,
+                ln2_g: g_ln2_g,
+                ln2_b: g_ln2_b,
+                f1_w: g_f1_w,
+                f1_b: g_f1_b,
+                f2_w: g_f2_w,
+                f2_b: g_f2_b,
             });
         }
 
@@ -1170,7 +1238,10 @@ impl TransformerNet {
         let mut adam = *adam;
         if let Some(sched) = self.lr_schedule {
             adam.lr = sched.lr_at(t);
-            vprintln!("[train_transformer::step] step {t}: scheduled lr={:.6e}", adam.lr);
+            vprintln!(
+                "[train_transformer::step] step {t}: scheduled lr={:.6e}",
+                adam.lr
+            );
         }
         if self.weight_decay != 0.0 {
             adam.weight_decay = self.weight_decay;
@@ -1207,14 +1278,22 @@ impl TransformerNet {
                 self.context_len,
                 self.num_heads,
                 self.embed_dim,
-                b.ln1_g.data.data.clone(), b.ln1_b.data.data.clone(),
-                b.q_w.data.data.clone(), b.q_b.data.data.clone(),
-                b.k_w.data.data.clone(), b.k_b.data.data.clone(),
-                b.v_w.data.data.clone(), b.v_b.data.data.clone(),
-                b.o_w.data.data.clone(), b.o_b.data.data.clone(),
-                b.ln2_g.data.data.clone(), b.ln2_b.data.data.clone(),
-                b.f1_w.data.data.clone(), b.f1_b.data.data.clone(),
-                b.f2_w.data.data.clone(), b.f2_b.data.data.clone(),
+                b.ln1_g.data.data.clone(),
+                b.ln1_b.data.data.clone(),
+                b.q_w.data.data.clone(),
+                b.q_b.data.data.clone(),
+                b.k_w.data.data.clone(),
+                b.k_b.data.data.clone(),
+                b.v_w.data.data.clone(),
+                b.v_b.data.data.clone(),
+                b.o_w.data.data.clone(),
+                b.o_b.data.data.clone(),
+                b.ln2_g.data.data.clone(),
+                b.ln2_b.data.data.clone(),
+                b.f1_w.data.data.clone(),
+                b.f1_b.data.data.clone(),
+                b.f2_w.data.data.clone(),
+                b.f2_b.data.data.clone(),
             )?));
         }
         m.push(Box::new(LayerNorm::new(
@@ -1242,7 +1321,9 @@ impl TransformerNet {
             head_w_data,
             self.head_b.data.data.clone(),
         )?));
-        m.push(Box::new(ActivationLayer::new(crate::activation::Activation::Softmax)));
+        m.push(Box::new(ActivationLayer::new(
+            crate::activation::Activation::Softmax,
+        )));
         Ok(m)
     }
 }
@@ -1318,7 +1399,11 @@ pub fn train_transformer_epoch(
     }
     let avg = total / steps as f32;
     if verbose::is_verbose() {
-        vprintln!("[train_transformer::epoch] steps={}, mean loss={:.6}", steps, avg);
+        vprintln!(
+            "[train_transformer::epoch] steps={}, mean loss={:.6}",
+            steps,
+            avg
+        );
     }
     Ok(avg)
 }
@@ -1433,8 +1518,11 @@ pub fn train_transformer_epoch_threaded(
                         // network copy (weights+grad+Adam moments ≈16 B/param).
                         let sub_in = &input_ref[w0 * t..w1 * t];
                         let sub_tg = &targets_ref[w0 * t..w1 * t];
-                        let (logits, cache) =
-                            net_ref.forward_train(sub_in, dropout, base_seed.wrapping_add(w0 as u64 + 1))?;
+                        let (logits, cache) = net_ref.forward_train(
+                            sub_in,
+                            dropout,
+                            base_seed.wrapping_add(w0 as u64 + 1),
+                        )?;
                         let (loss, dlogits) = softmax_cross_entropy(&logits, sub_tg)?;
                         let shard_rows = ((w1 - w0) * t) as f32;
                         let weight = shard_rows / total_rows;
@@ -1577,7 +1665,7 @@ mod tests {
             };
         }
 
-        check!(tok_emb, "tok_emb", &[4, 9, 13]);   // rows of tokens 1,2,3
+        check!(tok_emb, "tok_emb", &[4, 9, 13]); // rows of tokens 1,2,3
         check!(pos_emb, "pos_emb", &[0, 5, 11]);
         check!(lnf_g, "lnf_g", &[0, 3]);
         check!(lnf_b, "lnf_b", &[1]);
@@ -1643,12 +1731,18 @@ mod tests {
         net.fake_quantize_weights();
         let quantized = net.snapshot_weights();
         // Quantization actually moved (large) weights off their fp32 values.
-        assert!(masters.iter().zip(&quantized).any(|(m, q)| m != q),
-            "fake quantization changed no weights");
+        assert!(
+            masters.iter().zip(&quantized).any(|(m, q)| m != q),
+            "fake quantization changed no weights"
+        );
         // Per-channel snapping is idempotent — re-quantizing lands on the same
         // grid (so every value already sits on its channel's int8 grid).
         net.fake_quantize_weights();
-        assert_eq!(net.snapshot_weights(), quantized, "fake quantization is not idempotent");
+        assert_eq!(
+            net.snapshot_weights(),
+            quantized,
+            "fake quantization is not idempotent"
+        );
         // Restore must bring back the fp32 masters exactly.
         net.restore_weights(&masters);
         assert_eq!(net.snapshot_weights(), masters);
@@ -1679,7 +1773,10 @@ mod tests {
             output_dim: 4,
             tokenizer_state: String::new(),
         };
-        let norm = Normalizer { means: vec![], stds: vec![] };
+        let norm = Normalizer {
+            means: vec![],
+            stds: vec![],
+        };
         let bytes = to_bytes_quantized(&model, &norm, &meta).unwrap();
         let (m2, _, _) = from_bytes(&bytes).unwrap();
         let x = Tensor::matrix(1, 4, vec![0.0, 1.0, 2.0, 3.0]).unwrap();
@@ -1730,7 +1827,10 @@ mod tests {
             output_dim: 6,
             tokenizer_state: String::new(),
         };
-        let norm = Normalizer { means: vec![], stds: vec![] };
+        let norm = Normalizer {
+            means: vec![],
+            stds: vec![],
+        };
         let bytes = to_bytes(&model, &norm, &meta).unwrap();
         let (m2, _, _) = from_bytes(&bytes).unwrap();
         let x = Tensor::matrix(1, 4, vec![0.0, 3.0, 1.0, 5.0]).unwrap();
@@ -1777,7 +1877,8 @@ mod tests {
 
         let mut threaded = base.clone();
         let mut rt = Rng::new(99);
-        let lt = train_transformer_epoch_threaded(&mut threaded, &tokens, 8, &adam, &mut rt, 1).unwrap();
+        let lt =
+            train_transformer_epoch_threaded(&mut threaded, &tokens, 8, &adam, &mut rt, 1).unwrap();
 
         assert_eq!(ls, lt, "loss differs with a single shard");
         assert_eq!(
@@ -1803,9 +1904,13 @@ mod tests {
 
         let mut par = base.clone();
         let mut rp = Rng::new(1);
-        let lp = train_transformer_epoch_threaded(&mut par, &tokens, batch, &adam, &mut rp, 4).unwrap();
+        let lp =
+            train_transformer_epoch_threaded(&mut par, &tokens, batch, &adam, &mut rp, 4).unwrap();
 
-        assert!((ls - lp).abs() < 1e-4, "loss diverged: serial {ls} vs threaded {lp}");
+        assert!(
+            (ls - lp).abs() < 1e-4,
+            "loss diverged: serial {ls} vs threaded {lp}"
+        );
         let sw = serial.snapshot_weights();
         let pw = par.snapshot_weights();
         for (a, b) in sw.iter().zip(&pw) {
@@ -1845,12 +1950,17 @@ mod tests {
         let tokens: Vec<usize> = (0..400).map(|i| i % 4).collect();
         let adam = Adam::new(0.01);
         let mut rng = Rng::new(123);
-        let first = train_transformer_epoch_threaded(&mut net, &tokens, 16, &adam, &mut rng, 4).unwrap();
+        let first =
+            train_transformer_epoch_threaded(&mut net, &tokens, 16, &adam, &mut rng, 4).unwrap();
         let mut last = first;
         for _ in 0..30 {
-            last = train_transformer_epoch_threaded(&mut net, &tokens, 16, &adam, &mut rng, 4).unwrap();
+            last = train_transformer_epoch_threaded(&mut net, &tokens, 16, &adam, &mut rng, 4)
+                .unwrap();
         }
-        assert!(last < first * 0.5, "threaded loss did not halve: {first:.4} → {last:.4}");
+        assert!(
+            last < first * 0.5,
+            "threaded loss did not halve: {first:.4} → {last:.4}"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1866,17 +1976,32 @@ mod tests {
         net.set_weight_decay(0.1);
         assert!((net.weight_decay() - 0.1).abs() < 1e-9);
         // Known values; zero gradients so only weight decay acts.
-        for v in net.tok_emb.data.data.iter_mut() { *v = 2.0; } // 2-D weight
-        for v in net.head_b.data.data.iter_mut() { *v = 2.0; }  // 1-D bias
-        for v in net.lnf_g.data.data.iter_mut() { *v = 2.0; }   // 1-D LN gain
+        for v in net.tok_emb.data.data.iter_mut() {
+            *v = 2.0;
+        } // 2-D weight
+        for v in net.head_b.data.data.iter_mut() {
+            *v = 2.0;
+        } // 1-D bias
+        for v in net.lnf_g.data.data.iter_mut() {
+            *v = 2.0;
+        } // 1-D LN gain
         net.zero_grad();
         let adam = Adam::new(0.5); // lr; decay coefficient comes from the net
         net.step(&adam).unwrap();
         // Weight matrix: 2 − 0.5·0.1·2 = 1.9
-        assert!((net.tok_emb.data.data[0] - 1.9).abs() < 1e-5, "tok_emb not decayed");
+        assert!(
+            (net.tok_emb.data.data[0] - 1.9).abs() < 1e-5,
+            "tok_emb not decayed"
+        );
         // Bias and LN gain untouched.
-        assert!((net.head_b.data.data[0] - 2.0).abs() < 1e-6, "bias was decayed");
-        assert!((net.lnf_g.data.data[0] - 2.0).abs() < 1e-6, "LN gain was decayed");
+        assert!(
+            (net.head_b.data.data[0] - 2.0).abs() < 1e-6,
+            "bias was decayed"
+        );
+        assert!(
+            (net.lnf_g.data.data[0] - 2.0).abs() < 1e-6,
+            "LN gain was decayed"
+        );
     }
 
     #[test]
@@ -1891,12 +2016,21 @@ mod tests {
         // un-decayed LayerNorm gains/biases.
         let matrix_norm = |net: &TransformerNet| -> f32 {
             let b = &net.blocks[0];
-            [&b.q_w, &b.k_w, &b.v_w, &b.o_w, &b.f1_w, &b.f2_w, &net.head_w, &net.tok_emb]
-                .iter()
-                .flat_map(|p| p.data.data.iter())
-                .map(|x| x * x)
-                .sum::<f32>()
-                .sqrt()
+            [
+                &b.q_w,
+                &b.k_w,
+                &b.v_w,
+                &b.o_w,
+                &b.f1_w,
+                &b.f2_w,
+                &net.head_w,
+                &net.tok_emb,
+            ]
+            .iter()
+            .flat_map(|p| p.data.data.iter())
+            .map(|x| x * x)
+            .sum::<f32>()
+            .sqrt()
         };
 
         let mut plain = base.clone();
@@ -1910,14 +2044,20 @@ mod tests {
         for e in 0..30 {
             train_transformer_epoch(&mut plain, &tokens, 8, &adam, &mut rp).unwrap();
             let l = train_transformer_epoch(&mut decayed, &tokens, 8, &adam, &mut rd).unwrap();
-            if e == 0 { first = l; }
+            if e == 0 {
+                first = l;
+            }
             last = l;
         }
-        assert!(last < first, "decayed run should still reduce loss: {first:.4} → {last:.4}");
+        assert!(
+            last < first,
+            "decayed run should still reduce loss: {first:.4} → {last:.4}"
+        );
         assert!(
             matrix_norm(&decayed) < matrix_norm(&plain),
             "weight decay should shrink the weight matrices: {} vs {}",
-            matrix_norm(&decayed), matrix_norm(&plain)
+            matrix_norm(&decayed),
+            matrix_norm(&plain)
         );
     }
 
@@ -1930,7 +2070,10 @@ mod tests {
         let (b, _) = net.forward_train(&tokens, 0.5, 123).unwrap();
         assert_eq!(a.data, b.data, "same seed must reproduce the dropout mask");
         let (c, _) = net.forward_train(&tokens, 0.5, 999).unwrap();
-        assert_ne!(a.data, c.data, "a different seed must change the dropout pattern");
+        assert_ne!(
+            a.data, c.data,
+            "a different seed must change the dropout pattern"
+        );
         // dropout = 0 is exactly the plain forward.
         let (d, _) = net.forward_train(&tokens, 0.0, 123).unwrap();
         let (e, _) = net.forward(&tokens).unwrap();
@@ -1960,14 +2103,25 @@ mod tests {
                 for &i in $idx {
                     let analytic = net.blocks[0].$field.grad.data[i];
                     net.blocks[0].$field.data.data[i] += eps;
-                    let lp = softmax_cross_entropy(&net.forward_train(&tokens, p, seed).unwrap().0, &targets).unwrap().0;
+                    let lp = softmax_cross_entropy(
+                        &net.forward_train(&tokens, p, seed).unwrap().0,
+                        &targets,
+                    )
+                    .unwrap()
+                    .0;
                     net.blocks[0].$field.data.data[i] -= 2.0 * eps;
-                    let lm = softmax_cross_entropy(&net.forward_train(&tokens, p, seed).unwrap().0, &targets).unwrap().0;
+                    let lm = softmax_cross_entropy(
+                        &net.forward_train(&tokens, p, seed).unwrap().0,
+                        &targets,
+                    )
+                    .unwrap()
+                    .0;
                     net.blocks[0].$field.data.data[i] += eps;
                     let numeric = (lp - lm) / (2.0 * eps);
                     assert!(
                         (numeric - analytic).abs() < 6e-3 + 0.03 * analytic.abs(),
-                        "{}[{i}]: analytic={analytic:.6} numeric={numeric:.6}", stringify!($field)
+                        "{}[{i}]: analytic={analytic:.6} numeric={numeric:.6}",
+                        stringify!($field)
                     );
                 }
             };
@@ -1989,7 +2143,10 @@ mod tests {
         for _ in 0..40 {
             last = train_transformer_epoch(&mut net, &tokens, 8, &adam, &mut rng).unwrap();
         }
-        assert!(last < first * 0.7, "dropout training did not reduce loss: {first:.4} → {last:.4}");
+        assert!(
+            last < first * 0.7,
+            "dropout training did not reduce loss: {first:.4} → {last:.4}"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2146,7 +2303,10 @@ mod tests {
         for _ in 0..30 {
             last = train_transformer_epoch(&mut net, &tokens, 8, &adam, &mut rng).unwrap();
         }
-        assert!(last < first * 0.6, "tied training did not reduce loss: {first:.4} → {last:.4}");
+        assert!(
+            last < first * 0.6,
+            "tied training did not reduce loss: {first:.4} → {last:.4}"
+        );
 
         // The exported head must equal the final tok_embᵀ.
         let model = net.to_inference().unwrap();
@@ -2160,7 +2320,8 @@ mod tests {
         for v in 0..vocab {
             for e in 0..embed {
                 assert!(
-                    (head.weight.data[e * vocab + v] - net.tok_emb.data.data[v * embed + e]).abs() < 1e-6,
+                    (head.weight.data[e * vocab + v] - net.tok_emb.data.data[v * embed + e]).abs()
+                        < 1e-6,
                     "exported head ≠ tok_embᵀ at ({v},{e})"
                 );
             }
@@ -2205,13 +2366,19 @@ mod tests {
 
         let before = net.step_count();
         train_transformer_epoch(&mut net, &tokens, 1, &adam, &mut rng).unwrap();
-        assert_eq!(net.step_count() - before, num_windows,
-            "batch_size=1 must take exactly num_windows steps");
+        assert_eq!(
+            net.step_count() - before,
+            num_windows,
+            "batch_size=1 must take exactly num_windows steps"
+        );
 
         let before = net.step_count();
         train_transformer_epoch(&mut net, &tokens, 10_000, &adam, &mut rng).unwrap();
-        assert_eq!(net.step_count() - before, 1,
-            "an over-sized batch must take exactly one full-corpus step");
+        assert_eq!(
+            net.step_count() - before,
+            1,
+            "an over-sized batch must take exactly one full-corpus step"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2240,7 +2407,11 @@ mod tests {
         let steps_per_epoch = (tokens.len() - 4).div_ceil(8) as u64;
         let total = steps_per_epoch * 10;
         let mut sched_net = base.clone();
-        sched_net.set_lr_schedule(Some(LrSchedule::warmup_cosine(0.02, steps_per_epoch * 2, total)));
+        sched_net.set_lr_schedule(Some(LrSchedule::warmup_cosine(
+            0.02,
+            steps_per_epoch * 2,
+            total,
+        )));
         assert!(sched_net.lr_schedule().is_some());
         let mut rs = Rng::new(5);
         let first = train_transformer_epoch(&mut sched_net, &tokens, 8, &adam, &mut rs).unwrap();
@@ -2249,8 +2420,15 @@ mod tests {
             last = train_transformer_epoch(&mut sched_net, &tokens, 8, &adam, &mut rs).unwrap();
         }
 
-        assert_eq!(sched_net.step_count(), total, "step counter must drive the schedule");
-        assert!(last < first, "scheduled run should reduce loss: {first:.4} → {last:.4}");
+        assert_eq!(
+            sched_net.step_count(),
+            total,
+            "step counter must drive the schedule"
+        );
+        assert!(
+            last < first,
+            "scheduled run should reduce loss: {first:.4} → {last:.4}"
+        );
         // Warmup means the scheduled run takes a genuinely different path.
         assert_ne!(
             fixed.snapshot_weights(),
@@ -2279,7 +2457,11 @@ mod tests {
         // Pure: no weight or optimizer-moment mutation.
         let weights_before = net.snapshot_weights();
         let flat = net.backward_grads(&dl, &cache).unwrap();
-        assert_eq!(net.snapshot_weights(), weights_before, "backward_grads mutated weights");
+        assert_eq!(
+            net.snapshot_weights(),
+            weights_before,
+            "backward_grads mutated weights"
+        );
         assert_eq!(flat.len(), net.num_params());
 
         // The in-place wrapper stores exactly those gradients (canonical order).
@@ -2289,7 +2471,10 @@ mod tests {
         for g in net.grad_tensors_mut() {
             stored.extend_from_slice(&g.data);
         }
-        assert_eq!(stored, flat, "in-place backward differs from backward_grads");
+        assert_eq!(
+            stored, flat,
+            "in-place backward differs from backward_grads"
+        );
     }
 
     /// The shared-weight (no-clone) data-parallel path stays numerically in
@@ -2315,7 +2500,10 @@ mod tests {
         let pw = par.snapshot_weights();
         for (a, b) in sw.iter().zip(&pw) {
             for (x, y) in a.iter().zip(b) {
-                assert!((x - y).abs() < 1e-3, "shared-weight path drifted from serial: {x} vs {y}");
+                assert!(
+                    (x - y).abs() < 1e-3,
+                    "shared-weight path drifted from serial: {x} vs {y}"
+                );
             }
         }
     }
@@ -2347,8 +2535,14 @@ mod tests {
             }
         }
         let post = sumsq.sqrt() as f32;
-        assert!(pre > max_norm, "test needs an exploding-enough grad: pre={pre}");
-        assert!(post <= max_norm + 1e-4, "post-clip norm {post} exceeds budget {max_norm}");
+        assert!(
+            pre > max_norm,
+            "test needs an exploding-enough grad: pre={pre}"
+        );
+        assert!(
+            post <= max_norm + 1e-4,
+            "post-clip norm {post} exceeds budget {max_norm}"
+        );
     }
 
     /// Gradient clipping is actually wired into the epoch: with the same seed,
@@ -2363,7 +2557,9 @@ mod tests {
         let adam = Adam::new(0.05);
 
         let finite = |net: &mut TransformerNet| {
-            net.snapshot_weights().iter().all(|t| t.iter().all(|v| v.is_finite()))
+            net.snapshot_weights()
+                .iter()
+                .all(|t| t.iter().all(|v| v.is_finite()))
         };
 
         let mut unclipped = base.clone();
@@ -2383,7 +2579,10 @@ mod tests {
         }
 
         assert!(finite(&mut clipped), "clipped run must stay finite");
-        assert!(last < first, "clipped run should still reduce loss: {first:.4} → {last:.4}");
+        assert!(
+            last < first,
+            "clipped run should still reduce loss: {first:.4} → {last:.4}"
+        );
         // The clip threshold changed the optimization path.
         assert_ne!(
             unclipped.snapshot_weights(),

@@ -36,8 +36,12 @@ pub fn clip_grad_norm(grads: &mut [&mut Tensor], max_norm: f32) -> f32 {
                 *x *= scale;
             }
         }
-        vprintln!("[optim::clip_grad_norm] clipped: norm={:.6e} → max_norm={:.6e} (scale={:.6e})",
-            norm, max_norm, scale);
+        vprintln!(
+            "[optim::clip_grad_norm] clipped: norm={:.6e} → max_norm={:.6e} (scale={:.6e})",
+            norm,
+            max_norm,
+            scale
+        );
     }
     norm
 }
@@ -76,14 +80,21 @@ impl Sgd {
         for i in 0..param.data.len() {
             vel.data[i] = self.momentum * vel.data[i] + grad.data[i];
             let update = self.lr * vel.data[i];
-            if update.abs() > max_update { max_update = update.abs(); }
+            if update.abs() > max_update {
+                max_update = update.abs();
+            }
             param.data[i] -= update;
         }
 
         if verbose::is_verbose() {
             vprintln!("[optim::Sgd::step]   max |update|={:.6e}", max_update);
             let (pmin, pmax, pmean) = verbose::stats(&param.data);
-            vprintln!("[optim::Sgd::step]   post-step param: min={:.6e}, max={:.6e}, mean={:.6e}", pmin, pmax, pmean);
+            vprintln!(
+                "[optim::Sgd::step]   post-step param: min={:.6e}, max={:.6e}, mean={:.6e}",
+                pmin,
+                pmax,
+                pmean
+            );
             verbose::check_nan_inf(&param.data, "Sgd::step param");
             verbose::check_nan_inf(&vel.data, "Sgd::step velocity");
         }
@@ -126,12 +137,24 @@ pub struct LrSchedule {
 impl LrSchedule {
     /// Warmup-then-cosine-decay to zero — the most common transformer schedule.
     pub fn warmup_cosine(base_lr: f32, warmup_steps: u64, total_steps: u64) -> Self {
-        Self { base_lr, min_lr: 0.0, warmup_steps, total_steps, decay: LrDecay::Cosine }
+        Self {
+            base_lr,
+            min_lr: 0.0,
+            warmup_steps,
+            total_steps,
+            decay: LrDecay::Cosine,
+        }
     }
 
     /// Warmup-then-linear-decay to zero.
     pub fn warmup_linear(base_lr: f32, warmup_steps: u64, total_steps: u64) -> Self {
-        Self { base_lr, min_lr: 0.0, warmup_steps, total_steps, decay: LrDecay::Linear }
+        Self {
+            base_lr,
+            min_lr: 0.0,
+            warmup_steps,
+            total_steps,
+            decay: LrDecay::Linear,
+        }
     }
 
     /// Learning rate at 1-based `step`. Ramps 0 → `base_lr` across the warmup,
@@ -182,12 +205,21 @@ impl Adam {
     /// Standard defaults: β1=0.9, β2=0.999, ε=1e-8, no weight decay.
     pub fn new(lr: f32) -> Self {
         vprintln!("[optim::Adam::new] lr={}", lr);
-        Self { lr, beta1: 0.9, beta2: 0.999, eps: 1e-8, weight_decay: 0.0 }
+        Self {
+            lr,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay: 0.0,
+        }
     }
 
     /// AdamW with decoupled `weight_decay` (see the struct docs).
     pub fn with_weight_decay(lr: f32, weight_decay: f32) -> Self {
-        Self { weight_decay, ..Self::new(lr) }
+        Self {
+            weight_decay,
+            ..Self::new(lr)
+        }
     }
 
     /// m ← β1·m + (1−β1)·g;  v ← β2·v + (1−β2)·g²;
@@ -420,8 +452,12 @@ mod tests {
     #[test]
     fn cosine_decays_from_base_to_min() {
         let s = LrSchedule::warmup_cosine(0.2, 10, 110); // 100 decay steps
-        // Midpoint of decay (step 60) → halfway down for cosine: base/2.
-        assert!((s.lr_at(60) - 0.1).abs() < 1e-3, "cosine midpoint = {}", s.lr_at(60));
+                                                         // Midpoint of decay (step 60) → halfway down for cosine: base/2.
+        assert!(
+            (s.lr_at(60) - 0.1).abs() < 1e-3,
+            "cosine midpoint = {}",
+            s.lr_at(60)
+        );
         // Reaches min_lr (0) by total_steps and stays there.
         assert!(s.lr_at(110).abs() < 1e-6);
         assert!(s.lr_at(500).abs() < 1e-6);
@@ -436,11 +472,21 @@ mod tests {
 
     #[test]
     fn linear_decay_hits_midpoint_and_floor() {
-        let s = LrSchedule { base_lr: 1.0, min_lr: 0.2, warmup_steps: 0, total_steps: 100, decay: LrDecay::Linear };
+        let s = LrSchedule {
+            base_lr: 1.0,
+            min_lr: 0.2,
+            warmup_steps: 0,
+            total_steps: 100,
+            decay: LrDecay::Linear,
+        };
         // No warmup: step 1 ≈ base (one step into a 100-step linear decay).
         assert!((s.lr_at(1) - 0.992).abs() < 1e-3);
         // Halfway → halfway between base and min.
-        assert!((s.lr_at(50) - 0.6).abs() < 1e-3, "linear midpoint = {}", s.lr_at(50));
+        assert!(
+            (s.lr_at(50) - 0.6).abs() < 1e-3,
+            "linear midpoint = {}",
+            s.lr_at(50)
+        );
         // Floors at min_lr.
         assert!((s.lr_at(100) - 0.2).abs() < 1e-6);
         assert!((s.lr_at(200) - 0.2).abs() < 1e-6);

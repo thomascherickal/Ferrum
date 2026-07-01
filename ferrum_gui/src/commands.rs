@@ -152,7 +152,8 @@ pub fn save_corpus(text: String, path: String) -> Result<usize, String> {
     }
     if let Some(parent) = Path::new(&path).parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {parent:?}: {e}"))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {parent:?}: {e}"))?;
         }
     }
     std::fs::write(&path, text.as_bytes()).map_err(|e| format!("cannot write {path}: {e}"))?;
@@ -280,8 +281,19 @@ fn train_inner(app: AppHandle, p: TrainParams) -> Result<TrainResult, String> {
                 return Err("vocab must be 0 (character-level) or ≥ 256 (byte-level BPE)".into());
             }
             GenerativeSLM::train_transformer_threaded_with_callback(
-                &corpus, p.context_len, p.embed_dim, p.num_heads, p.num_blocks, p.hidden_dim,
-                p.epochs, p.lr, p.batch_size, p.vocab_size, p.threads, &mut rng, progress,
+                &corpus,
+                p.context_len,
+                p.embed_dim,
+                p.num_heads,
+                p.num_blocks,
+                p.hidden_dim,
+                p.epochs,
+                p.lr,
+                p.batch_size,
+                p.vocab_size,
+                p.threads,
+                &mut rng,
+                progress,
             )
         }
         "embedded" => {
@@ -290,13 +302,29 @@ fn train_inner(app: AppHandle, p: TrainParams) -> Result<TrainResult, String> {
                 return Err("vocab must be 0 (character-level) or ≥ 256 (byte-level BPE)".into());
             }
             GenerativeSLM::train_embedded_with_callback(
-                &corpus, p.context_len, p.embed_dim, p.hidden_dim, p.epochs, p.lr, p.momentum,
-                p.batch_size, p.vocab_size, &mut rng, progress,
+                &corpus,
+                p.context_len,
+                p.embed_dim,
+                p.hidden_dim,
+                p.epochs,
+                p.lr,
+                p.momentum,
+                p.batch_size,
+                p.vocab_size,
+                &mut rng,
+                progress,
             )
         }
         "onehot" => GenerativeSLM::train_with_callback(
-            &corpus, p.context_len, p.hidden_dim, p.epochs, p.lr, p.momentum, p.batch_size,
-            &mut rng, progress,
+            &corpus,
+            p.context_len,
+            p.hidden_dim,
+            p.epochs,
+            p.lr,
+            p.momentum,
+            p.batch_size,
+            &mut rng,
+            progress,
         ),
         other => {
             ferrum_core::set_verbose(false);
@@ -313,7 +341,9 @@ fn train_inner(app: AppHandle, p: TrainParams) -> Result<TrainResult, String> {
         .map_err(|e| format!("cannot save model {}: {e}", p.model_path))?;
     ferrum_core::set_verbose(false);
 
-    let bytes = std::fs::metadata(&p.model_path).map(|m| m.len()).unwrap_or(0);
+    let bytes = std::fs::metadata(&p.model_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
     let tokenizer = if slm.meta.tokenizer_state.is_empty() {
         "character-level".to_string()
     } else {
@@ -433,7 +463,9 @@ pub async fn evaluate_slm(params: EvalParams) -> Result<EvalRow, String> {
         };
         let slm = GenerativeSLM::load(&params.model_path)
             .map_err(|e| format!("cannot load model {}: {e}", params.model_path))?;
-        let ev = slm.evaluate(&text).map_err(|e| format!("evaluation failed: {e}"))?;
+        let ev = slm
+            .evaluate(&text)
+            .map_err(|e| format!("evaluation failed: {e}"))?;
         Ok(EvalRow {
             model: file_name(&params.model_path),
             num_predictions: ev.num_predictions,
@@ -478,9 +510,16 @@ pub fn model_info(path: String) -> Result<ModelInfo, String> {
     let slm = GenerativeSLM::from_bytes(&raw).map_err(|e| format!("not a valid model: {e}"))?;
     let m = &slm.meta;
     let (tokenizer, merges) = if m.tokenizer_state.is_empty() {
-        (format!("character-level ({} chars)", m.class_names.len()), 0)
+        (
+            format!("character-level ({} chars)", m.class_names.len()),
+            0,
+        )
     } else {
-        let merges = m.tokenizer_state.split(';').filter(|s| !s.is_empty()).count();
+        let merges = m
+            .tokenizer_state
+            .split(';')
+            .filter(|s| !s.is_empty())
+            .count();
         (format!("byte-level BPE ({} tokens)", m.output_dim), merges)
     };
     Ok(ModelInfo {
@@ -488,7 +527,11 @@ pub fn model_info(path: String) -> Result<ModelInfo, String> {
         bytes: raw.len() as u64,
         format: format!(
             "FINF v{version}{}",
-            if version == 5 { " (int8-quantized)" } else { " (f32)" }
+            if version == 5 {
+                " (int8-quantized)"
+            } else {
+                " (f32)"
+            }
         ),
         name: m.dataset_name.clone(),
         task: format!("{:?}", m.task),
@@ -539,7 +582,12 @@ fn available_memory_bytes() -> Option<usize> {
     let info = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in info.lines() {
         if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            return rest.split_whitespace().next()?.parse::<usize>().ok().map(|kb| kb * 1024);
+            return rest
+                .split_whitespace()
+                .next()?
+                .parse::<usize>()
+                .ok()
+                .map(|kb| kb * 1024);
         }
     }
     None
@@ -669,7 +717,11 @@ fn gguf_run_inner(p: GgufRunParams) -> Result<GgufRunResult, String> {
     }
     // A fine-tune checkpoint holds f32 weights, so applying one forces f32.
     let resume = p.resume.as_ref().filter(|s| !s.trim().is_empty()).cloned();
-    let prec = if resume.is_some() { None } else { parse_quant(&p.quant)? };
+    let prec = if resume.is_some() {
+        None
+    } else {
+        parse_quant(&p.quant)?
+    };
     let g = Gguf::open(&p.model_path).map_err(|e| format!("cannot open {}: {e}", p.model_path))?;
 
     // Memory guard before the (potentially large) load.
@@ -686,19 +738,25 @@ fn gguf_run_inner(p: GgufRunParams) -> Result<GgufRunResult, String> {
     }
 
     let tok = GgufTokenizer::from_gguf(&g).ok();
-    let mut model = g.load_llama_prec(prec).map_err(|e| format!("cannot load model: {e}"))?;
+    let mut model = g
+        .load_llama_prec(prec)
+        .map_err(|e| format!("cannot load model: {e}"))?;
 
     // Overlay fine-tuned weights from a checkpoint, if requested.
     if let Some(ckpt) = &resume {
-        let bytes = std::fs::read(ckpt).map_err(|e| format!("cannot read checkpoint {ckpt}: {e}"))?;
+        let bytes =
+            std::fs::read(ckpt).map_err(|e| format!("cannot read checkpoint {ckpt}: {e}"))?;
         let mut tr = LlamaTrainer::new(model).map_err(|e| format!("cannot wrap model: {e}"))?;
         tr.load_checkpoint_into(&bytes)
             .map_err(|e| format!("cannot apply checkpoint {ckpt}: {e}"))?;
         model = tr.model;
     }
 
-    let prompt_ids: Vec<usize> = if let Some(ids) = p.ids.as_ref().filter(|s| !s.trim().is_empty()) {
-        ids.split_whitespace().filter_map(|s| s.parse().ok()).collect()
+    let prompt_ids: Vec<usize> = if let Some(ids) = p.ids.as_ref().filter(|s| !s.trim().is_empty())
+    {
+        ids.split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect()
     } else if let Some(t) = &tok {
         let mut v = Vec::new();
         if let Some(bos) = t.bos() {
@@ -724,7 +782,11 @@ fn gguf_run_inner(p: GgufRunParams) -> Result<GgufRunResult, String> {
 
     let text = match &tok {
         Some(t) => format!("{}{}", p.prompt, t.decode(&out)),
-        None => out.iter().map(usize::to_string).collect::<Vec<_>>().join(" "),
+        None => out
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(" "),
     };
     Ok(GgufRunResult {
         text,
@@ -778,7 +840,10 @@ pub struct FinetuneResult {
 /// `.flck` checkpoint that `run_gguf { resume }` can overlay on the base model.
 /// Per-epoch progress streams as `finetune-progress` events.
 #[tauri::command]
-pub async fn finetune_gguf(app: AppHandle, params: FinetuneParams) -> Result<FinetuneResult, String> {
+pub async fn finetune_gguf(
+    app: AppHandle,
+    params: FinetuneParams,
+) -> Result<FinetuneResult, String> {
     tauri::async_runtime::spawn_blocking(move || finetune_inner(app, params))
         .await
         .map_err(|e| format!("task error: {e}"))?
@@ -881,10 +946,18 @@ fn finetune_inner(app: AppHandle, p: FinetuneParams) -> Result<FinetuneResult, S
     // resumed run does not start past total_steps — which would pin the LR at 0.
     if p.warmup > 0 {
         let total = tr.step_count() + steps_per_epoch * p.epochs as u64;
-        tr.set_lr_schedule(Some(LrSchedule::warmup_cosine(p.lr, p.warmup, total.max(p.warmup + 1))));
+        tr.set_lr_schedule(Some(LrSchedule::warmup_cosine(
+            p.lr,
+            p.warmup,
+            total.max(p.warmup + 1),
+        )));
     }
 
-    let threads = if p.threads == 0 { ferrum_core::num_threads() } else { p.threads };
+    let threads = if p.threads == 0 {
+        ferrum_core::num_threads()
+    } else {
+        p.threads
+    };
 
     // 5. Train, streaming per-epoch progress.
     let t0 = std::time::Instant::now();
@@ -1113,9 +1186,17 @@ mod tests {
     fn fetch_text_rejects_non_http_urls() {
         // Validation happens before any network access, so these never hit the
         // wire — they fail fast with a clear message.
-        for url in ["ftp://example.com/x", "file:///etc/passwd", "javascript:1", ""] {
+        for url in [
+            "ftp://example.com/x",
+            "file:///etc/passwd",
+            "javascript:1",
+            "",
+        ] {
             let err = fetch_text(url, 1024).unwrap_err();
-            assert!(err.contains("http://"), "unexpected error for {url:?}: {err}");
+            assert!(
+                err.contains("http://"),
+                "unexpected error for {url:?}: {err}"
+            );
         }
     }
 

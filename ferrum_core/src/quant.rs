@@ -204,7 +204,13 @@ impl QWeight {
                 q
             }
         };
-        Self { rows, cols, kind, scales, q }
+        Self {
+            rows,
+            cols,
+            kind,
+            scales,
+            q,
+        }
     }
 
     /// Sign-extend a 4-bit nibble (`0..=15`) to `-8..=7`.
@@ -230,7 +236,11 @@ impl QWeight {
                 let src = &self.q[r * rb..(r + 1) * rb];
                 // Split-half layout (see the `q` field docs).
                 for c in 0..self.cols {
-                    let nib = if c < half { src[c] & 0x0F } else { src[c - half] >> 4 };
+                    let nib = if c < half {
+                        src[c] & 0x0F
+                    } else {
+                        src[c - half] >> 4
+                    };
                     out[c] = Self::nibble_to_i8(nib) as f32 * scale;
                 }
             }
@@ -313,7 +323,9 @@ mod tests {
     fn per_channel_each_row_on_its_own_grid() {
         let channels = 4;
         let row = 32; // 4×32 = 128 ≥ QUANT_MIN_LEN
-        let mut data: Vec<f32> = (0..channels * row).map(|i| (i as f32 * 0.13).sin()).collect();
+        let mut data: Vec<f32> = (0..channels * row)
+            .map(|i| (i as f32 * 0.13).sin())
+            .collect();
         // Give one row a large outlier so its scale differs from the others.
         data[2 * row + 5] = 50.0;
         assert!(fake_quantize_int8_per_channel(&mut data, channels));
@@ -326,7 +338,10 @@ mod tests {
             }
         }
         // The outlier row's scale is much larger than a neighbour's.
-        assert!(scales[2] > scales[0] * 5.0, "outlier did not localise to its row");
+        assert!(
+            scales[2] > scales[0] * 5.0,
+            "outlier did not localise to its row"
+        );
     }
 
     #[test]
@@ -359,8 +374,10 @@ mod tests {
         };
         let e_tensor = err(&per_tensor);
         let e_channel = err(&per_channel);
-        assert!(e_channel * 5.0 < e_tensor,
-            "per-channel ({e_channel:.4}) should be far below per-tensor ({e_tensor:.4})");
+        assert!(
+            e_channel * 5.0 < e_tensor,
+            "per-channel ({e_channel:.4}) should be far below per-tensor ({e_tensor:.4})"
+        );
     }
 
     #[test]
@@ -377,7 +394,9 @@ mod tests {
     #[test]
     fn qweight_int8_roundtrip_bounded_by_half_scale() {
         let (rows, cols) = (5, 40);
-        let data: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.017).sin() * 1.3).collect();
+        let data: Vec<f32> = (0..rows * cols)
+            .map(|i| (i as f32 * 0.017).sin() * 1.3)
+            .collect();
         let qw = QWeight::from_f32(&data, rows, cols, QKind::Int8);
         assert_eq!(qw.kind, QKind::Int8);
         assert_eq!(qw.resident_bytes(), rows * cols + rows * 4);
@@ -409,7 +428,9 @@ mod tests {
             for c in 0..cols {
                 assert!(
                     (row[c] - back[r * cols + c]).abs() <= step * 0.5 + 1e-6,
-                    "int4 r{r} c{c}: {} vs {}", row[c], back[r * cols + c]
+                    "int4 r{r} c{c}: {} vs {}",
+                    row[c],
+                    back[r * cols + c]
                 );
             }
         }

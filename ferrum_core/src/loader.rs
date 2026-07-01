@@ -81,7 +81,11 @@ struct Reader<'a> {
 }
 impl<'a> Reader<'a> {
     fn new(b: &'a [u8]) -> Self {
-        Self { bytes: b, pos: 0, v5: false }
+        Self {
+            bytes: b,
+            pos: 0,
+            v5: false,
+        }
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         let end = self.pos + n;
@@ -162,7 +166,9 @@ impl<'a> Reader<'a> {
             ENC_INT4 | ENC_INT4_PER_CHANNEL => Err(InferError::Format(
                 "int4 weights are only valid for matrices (read via weights_q)".into(),
             )),
-            m => Err(InferError::Format(format!("bad weight encoding marker {m}"))),
+            m => Err(InferError::Format(format!(
+                "bad weight encoding marker {m}"
+            ))),
         }
     }
 
@@ -258,7 +264,9 @@ impl<'a> Reader<'a> {
                     Ok(LoadedWeights::F32(qw.to_f32()))
                 }
             }
-            m => Err(InferError::Format(format!("bad weight encoding marker {m}"))),
+            m => Err(InferError::Format(format!(
+                "bad weight encoding marker {m}"
+            ))),
         }
     }
 
@@ -290,7 +298,12 @@ impl LoadedWeights {
 
 /// Build a `Linear` from a loaded weight matrix, keeping it quantized in memory
 /// when the file was quantized (Opt#1) and falling back to f32 otherwise.
-fn linear_from_loaded(in_f: usize, out_f: usize, w: LoadedWeights, bias: Vec<f32>) -> Result<Linear> {
+fn linear_from_loaded(
+    in_f: usize,
+    out_f: usize,
+    w: LoadedWeights,
+    bias: Vec<f32>,
+) -> Result<Linear> {
     match w {
         LoadedWeights::Quant(qw) => Linear::quantized(in_f, out_f, qw, bias),
         LoadedWeights::F32(data) => Linear::new(in_f, out_f, data, bias),
@@ -387,7 +400,11 @@ fn push_weights(out: &mut Vec<u8>, data: &[f32], channels: usize, v5: bool, prec
             }
         }
         QPrec::Int4 => {
-            let rows = if channels > 0 && data.len().is_multiple_of(channels) { channels } else { 1 };
+            let rows = if channels > 0 && data.len().is_multiple_of(channels) {
+                channels
+            } else {
+                1
+            };
             let cols = data.len() / rows;
             let qw = QWeight::from_f32(data, rows, cols, QKind::Int4);
             out.push(ENC_INT4_PER_CHANNEL);
@@ -451,13 +468,25 @@ fn to_bytes_impl(
     // (biases, LayerNorm) use `channels = 1` and are read back through the f32
     // path, which has no int4 decoder — so they never go below int8 (int4 is
     // demoted to int8 for them). Both stay f32 below QUANT_MIN_LEN anyway.
-    let vec_prec = if prec == QPrec::Int4 { QPrec::Int8 } else { prec };
+    let vec_prec = if prec == QPrec::Int4 {
+        QPrec::Int8
+    } else {
+        prec
+    };
     let push_mat = |out: &mut Vec<u8>, data: &[f32], channels: usize| {
         push_weights(out, data, channels, v5, prec)
     };
     let push_vec = |out: &mut Vec<u8>, data: &[f32]| push_weights(out, data, 1, v5, vec_prec);
-    vprintln!("[loader::to_bytes] Serializing FINF v{} model ({} layers, prec=int{})",
-        version, model.len(), match prec { QPrec::F32 => 32, QPrec::Int8 => 8, QPrec::Int4 => 4 });
+    vprintln!(
+        "[loader::to_bytes] Serializing FINF v{} model ({} layers, prec=int{})",
+        version,
+        model.len(),
+        match prec {
+            QPrec::F32 => 32,
+            QPrec::Int8 => 8,
+            QPrec::Int4 => 4,
+        }
+    );
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
     push_u32(&mut out, version);
@@ -470,7 +499,11 @@ fn to_bytes_impl(
 
     push_u32(&mut out, model.len() as u32);
     for (layer_idx, layer) in model.layers().iter().enumerate() {
-        vprintln!("[loader::to_bytes]   layer[{}]: {}", layer_idx, layer.name());
+        vprintln!(
+            "[loader::to_bytes]   layer[{}]: {}",
+            layer_idx,
+            layer.name()
+        );
         let any = layer.as_any();
 
         if let Some(lin) = any.downcast_ref::<Linear>() {
@@ -481,14 +514,11 @@ fn to_bytes_impl(
             // memory, so a load-quantized model re-serializes correctly.
             push_mat(&mut out, &lin.weight_f32(), lin.in_features());
             push_vec(&mut out, &lin.bias.data);
-
         } else if let Some(act) = any.downcast_ref::<ActivationLayer>() {
             out.push(TAG_ACTIVATION);
             out.push(act.kind.tag());
-
         } else if any.downcast_ref::<Flatten>().is_some() {
             out.push(TAG_FLATTEN);
-
         } else if let Some(emb) = any.downcast_ref::<Embedding>() {
             out.push(TAG_EMBEDDING);
             push_usize(&mut out, emb.vocab_size());
@@ -496,13 +526,11 @@ fn to_bytes_impl(
             push_usize(&mut out, emb.embedding_dim());
             push_mat(&mut out, &emb.token_weight.data, emb.vocab_size());
             push_mat(&mut out, &emb.pos_weight.data, emb.max_seq_len());
-
         } else if let Some(ln) = any.downcast_ref::<LayerNorm>() {
             out.push(TAG_LAYERNORM);
             push_usize(&mut out, ln.dim());
             push_vec(&mut out, &ln.gamma.data);
             push_vec(&mut out, &ln.beta.data);
-
         } else if let Some(tb) = any.downcast_ref::<TransformerBlock>() {
             out.push(TAG_TRANSFORMER_BLOCK);
             push_usize(&mut out, tb.context_len());
@@ -519,7 +547,11 @@ fn to_bytes_impl(
             push_vec(&mut out, &tb.k_proj.bias.data);
             push_mat(&mut out, &tb.v_proj.weight_f32(), tb.v_proj.in_features());
             push_vec(&mut out, &tb.v_proj.bias.data);
-            push_mat(&mut out, &tb.out_proj.weight_f32(), tb.out_proj.in_features());
+            push_mat(
+                &mut out,
+                &tb.out_proj.weight_f32(),
+                tb.out_proj.in_features(),
+            );
             push_vec(&mut out, &tb.out_proj.bias.data);
             push_vec(&mut out, &tb.ln2.gamma.data);
             push_vec(&mut out, &tb.ln2.beta.data);
@@ -527,7 +559,6 @@ fn to_bytes_impl(
             push_vec(&mut out, &tb.ffn1.bias.data);
             push_mat(&mut out, &tb.ffn2.weight_f32(), tb.ffn2.in_features());
             push_vec(&mut out, &tb.ffn2.bias.data);
-
         } else {
             return Err(InferError::Format(format!(
                 "unknown layer type: {}",
@@ -562,7 +593,10 @@ pub fn from_bytes(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata
     let norm_str = r.utf8(norm_len)?;
     // SLM models may have empty normalizer — return trivial identity norm
     let norm = if norm_str.is_empty() {
-        Normalizer { means: vec![], stds: vec![] }
+        Normalizer {
+            means: vec![],
+            stds: vec![],
+        }
     } else {
         Normalizer::decode(norm_str)?
     };
@@ -578,7 +612,12 @@ pub fn from_bytes(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata
             TAG_LINEAR => {
                 let in_f = r.usize()?;
                 let out_f = r.usize()?;
-                vprintln!("[loader::from_bytes]   layer[{}]: Linear({}→{})", layer_i, in_f, out_f);
+                vprintln!(
+                    "[loader::from_bytes]   layer[{}]: Linear({}→{})",
+                    layer_i,
+                    in_f,
+                    out_f
+                );
                 let w = r.weights_q(in_f, out_f)?;
                 let bias = r.weights(out_f)?;
                 model.push(Box::new(linear_from_loaded(in_f, out_f, w, bias)?));
@@ -587,25 +626,43 @@ pub fn from_bytes(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata
                 let t = r.u8()?;
                 let act = Activation::from_tag(t)
                     .ok_or_else(|| InferError::Format(format!("bad act tag {t}")))?;
-                vprintln!("[loader::from_bytes]   layer[{}]: Activation({:?})", layer_i, act);
+                vprintln!(
+                    "[loader::from_bytes]   layer[{}]: Activation({:?})",
+                    layer_i,
+                    act
+                );
                 model.push(Box::new(ActivationLayer::new(act)));
             }
             TAG_EMBEDDING => {
                 let vocab_size = r.usize()?;
                 let max_seq_len = r.usize()?;
                 let embedding_dim = r.usize()?;
-                vprintln!("[loader::from_bytes]   layer[{}]: Embedding(vocab={}, seq={}, dim={})", layer_i, vocab_size, max_seq_len, embedding_dim);
+                vprintln!(
+                    "[loader::from_bytes]   layer[{}]: Embedding(vocab={}, seq={}, dim={})",
+                    layer_i,
+                    vocab_size,
+                    max_seq_len,
+                    embedding_dim
+                );
                 // Embeddings stay f32 in memory (lookup + add, not a GEMV), but
                 // we still read a quantized table by dequantizing on load.
                 let tok = r.weights_q(vocab_size, embedding_dim)?.into_f32();
                 let pos = r.weights_q(max_seq_len, embedding_dim)?.into_f32();
                 model.push(Box::new(Embedding::new(
-                    vocab_size, max_seq_len, embedding_dim, tok, pos,
+                    vocab_size,
+                    max_seq_len,
+                    embedding_dim,
+                    tok,
+                    pos,
                 )?));
             }
             TAG_LAYERNORM => {
                 let dim = r.usize()?;
-                vprintln!("[loader::from_bytes]   layer[{}]: LayerNorm(dim={})", layer_i, dim);
+                vprintln!(
+                    "[loader::from_bytes]   layer[{}]: LayerNorm(dim={})",
+                    layer_i,
+                    dim
+                );
                 model.push(Box::new(LayerNorm::new(
                     dim,
                     r.weights(dim)?,
@@ -680,9 +737,15 @@ pub fn save_quantized(
     meta: &ModelMetadata,
     path: &str,
 ) -> Result<()> {
-    vprintln!("[loader::save_quantized] Saving quantized model to: {}", path);
+    vprintln!(
+        "[loader::save_quantized] Saving quantized model to: {}",
+        path
+    );
     let bytes = to_bytes_quantized(model, norm, meta)?;
-    vprintln!("[loader::save_quantized] Writing {} bytes to disk", bytes.len());
+    vprintln!(
+        "[loader::save_quantized] Writing {} bytes to disk",
+        bytes.len()
+    );
     std::fs::write(path, bytes)?;
     Ok(())
 }
@@ -718,15 +781,19 @@ mod tests {
 
     fn make_bundle() -> (Sequential, Normalizer, ModelMetadata) {
         let l1 = Linear::new(
-            4, 8,
+            4,
+            8,
             (0..32).map(|i| i as f32 * 0.01).collect(),
             vec![0.0; 8],
-        ).unwrap();
+        )
+        .unwrap();
         let l2 = Linear::new(
-            8, 3,
+            8,
+            3,
             (0..24).map(|i| i as f32 * -0.01).collect(),
             vec![0.1; 3],
-        ).unwrap();
+        )
+        .unwrap();
         let model = Sequential::new()
             .with(Box::new(l1))
             .with(Box::new(ActivationLayer::new(Activation::ReLU)))
@@ -760,21 +827,32 @@ mod tests {
         let dim = 64usize;
         let heads = 4usize;
         let hidden = 128usize;
-        let f = |n: usize, s: f32| -> Vec<f32> {
-            (0..n).map(|i| (i as f32 * s).sin() * 0.2).collect()
-        };
-        let emb = Embedding::new(vocab, ctx, dim, f(vocab * dim, 0.01), f(ctx * dim, 0.02)).unwrap();
+        let f =
+            |n: usize, s: f32| -> Vec<f32> { (0..n).map(|i| (i as f32 * s).sin() * 0.2).collect() };
+        let emb =
+            Embedding::new(vocab, ctx, dim, f(vocab * dim, 0.01), f(ctx * dim, 0.02)).unwrap();
         let tb = TransformerBlock::new(
-            ctx, heads, dim,
-            vec![1.0; dim], vec![0.0; dim],
-            f(dim * dim, 0.013), vec![0.0; dim],
-            f(dim * dim, 0.017), vec![0.0; dim],
-            f(dim * dim, 0.019), vec![0.0; dim],
-            f(dim * dim, 0.023), vec![0.0; dim],
-            vec![1.0; dim], vec![0.0; dim],
-            f(dim * hidden, 0.007), vec![0.0; hidden],
-            f(hidden * dim, 0.009), vec![0.0; dim],
-        ).unwrap();
+            ctx,
+            heads,
+            dim,
+            vec![1.0; dim],
+            vec![0.0; dim],
+            f(dim * dim, 0.013),
+            vec![0.0; dim],
+            f(dim * dim, 0.017),
+            vec![0.0; dim],
+            f(dim * dim, 0.019),
+            vec![0.0; dim],
+            f(dim * dim, 0.023),
+            vec![0.0; dim],
+            vec![1.0; dim],
+            vec![0.0; dim],
+            f(dim * hidden, 0.007),
+            vec![0.0; hidden],
+            f(hidden * dim, 0.009),
+            vec![0.0; dim],
+        )
+        .unwrap();
         let lnf = LayerNorm::new(dim, vec![1.0; dim], vec![0.0; dim]).unwrap();
         let head = Linear::new(dim, vocab, f(dim * vocab, 0.005), vec![0.0; vocab]).unwrap();
         let model = Sequential::new()
@@ -783,7 +861,10 @@ mod tests {
             .with(Box::new(lnf))
             .with(Box::new(head))
             .with(Box::new(ActivationLayer::new(Activation::Softmax)));
-        let norm = Normalizer { means: vec![], stds: vec![] };
+        let norm = Normalizer {
+            means: vec![],
+            stds: vec![],
+        };
         let meta = ModelMetadata {
             dataset_name: "big".into(),
             task: TaskType::TransformerSLM,
@@ -804,20 +885,34 @@ mod tests {
         let max_seq_len = 4;
         let embedding_dim = 8;
         let emb = Embedding::new(
-            vocab_size, max_seq_len, embedding_dim,
-            (0..vocab_size * embedding_dim).map(|i| i as f32 * 0.1).collect(),
-            (0..max_seq_len * embedding_dim).map(|i| i as f32 * 0.01).collect(),
-        ).unwrap();
+            vocab_size,
+            max_seq_len,
+            embedding_dim,
+            (0..vocab_size * embedding_dim)
+                .map(|i| i as f32 * 0.1)
+                .collect(),
+            (0..max_seq_len * embedding_dim)
+                .map(|i| i as f32 * 0.01)
+                .collect(),
+        )
+        .unwrap();
         let lm_head = Linear::new(
-            embedding_dim, vocab_size,
-            (0..embedding_dim * vocab_size).map(|i| i as f32 * 0.01).collect(),
+            embedding_dim,
+            vocab_size,
+            (0..embedding_dim * vocab_size)
+                .map(|i| i as f32 * 0.01)
+                .collect(),
             vec![0.0; vocab_size],
-        ).unwrap();
+        )
+        .unwrap();
         let model = Sequential::new()
             .with(Box::new(emb))
             .with(Box::new(ActivationLayer::new(Activation::Softmax)))
             .with(Box::new(lm_head));
-        let norm = Normalizer { means: vec![], stds: vec![] };
+        let norm = Normalizer {
+            means: vec![],
+            stds: vec![],
+        };
         let vocab: Vec<String> = "abcde".chars().map(|c| c.to_string()).collect();
         let meta = ModelMetadata {
             dataset_name: "tiny_slm".into(),
@@ -880,17 +975,26 @@ mod tests {
         // make_bundle's largest tensor is 32 values (< QUANT_MIN_LEN), so use
         // a bigger Linear to actually exercise the int8 path.
         let big = Linear::new(
-            64, 64,
-            (0..64 * 64).map(|i| (i as f32 * 0.37).sin() * 0.1).collect(),
+            64,
+            64,
+            (0..64 * 64)
+                .map(|i| (i as f32 * 0.37).sin() * 0.1)
+                .collect(),
             vec![0.0; 64],
-        ).unwrap();
+        )
+        .unwrap();
         let big_model = Sequential::new().with(Box::new(big));
-        let big_norm = Normalizer { means: vec![], stds: vec![] };
+        let big_norm = Normalizer {
+            means: vec![],
+            stds: vec![],
+        };
         let big_full = to_bytes(&big_model, &big_norm, &meta).unwrap();
         let big_quant = to_bytes_quantized(&big_model, &big_norm, &meta).unwrap();
         assert!(
             (big_quant.len() as f32) < (big_full.len() as f32) * 0.35,
-            "quantized {} not ≈4× smaller than {}", big_quant.len(), big_full.len()
+            "quantized {} not ≈4× smaller than {}",
+            big_quant.len(),
+            big_full.len()
         );
 
         // Small model: everything stays f32 (marker overhead only) and the
@@ -918,13 +1022,23 @@ mod tests {
         // save→load the layer must still be quantized *in memory* (Opt#1: no f32
         // expansion) and produce output close to the f32 original.
         let (in_f, out_f) = (96usize, 96usize);
-        let w: Vec<f32> = (0..in_f * out_f).map(|i| (i as f32 * 0.011).sin() * 0.4).collect();
+        let w: Vec<f32> = (0..in_f * out_f)
+            .map(|i| (i as f32 * 0.011).sin() * 0.4)
+            .collect();
         let big = Linear::new(in_f, out_f, w, vec![0.0; out_f]).unwrap();
         let model = Sequential::new().with(Box::new(big));
-        let norm = Normalizer { means: vec![], stds: vec![] };
+        let norm = Normalizer {
+            means: vec![],
+            stds: vec![],
+        };
         let (_, _, meta) = make_bundle();
 
-        let x = Tensor::matrix(1, in_f, (0..in_f).map(|i| (i as f32 * 0.03).cos()).collect()).unwrap();
+        let x = Tensor::matrix(
+            1,
+            in_f,
+            (0..in_f).map(|i| (i as f32 * 0.03).cos()).collect(),
+        )
+        .unwrap();
         let y_f32 = model.forward(&x).unwrap();
 
         let bytes = to_bytes_quantized_int4(&model, &norm, &meta).unwrap();
@@ -933,7 +1047,9 @@ mod tests {
         let f32_bytes = to_bytes(&model, &norm, &meta).unwrap();
         assert!(
             (bytes.len() as f32) < (f32_bytes.len() as f32) * 0.4,
-            "int4 file {} not far smaller than f32 {}", bytes.len(), f32_bytes.len()
+            "int4 file {} not far smaller than f32 {}",
+            bytes.len(),
+            f32_bytes.len()
         );
 
         let (loaded, _, _) = from_bytes(&bytes).unwrap();
@@ -946,7 +1062,12 @@ mod tests {
         assert!(lin.weight.data.is_empty(), "f32 copy must be dropped");
 
         let y_q = loaded.forward(&x).unwrap();
-        let mae: f32 = y_f32.data.iter().zip(&y_q.data).map(|(a, b)| (a - b).abs()).sum::<f32>()
+        let mae: f32 = y_f32
+            .data
+            .iter()
+            .zip(&y_q.data)
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
             / out_f as f32;
         assert!(mae < 0.2, "int4 forward drifted too far: mae={mae}");
     }
@@ -976,12 +1097,17 @@ mod tests {
         // 4 channels × 32 values; channel 2 holds a large outlier.
         let channels = 4;
         let row = 32;
-        let mut data: Vec<f32> = (0..channels * row).map(|i| (i as f32 * 0.05).sin() * 0.3).collect();
+        let mut data: Vec<f32> = (0..channels * row)
+            .map(|i| (i as f32 * 0.05).sin() * 0.3)
+            .collect();
         data[2 * row + 1] = 25.0;
 
         let mut out = Vec::new();
         push_weights(&mut out, &data, channels, /*v5=*/ true, QPrec::Int8);
-        assert_eq!(out[0], ENC_INT8_PER_CHANNEL, "matrix should use the per-channel marker");
+        assert_eq!(
+            out[0], ENC_INT8_PER_CHANNEL,
+            "matrix should use the per-channel marker"
+        );
 
         let mut r = Reader::new(&out);
         r.v5 = true;
@@ -991,22 +1117,37 @@ mod tests {
         // Each value is within its own channel's scale/2.
         let scales = int8_scales_per_channel(&data, channels);
         for (i, (o, q)) in data.iter().zip(&decoded).enumerate() {
-            assert!((o - q).abs() <= scales[i / row] * 0.5 + 1e-6, "value {i}: {o} vs {q}");
+            assert!(
+                (o - q).abs() <= scales[i / row] * 0.5 + 1e-6,
+                "value {i}: {o} vs {q}"
+            );
         }
         // The outlier did NOT inflate the clean channels' scale: channel 0 stays
         // accurate (this is the per-channel win over per-tensor).
-        let clean_err: f32 = data[..row].iter().zip(&decoded[..row]).map(|(a, b)| (a - b).abs()).sum();
-        assert!(clean_err < 0.05, "clean channel error too large: {clean_err}");
+        let clean_err: f32 = data[..row]
+            .iter()
+            .zip(&decoded[..row])
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(
+            clean_err < 0.05,
+            "clean channel error too large: {clean_err}"
+        );
     }
 
     #[test]
     fn one_dimensional_weight_uses_per_tensor_marker() {
         // channels = 1 (a bias-like vector) must fall back to the single-scale
         // int8 marker, not the per-channel one.
-        let data: Vec<f32> = (0..QUANT_MIN_LEN).map(|i| (i as f32 * 0.1).cos() * 0.2).collect();
+        let data: Vec<f32> = (0..QUANT_MIN_LEN)
+            .map(|i| (i as f32 * 0.1).cos() * 0.2)
+            .collect();
         let mut out = Vec::new();
         push_weights(&mut out, &data, 1, true, QPrec::Int8);
-        assert_eq!(out[0], ENC_INT8, "1-D vector should use the per-tensor marker");
+        assert_eq!(
+            out[0], ENC_INT8,
+            "1-D vector should use the per-tensor marker"
+        );
         let mut r = Reader::new(&out);
         r.v5 = true;
         let decoded = r.weights(data.len()).unwrap();
@@ -1031,14 +1172,19 @@ mod tests {
     #[test]
     fn flatten_roundtrips_as_v5() {
         let lin = Linear::new(
-            8, 3,
+            8,
+            3,
             (0..24).map(|i| i as f32 * 0.01).collect(),
             vec![0.0; 3],
-        ).unwrap();
+        )
+        .unwrap();
         let model = Sequential::new()
             .with(Box::new(Flatten::new()))
             .with(Box::new(lin));
-        let norm = Normalizer { means: vec![], stds: vec![] };
+        let norm = Normalizer {
+            means: vec![],
+            stds: vec![],
+        };
         let (_, _, meta) = make_bundle();
 
         let bytes = to_bytes(&model, &norm, &meta).unwrap();
@@ -1100,16 +1246,25 @@ mod tests {
     #[derive(Debug)]
     struct DummyLayer;
     impl crate::layer::Layer for DummyLayer {
-        fn forward(&self, x: &Tensor) -> Result<Tensor> { Ok(x.clone()) }
-        fn name(&self) -> String { "DummyLayer".to_string() }
-        fn as_any(&self) -> &dyn std::any::Any { self }
+        fn forward(&self, x: &Tensor) -> Result<Tensor> {
+            Ok(x.clone())
+        }
+        fn name(&self) -> String {
+            "DummyLayer".to_string()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
 
     #[test]
     fn to_bytes_unknown_layer_error() {
         let mut model = Sequential::new();
         model.push(Box::new(DummyLayer));
-        let norm = Normalizer { means: vec![], stds: vec![] };
+        let norm = Normalizer {
+            means: vec![],
+            stds: vec![],
+        };
         let meta = ModelMetadata {
             dataset_name: "test".into(),
             task: TaskType::Classification,
@@ -1122,7 +1277,10 @@ mod tests {
             output_dim: 0,
             tokenizer_state: String::new(),
         };
-        assert!(matches!(to_bytes(&model, &norm, &meta), Err(InferError::Format(_))));
+        assert!(matches!(
+            to_bytes(&model, &norm, &meta),
+            Err(InferError::Format(_))
+        ));
     }
 
     #[test]
@@ -1182,22 +1340,36 @@ mod tests {
 
         let ln = LayerNorm::new(embedding_dim, vec![1.0; c], vec![0.0; c]).unwrap();
         let tb = TransformerBlock::new(
-            context_len, num_heads, embedding_dim,
-            vec![1.0; c], vec![0.0; c],
-            vec![0.1; c*c], vec![0.0; c],
-            vec![0.1; c*c], vec![0.0; c],
-            vec![0.1; c*c], vec![0.0; c],
-            vec![0.1; c*c], vec![0.0; c],
-            vec![1.0; c], vec![0.0; c],
-            vec![0.1; c*h], vec![0.0; h],
-            vec![0.1; h*c], vec![0.0; c],
-        ).unwrap();
+            context_len,
+            num_heads,
+            embedding_dim,
+            vec![1.0; c],
+            vec![0.0; c],
+            vec![0.1; c * c],
+            vec![0.0; c],
+            vec![0.1; c * c],
+            vec![0.0; c],
+            vec![0.1; c * c],
+            vec![0.0; c],
+            vec![0.1; c * c],
+            vec![0.0; c],
+            vec![1.0; c],
+            vec![0.0; c],
+            vec![0.1; c * h],
+            vec![0.0; h],
+            vec![0.1; h * c],
+            vec![0.0; c],
+        )
+        .unwrap();
 
         let mut model = Sequential::new();
         model.push(Box::new(ln));
         model.push(Box::new(tb));
 
-        let norm = Normalizer { means: vec![], stds: vec![] };
+        let norm = Normalizer {
+            means: vec![],
+            stds: vec![],
+        };
         let meta = ModelMetadata {
             dataset_name: "tb_test".into(),
             task: TaskType::TransformerSLM,
@@ -1224,4 +1396,3 @@ mod tests {
         }
     }
 }
-

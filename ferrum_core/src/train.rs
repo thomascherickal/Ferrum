@@ -27,7 +27,12 @@ pub struct DenseT {
 
 impl DenseT {
     pub fn new_random(in_f: usize, out_f: usize, scale: f32, rng: &mut Rng) -> Self {
-        vprintln!("[train::DenseT::new_random] Creating layer: in={}, out={}, scale={:.6}", in_f, out_f, scale);
+        vprintln!(
+            "[train::DenseT::new_random] Creating layer: in={}, out={}, scale={:.6}",
+            in_f,
+            out_f,
+            scale
+        );
         let w: Vec<f32> = (0..in_f * out_f)
             .map(|_| rng.next_normal() * scale)
             .collect();
@@ -44,13 +49,23 @@ impl DenseT {
         };
         if verbose::is_verbose() {
             let (wmin, wmax, wmean) = verbose::stats(&layer.weight.data);
-            vprintln!("[train::DenseT::new_random]   weight stats: min={:.6}, max={:.6}, mean={:.6}", wmin, wmax, wmean);
+            vprintln!(
+                "[train::DenseT::new_random]   weight stats: min={:.6}, max={:.6}, mean={:.6}",
+                wmin,
+                wmax,
+                wmean
+            );
         }
         layer
     }
 
     fn forward(&mut self, x: &Tensor) -> Result<Tensor> {
-        vprintln!("[train::DenseT::forward] input shape={:?}, weight=[{},{}]", x.shape, self.in_f, self.out_f);
+        vprintln!(
+            "[train::DenseT::forward] input shape={:?}, weight=[{},{}]",
+            x.shape,
+            self.in_f,
+            self.out_f
+        );
         self.input = Some(x.clone());
         let result = ops::add_bias(&ops::matmul(x, &self.weight)?, &self.bias)?;
         if verbose::is_verbose() {
@@ -73,9 +88,19 @@ impl DenseT {
         let dx = ops::matmul(dy, &ops::transpose(&self.weight)?)?;
         if verbose::is_verbose() {
             let (gmin, gmax, gmean) = verbose::stats(&self.grad_w.data);
-            vprintln!("[train::DenseT::backward]   grad_w stats: min={:.6e}, max={:.6e}, mean={:.6e}", gmin, gmax, gmean);
+            vprintln!(
+                "[train::DenseT::backward]   grad_w stats: min={:.6e}, max={:.6e}, mean={:.6e}",
+                gmin,
+                gmax,
+                gmean
+            );
             let (gbmin, gbmax, gbmean) = verbose::stats(&self.grad_b.data);
-            vprintln!("[train::DenseT::backward]   grad_b stats: min={:.6e}, max={:.6e}, mean={:.6e}", gbmin, gbmax, gbmean);
+            vprintln!(
+                "[train::DenseT::backward]   grad_b stats: min={:.6e}, max={:.6e}, mean={:.6e}",
+                gbmin,
+                gbmax,
+                gbmean
+            );
             verbose::check_nan_inf(&self.grad_w.data, "DenseT::backward grad_w");
             verbose::check_nan_inf(&self.grad_b.data, "DenseT::backward grad_b");
             verbose::check_nan_inf(&dx.data, "DenseT::backward dx");
@@ -84,12 +109,22 @@ impl DenseT {
     }
 
     fn step(&mut self, opt: &Sgd) -> Result<()> {
-        vprintln!("[train::DenseT::step] Updating weight=[{},{}], bias=[{}]", self.in_f, self.out_f, self.out_f);
+        vprintln!(
+            "[train::DenseT::step] Updating weight=[{},{}], bias=[{}]",
+            self.in_f,
+            self.out_f,
+            self.out_f
+        );
         opt.step(&mut self.weight, &self.grad_w, &mut self.vel_w)?;
         opt.step(&mut self.bias, &self.grad_b, &mut self.vel_b)?;
         if verbose::is_verbose() {
             let (wmin, wmax, wmean) = verbose::stats(&self.weight.data);
-            vprintln!("[train::DenseT::step]   post-update weight: min={:.6e}, max={:.6e}, mean={:.6e}", wmin, wmax, wmean);
+            vprintln!(
+                "[train::DenseT::step]   post-update weight: min={:.6e}, max={:.6e}, mean={:.6e}",
+                wmin,
+                wmax,
+                wmean
+            );
             verbose::check_nan_inf(&self.weight.data, "DenseT::step weight");
             verbose::check_nan_inf(&self.bias.data, "DenseT::step bias");
         }
@@ -128,7 +163,12 @@ pub struct EmbedT {
 impl EmbedT {
     pub fn new_random(vocab_size: usize, embed_dim: usize, rng: &mut Rng) -> Self {
         let scale = (1.0 / embed_dim as f32).sqrt();
-        vprintln!("[train::EmbedT::new_random] vocab={}, dim={}, scale={:.6}", vocab_size, embed_dim, scale);
+        vprintln!(
+            "[train::EmbedT::new_random] vocab={}, dim={}, scale={:.6}",
+            vocab_size,
+            embed_dim,
+            scale
+        );
         let w: Vec<f32> = (0..vocab_size * embed_dim)
             .map(|_| rng.next_normal() * scale)
             .collect();
@@ -144,8 +184,13 @@ impl EmbedT {
 
     fn forward(&mut self, x: &Tensor) -> Result<Tensor> {
         let (batch, seq_len) = x.matrix_dims()?;
-        vprintln!("[train::EmbedT::forward] input=[{},{}], vocab={}, dim={}",
-            batch, seq_len, self.vocab_size, self.embed_dim);
+        vprintln!(
+            "[train::EmbedT::forward] input=[{},{}], vocab={}, dim={}",
+            batch,
+            seq_len,
+            self.vocab_size,
+            self.embed_dim
+        );
         self.input = Some(x.clone());
         let e = self.embed_dim;
         let mut out = vec![0.0f32; batch * seq_len * e];
@@ -221,9 +266,13 @@ impl ReluT {
         let result = x.map(|v| v.max(0.0));
         if verbose::is_verbose() {
             let zeros = result.data.iter().filter(|&&v| v == 0.0).count();
-            vprintln!("[train::ReluT::forward] shape={:?}, zeroed={}/{} ({:.1}% dead)",
-                result.shape, zeros, result.data.len(),
-                100.0 * zeros as f32 / result.data.len() as f32);
+            vprintln!(
+                "[train::ReluT::forward] shape={:?}, zeroed={}/{} ({:.1}% dead)",
+                result.shape,
+                zeros,
+                result.data.len(),
+                100.0 * zeros as f32 / result.data.len() as f32
+            );
         }
         Ok(result)
     }
@@ -296,7 +345,12 @@ pub struct Net {
 impl Net {
     /// `input_dim → hidden (ReLU) → output_dim (logits)`
     pub fn mlp(input_dim: usize, hidden: usize, output_dim: usize, rng: &mut Rng) -> Self {
-        vprintln!("[train::Net::mlp] Building MLP: input={} → hidden={} → output={}", input_dim, hidden, output_dim);
+        vprintln!(
+            "[train::Net::mlp] Building MLP: input={} → hidden={} → output={}",
+            input_dim,
+            hidden,
+            output_dim
+        );
         let s1 = (2.0 / input_dim as f32).sqrt(); // Kaiming init for ReLU
         let s2 = (1.0 / hidden as f32).sqrt();
         let layers = vec![
@@ -329,8 +383,14 @@ impl Net {
         output_dim: usize,
         rng: &mut Rng,
     ) -> Self {
-        vprintln!("[train::Net::embedding_mlp] vocab={} ctx={} E={} → hidden={} → out={}",
-            vocab_size, context_len, embed_dim, hidden, output_dim);
+        vprintln!(
+            "[train::Net::embedding_mlp] vocab={} ctx={} E={} → hidden={} → out={}",
+            vocab_size,
+            context_len,
+            embed_dim,
+            hidden,
+            output_dim
+        );
         let flat = context_len * embed_dim;
         let s1 = (2.0 / flat as f32).sqrt(); // Kaiming init for ReLU
         let s2 = (1.0 / hidden as f32).sqrt();
@@ -347,7 +407,10 @@ impl Net {
             qat: false,
             grad_clip: None,
         };
-        vprintln!("[train::Net::embedding_mlp] Total params: {}", net.num_params());
+        vprintln!(
+            "[train::Net::embedding_mlp] Total params: {}",
+            net.num_params()
+        );
         net
     }
 
@@ -425,7 +488,11 @@ impl Net {
     /// parameters fall back to a single scale.
     pub(crate) fn fake_quantize_weights(&mut self) {
         for t in self.param_tensors_mut() {
-            let channels = if t.shape.len() >= 2 { t.shape[0].max(1) } else { 1 };
+            let channels = if t.shape.len() >= 2 {
+                t.shape[0].max(1)
+            } else {
+                1
+            };
             crate::quant::fake_quantize_int8_per_channel(&mut t.data, channels);
         }
     }
@@ -448,7 +515,12 @@ impl Net {
                     TLayer::Dense(_) => "Dense",
                     TLayer::Relu(_) => "ReLU",
                 };
-                vprintln!("[train::Net::forward]   layer[{}] {} → shape={:?}", i, name, cur.shape);
+                vprintln!(
+                    "[train::Net::forward]   layer[{}] {} → shape={:?}",
+                    i,
+                    name,
+                    cur.shape
+                );
             }
         }
         Ok(cur)
@@ -459,13 +531,21 @@ impl Net {
         let mut grad = dlogits.clone();
         for (i, l) in self.layers.iter_mut().rev().enumerate() {
             grad = l.backward(&grad)?;
-            vprintln!("[train::Net::backward]   layer[rev-{}] → grad shape={:?}", i, grad.shape);
+            vprintln!(
+                "[train::Net::backward]   layer[rev-{}] → grad shape={:?}",
+                i,
+                grad.shape
+            );
         }
         Ok(())
     }
 
     pub fn step(&mut self, opt: &Sgd) -> Result<()> {
-        vprintln!("[train::Net::step] Optimizer step (lr={}, momentum={})", opt.lr, opt.momentum);
+        vprintln!(
+            "[train::Net::step] Optimizer step (lr={}, momentum={})",
+            opt.lr,
+            opt.momentum
+        );
         for l in &mut self.layers {
             l.step(opt)?;
         }
@@ -497,7 +577,10 @@ impl Net {
 
     /// Export to inference model. Classification appends Softmax; regression appends Identity.
     pub fn to_inference_task(&self, task: crate::csv::TaskType) -> Result<Sequential> {
-        vprintln!("[train::Net::to_inference_task] Converting to inference model, task={:?}", task);
+        vprintln!(
+            "[train::Net::to_inference_task] Converting to inference model, task={:?}",
+            task
+        );
         let mut m = Sequential::new();
         for l in &self.layers {
             match l {
@@ -526,7 +609,10 @@ impl Net {
             crate::csv::TaskType::TransformerSLM => Activation::Softmax,
         };
         m.push(Box::new(ActivationLayer::new(final_act)));
-        vprintln!("[train::Net::to_inference_task] Inference model: {} layers", m.len());
+        vprintln!(
+            "[train::Net::to_inference_task] Inference model: {} layers",
+            m.len()
+        );
         Ok(m)
     }
 }
@@ -559,8 +645,14 @@ pub fn train_epoch(
     // once instead of ≈63% in expectation under sampling with replacement.
     let steps = n.div_ceil(batch_size);
     let perm = rng.shuffled_indices(n);
-    vprintln!("[train::train_epoch] samples={}, batch_size={}, steps={}, lr={}, momentum={}",
-        n, batch_size, steps, opt.lr, opt.momentum);
+    vprintln!(
+        "[train::train_epoch] samples={}, batch_size={}, steps={}, lr={}, momentum={}",
+        n,
+        batch_size,
+        steps,
+        opt.lr,
+        opt.momentum
+    );
 
     let epoch_start = std::time::Instant::now();
 
@@ -579,7 +671,13 @@ pub fn train_epoch(
         }
         let xb = Tensor::matrix(cur_bs, cols, xb_data)?;
 
-        vprintln!("[train::train_epoch]   step {}/{}: batch shape=[{},{}]", step+1, steps, cur_bs, cols);
+        vprintln!(
+            "[train::train_epoch]   step {}/{}: batch shape=[{},{}]",
+            step + 1,
+            steps,
+            cur_bs,
+            cols
+        );
 
         // QAT: gradients are computed at the int8-snapped weights, but the
         // optimizer updates the fp32 masters (straight-through estimator).
@@ -594,21 +692,35 @@ pub fn train_epoch(
         // Forward
         let logits = net.forward(&xb)?;
         if verbose::is_verbose() {
-            verbose::check_nan_inf(&logits.data, &format!("train_epoch step {} forward logits", step+1));
+            verbose::check_nan_inf(
+                &logits.data,
+                &format!("train_epoch step {} forward logits", step + 1),
+            );
         }
 
         // Loss
         let (loss, dlogits) = softmax_cross_entropy(&logits, &yb)?;
-        vprintln!("[train::train_epoch]   step {}/{}: loss={:.6}", step+1, steps, loss);
+        vprintln!(
+            "[train::train_epoch]   step {}/{}: loss={:.6}",
+            step + 1,
+            steps,
+            loss
+        );
 
         if verbose::is_verbose() {
             if loss.is_nan() {
-                crate::verbose::log_line(&format!("[ferrum_core::WARN] ⚠️  NaN loss detected at step {}! Training may diverge.", step+1));
+                crate::verbose::log_line(&format!(
+                    "[ferrum_core::WARN] ⚠️  NaN loss detected at step {}! Training may diverge.",
+                    step + 1
+                ));
             }
             if loss.is_infinite() {
                 crate::verbose::log_line(&format!("[ferrum_core::WARN] ⚠️  Infinite loss detected at step {}! Training may diverge.", step+1));
             }
-            verbose::check_nan_inf(&dlogits.data, &format!("train_epoch step {} dlogits", step+1));
+            verbose::check_nan_inf(
+                &dlogits.data,
+                &format!("train_epoch step {} dlogits", step + 1),
+            );
         }
 
         // Backward
@@ -628,26 +740,44 @@ pub fn train_epoch(
 
         if verbose::is_verbose() {
             let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
-            vprintln!("[train::train_epoch]   step {}/{}: done in {:.1}ms, running avg loss={:.6}",
-                step+1, steps, step_ms, total_loss / batches as f32);
+            vprintln!(
+                "[train::train_epoch]   step {}/{}: done in {:.1}ms, running avg loss={:.6}",
+                step + 1,
+                steps,
+                step_ms,
+                total_loss / batches as f32
+            );
         }
     }
 
     let epoch_ms = epoch_start.elapsed().as_secs_f64() * 1000.0;
     let avg_loss = total_loss / batches as f32;
-    vprintln!("[train::train_epoch] Epoch done in {:.1}ms, mean loss={:.6}", epoch_ms, avg_loss);
+    vprintln!(
+        "[train::train_epoch] Epoch done in {:.1}ms, mean loss={:.6}",
+        epoch_ms,
+        avg_loss
+    );
 
     Ok(avg_loss)
 }
 
 /// Compute accuracy on a full dataset (no gradient tracking).
 pub fn accuracy(net: &mut Net, x: &Tensor, y: &[usize]) -> Result<f32> {
-    vprintln!("[train::accuracy] Computing accuracy on {} samples", y.len());
+    vprintln!(
+        "[train::accuracy] Computing accuracy on {} samples",
+        y.len()
+    );
     let logits = net.forward(x)?;
     let preds = crate::ops::argmax_rows(&logits)?;
     let correct = preds.iter().zip(y).filter(|(p, t)| p == t).count();
     let acc = correct as f32 / y.len() as f32;
-    vprintln!("[train::accuracy] Result: {}/{} correct = {:.4} ({:.1}%)", correct, y.len(), acc, acc * 100.0);
+    vprintln!(
+        "[train::accuracy] Result: {}/{} correct = {:.4} ({:.1}%)",
+        correct,
+        y.len(),
+        acc,
+        acc * 100.0
+    );
     Ok(acc)
 }
 
@@ -779,8 +909,14 @@ mod tests {
             }
         }
         let post = sumsq.sqrt() as f32;
-        assert!(pre > max_norm, "pre-clip norm {pre} should exceed the budget");
-        assert!(post <= max_norm + 1e-4, "post-clip norm {post} exceeds {max_norm}");
+        assert!(
+            pre > max_norm,
+            "pre-clip norm {pre} should exceed the budget"
+        );
+        assert!(
+            post <= max_norm + 1e-4,
+            "post-clip norm {post} exceeds {max_norm}"
+        );
     }
 
     #[test]
@@ -793,7 +929,9 @@ mod tests {
         let opt = Sgd::new(50.0);
 
         let finite = |net: &mut Net| {
-            net.snapshot_weights().iter().all(|t| t.iter().all(|v| v.is_finite()))
+            net.snapshot_weights()
+                .iter()
+                .all(|t| t.iter().all(|v| v.is_finite()))
         };
 
         let mut diverging = Net::mlp(4, 16, 3, &mut Rng::new(1));
@@ -801,7 +939,10 @@ mod tests {
         for _ in 0..20 {
             let _ = train_epoch(&mut diverging, &x, &y, 10, &opt, &mut r1);
         }
-        assert!(!finite(&mut diverging), "high LR expected to diverge without clipping");
+        assert!(
+            !finite(&mut diverging),
+            "high LR expected to diverge without clipping"
+        );
 
         let mut clipped = Net::mlp(4, 16, 3, &mut Rng::new(1));
         clipped.set_grad_clip(Some(1.0));
@@ -861,11 +1002,15 @@ mod tests {
     #[test]
     fn to_inference_task_branches() {
         let net = small_net();
-        let m_reg = net.to_inference_task(crate::csv::TaskType::Regression).unwrap();
+        let m_reg = net
+            .to_inference_task(crate::csv::TaskType::Regression)
+            .unwrap();
         assert_eq!(m_reg.len(), 4);
         assert_eq!(m_reg.layers()[3].name(), "Activation(Identity)");
 
-        let m_slm = net.to_inference_task(crate::csv::TaskType::TransformerSLM).unwrap();
+        let m_slm = net
+            .to_inference_task(crate::csv::TaskType::TransformerSLM)
+            .unwrap();
         assert_eq!(m_slm.len(), 4);
         assert_eq!(m_slm.layers()[3].name(), "Activation(Softmax)");
     }
@@ -904,7 +1049,10 @@ mod tests {
         let one = Tensor::matrix(1, ctx, vec![0.0, 1.0, 2.0]).unwrap();
         let train_logits = net.forward(&one).unwrap();
         let infer_probs = model.forward(&one).unwrap();
-        let max = train_logits.data.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+        let max = train_logits
+            .data
+            .iter()
+            .fold(f32::NEG_INFINITY, |m, &v| m.max(v));
         let exps: Vec<f32> = train_logits.data.iter().map(|&v| (v - max).exp()).collect();
         let sum: f32 = exps.iter().sum();
         for (p, e) in infer_probs.data.iter().zip(&exps) {
@@ -938,11 +1086,15 @@ mod tests {
             if let TLayer::Embed(e) = &mut net.layers[0] {
                 e.table.data[k] = orig + eps;
             }
-            let lp = softmax_cross_entropy(&net.forward(&x).unwrap(), &targets).unwrap().0;
+            let lp = softmax_cross_entropy(&net.forward(&x).unwrap(), &targets)
+                .unwrap()
+                .0;
             if let TLayer::Embed(e) = &mut net.layers[0] {
                 e.table.data[k] = orig - eps;
             }
-            let lm = softmax_cross_entropy(&net.forward(&x).unwrap(), &targets).unwrap().0;
+            let lm = softmax_cross_entropy(&net.forward(&x).unwrap(), &targets)
+                .unwrap()
+                .0;
             if let TLayer::Embed(e) = &mut net.layers[0] {
                 e.table.data[k] = orig;
             }

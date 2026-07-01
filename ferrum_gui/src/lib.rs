@@ -15,9 +15,9 @@
 //! | `gen-fragment`  | `String` (streamed text fragment)    | streaming generation  |
 //! | `term-output`   | `{ line, stream }`                   | interactive terminal  |
 
+mod capable;
 mod commands;
 mod datasets;
-mod capable;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
