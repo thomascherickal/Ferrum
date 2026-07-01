@@ -61,7 +61,7 @@ impl TabularModel {
                 format!(r#"{{"type":"regression","value":{pred_raw:.4},"value_norm":{pred_norm:.6}}}"#)
             }
             TaskType::TransformerSLM => {
-                format!(r#"{{"type":"error","message":"Use TransformerSLMModel for SLM inference"}}"#)
+                r#"{"type":"error","message":"Use TransformerSLMModel for SLM inference"}"#.to_string()
             }
         };
         Ok(json)

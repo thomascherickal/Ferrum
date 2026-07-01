@@ -42,6 +42,8 @@ pub struct DatasetEntry {
     pub format: String,
 }
 
+// Compact row builder for the static dataset catalog below.
+#[allow(clippy::too_many_arguments)]
 fn e(id: &str, name: &str, source: &str, desc: &str, mb: u32, repo: &str, file: &str, fmt: &str) -> DatasetEntry {
     DatasetEntry {
         id: id.into(),

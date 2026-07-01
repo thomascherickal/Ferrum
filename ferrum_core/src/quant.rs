@@ -51,7 +51,7 @@ pub fn fake_quantize_int8(data: &mut [f32]) -> bool {
 /// One symmetric int8 scale per contiguous channel (row) of `data`. `channels`
 /// must be non-zero and divide `data.len()`.
 pub fn int8_scales_per_channel(data: &[f32], channels: usize) -> Vec<f32> {
-    debug_assert!(channels != 0 && data.len() % channels == 0);
+    debug_assert!(channels != 0 && data.len().is_multiple_of(channels));
     let row = data.len() / channels.max(1);
     data.chunks(row.max(1)).map(int8_scale).collect()
 }
@@ -64,7 +64,7 @@ pub fn int8_scales_per_channel(data: &[f32], channels: usize) -> Vec<f32> {
 /// the length are left untouched. With `channels == 1` this is exactly the
 /// per-tensor behaviour. Returns `true` if the tensor was quantized.
 pub fn fake_quantize_int8_per_channel(data: &mut [f32], channels: usize) -> bool {
-    if channels == 0 || data.is_empty() || data.len() % channels != 0 {
+    if channels == 0 || data.is_empty() || !data.len().is_multiple_of(channels) {
         return false;
     }
     if data.len() < QUANT_MIN_LEN || !data.iter().all(|v| v.is_finite()) {

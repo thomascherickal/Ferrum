@@ -141,7 +141,7 @@ impl<'a> Reader<'a> {
             }
             ENC_INT8_PER_CHANNEL => {
                 let channels = self.usize()?;
-                if channels == 0 || n % channels != 0 {
+                if channels == 0 || !n.is_multiple_of(channels) {
                     return Err(InferError::Format(format!(
                         "per-channel weights: {channels} channels do not divide {n} values"
                     )));
@@ -326,7 +326,7 @@ fn push_str(out: &mut Vec<u8>, s: &str) {
 /// Encode `data` as one i8 per value against `scale` (the symmetric int8 grid).
 fn push_int8(out: &mut Vec<u8>, data: &[f32], scale: f32) {
     if scale == 0.0 {
-        out.extend(std::iter::repeat(0u8).take(data.len()));
+        out.extend(std::iter::repeat_n(0u8, data.len()));
     } else {
         for &v in data {
             out.push((v / scale).round().clamp(-127.0, 127.0) as i8 as u8);
@@ -368,7 +368,7 @@ fn push_weights(out: &mut Vec<u8>, data: &[f32], channels: usize, v5: bool, prec
         QPrec::F32 => unreachable!(),
         QPrec::Int8 => {
             // Per-channel when the matrix splits into >1 even rows; else per-tensor.
-            if channels > 1 && data.len() % channels == 0 {
+            if channels > 1 && data.len().is_multiple_of(channels) {
                 let row = data.len() / channels;
                 let scales = int8_scales_per_channel(data, channels);
                 out.push(ENC_INT8_PER_CHANNEL);
@@ -387,7 +387,7 @@ fn push_weights(out: &mut Vec<u8>, data: &[f32], channels: usize, v5: bool, prec
             }
         }
         QPrec::Int4 => {
-            let rows = if channels > 0 && data.len() % channels == 0 { channels } else { 1 };
+            let rows = if channels > 0 && data.len().is_multiple_of(channels) { channels } else { 1 };
             let cols = data.len() / rows;
             let qw = QWeight::from_f32(data, rows, cols, QKind::Int4);
             out.push(ENC_INT4_PER_CHANNEL);

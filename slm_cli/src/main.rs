@@ -255,7 +255,7 @@ fn train_and_save(
     let epochs = cfg.epochs;
     let report_every = (epochs / 20).max(1);
     let progress = |ep: usize, loss: f32| {
-        if ep == 1 || ep % report_every == 0 || ep == epochs {
+        if ep == 1 || ep.is_multiple_of(report_every) || ep == epochs {
             println!("  epoch {ep:>5}/{epochs}   loss = {loss:.6}");
         }
     };

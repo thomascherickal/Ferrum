@@ -26,8 +26,11 @@
 //!
 //! GPUs are never used: all parallelism is plain CPU threads.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Arc;
 
 static NUM_THREADS: OnceLock<usize> = OnceLock::new();
 
@@ -79,13 +82,16 @@ pub fn should_parallelize(rows: usize, cost: usize) -> bool {
 // Persistent worker pool
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[cfg(not(target_arch = "wasm32"))]
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
 /// A fixed set of long-lived worker threads, each owning one job channel.
+#[cfg(not(target_arch = "wasm32"))]
 struct Pool {
     senders: Vec<Sender<Job>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 static POOL: OnceLock<Pool> = OnceLock::new();
 
 #[cfg(not(target_arch = "wasm32"))]

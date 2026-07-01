@@ -69,7 +69,7 @@ mod tests {
                     let mut r = Rng::new(seed);
                     r.next_u64()
                 })
-                .last()
+                .next_back()
         };
         assert_eq!(
             {

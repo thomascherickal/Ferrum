@@ -153,8 +153,8 @@ mod tests {
             &targets,
         )
         .unwrap();
-        for i in 0..3 {
-            logits_data[i] -= lr * grad.data[i];
+        for (l, &g) in logits_data.iter_mut().zip(&grad.data) {
+            *l -= lr * g;
         }
         let (loss1, _) =
             softmax_cross_entropy(&Tensor::matrix(1, 3, logits_data).unwrap(), &targets).unwrap();

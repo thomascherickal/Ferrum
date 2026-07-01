@@ -127,7 +127,7 @@ fn synth_llama_with_tokenizer() -> Vec<u8> {
     bytes.extend_from_slice(&meta);
     bytes.extend_from_slice(&infos);
     let pad = bytes.len().div_ceil(32) * 32 - bytes.len();
-    bytes.extend(std::iter::repeat(0u8).take(pad));
+    bytes.extend(std::iter::repeat_n(0u8, pad));
     bytes.extend_from_slice(&data);
     bytes
 }

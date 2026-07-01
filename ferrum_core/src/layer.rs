@@ -477,7 +477,7 @@ impl TransformerBlock {
         if context_len == 0 {
             return Err(InferError::DimMismatch("context_len must be > 0".into()));
         }
-        if num_heads == 0 || embedding_dim % num_heads != 0 {
+        if num_heads == 0 || !embedding_dim.is_multiple_of(num_heads) {
             return Err(InferError::DimMismatch(format!(
                 "embedding_dim {embedding_dim} must be divisible by num_heads {num_heads}"
             )));
@@ -532,7 +532,7 @@ impl TransformerBlock {
         if context_len == 0 {
             return Err(InferError::DimMismatch("context_len must be > 0".into()));
         }
-        if num_heads == 0 || embedding_dim % num_heads != 0 {
+        if num_heads == 0 || !embedding_dim.is_multiple_of(num_heads) {
             return Err(InferError::DimMismatch(format!(
                 "embedding_dim {embedding_dim} must be divisible by num_heads {num_heads}"
             )));
@@ -787,10 +787,12 @@ impl Layer for TransformerBlock {
 
         // Residual connection
         vprintln!("[layer::TransformerBlock::forward]   ├─ Residual connection 1 (input + attention)");
-        let mut x_attn_data = vec![0.0f32; m * c];
-        for i in 0..m * c {
-            x_attn_data[i] = input.data[i] + projected.data[i];
-        }
+        let x_attn_data: Vec<f32> = input
+            .data
+            .iter()
+            .zip(&projected.data)
+            .map(|(a, b)| a + b)
+            .collect();
         let x_attn = Tensor::matrix(m, c, x_attn_data)?;
         if verbose::is_verbose() {
             let (vmin, vmax, vmean) = verbose::stats(&x_attn.data);
@@ -815,10 +817,12 @@ impl Layer for TransformerBlock {
 
         // Residual connection
         vprintln!("[layer::TransformerBlock::forward]   └─ Residual connection 2 (attn + ffn)");
-        let mut out_data = vec![0.0f32; m * c];
-        for i in 0..m * c {
-            out_data[i] = x_attn.data[i] + ff2.data[i];
-        }
+        let out_data: Vec<f32> = x_attn
+            .data
+            .iter()
+            .zip(&ff2.data)
+            .map(|(a, b)| a + b)
+            .collect();
         if verbose::is_verbose() {
             let (vmin, vmax, vmean) = verbose::stats(&out_data);
             vprintln!("[layer::TransformerBlock::forward]   Final output: min={:.6}, max={:.6}, mean={:.6}", vmin, vmax, vmean);
@@ -1188,7 +1192,7 @@ mod tests {
         block.forward(&x).unwrap();
         let attn = block.last_attention.borrow();
         // Shape: [batch=1, heads=2, T=4, T=4] = 32 elements
-        assert_eq!(attn.len(), 1 * 2 * 4 * 4);
+        assert_eq!(attn.len(), 2 * 4 * 4);
     }
 
     #[test]

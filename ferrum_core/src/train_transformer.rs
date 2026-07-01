@@ -89,6 +89,9 @@ fn ln_fwd(x: &Tensor, g: &Tensor, b: &Tensor) -> Result<(Tensor, Tensor, Vec<f32
     let mut y = vec![0.0f32; rows * cols];
     let mut xhat = vec![0.0f32; rows * cols];
     let mut inv_std = vec![0.0f32; rows];
+    // `r` indexes inv_std and derives the row offset for x/y/xhat — an iterator
+    // would obscure the per-row math without removing the offset arithmetic.
+    #[allow(clippy::needless_range_loop)]
     for r in 0..rows {
         let base = r * cols;
         let row = &x.data[base..base + cols];
@@ -121,6 +124,8 @@ fn ln_bwd(
     let mut dx = vec![0.0f32; rows * cols];
     let mut dg = vec![0.0f32; cols];
     let mut db = vec![0.0f32; cols];
+    // `r` derives the row offset and indexes inv_std; see ln_fwd.
+    #[allow(clippy::needless_range_loop)]
     for r in 0..rows {
         let base = r * cols;
         let mut sum_dxhat = 0.0f32;
@@ -250,6 +255,7 @@ fn attn_fwd(
 }
 
 /// Backward through causal multi-head attention. Returns (dq, dk, dv), each [M, C].
+#[allow(clippy::too_many_arguments)] // the attention backward genuinely needs q/k/v, probs, and the batch/t/heads shape
 fn attn_bwd(
     d_out: &Tensor,
     q: &Tensor,
@@ -547,7 +553,7 @@ impl TransformerNet {
         num_blocks: usize,
         rng: &mut Rng,
     ) -> Result<Self> {
-        if num_heads == 0 || embed_dim % num_heads != 0 {
+        if num_heads == 0 || !embed_dim.is_multiple_of(num_heads) {
             return Err(InferError::DimMismatch(format!(
                 "embedding_dim {embed_dim} must be divisible by num_heads {num_heads}"
             )));
@@ -923,7 +929,7 @@ impl TransformerNet {
     /// cache). `dropout = 0` is the plain, deterministic forward.
     pub fn forward_train(&self, tokens: &[usize], dropout: f32, seed: u64) -> Result<(Tensor, FwdCache)> {
         let t = self.context_len;
-        if tokens.is_empty() || tokens.len() % t != 0 {
+        if tokens.is_empty() || !tokens.len().is_multiple_of(t) {
             return Err(InferError::DimMismatch(format!(
                 "token count {} must be a non-zero multiple of context_len {t}",
                 tokens.len()
@@ -1349,7 +1355,7 @@ pub fn train_transformer_epoch_threaded(
     #[cfg(target_arch = "wasm32")]
     {
         let _ = threads;
-        return train_transformer_epoch(net, tokens, batch_size, adam, rng);
+        train_transformer_epoch(net, tokens, batch_size, adam, rng)
     }
 
     #[cfg(not(target_arch = "wasm32"))]

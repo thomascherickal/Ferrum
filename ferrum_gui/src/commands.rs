@@ -264,7 +264,7 @@ fn train_inner(app: AppHandle, p: TrainParams) -> Result<TrainResult, String> {
 
     let slm = match p.method.as_str() {
         "transformer" => {
-            if p.num_heads == 0 || p.embed_dim % p.num_heads != 0 {
+            if p.num_heads == 0 || !p.embed_dim.is_multiple_of(p.num_heads) {
                 ferrum_core::set_verbose(false);
                 return Err(format!(
                     "embedding dim ({}) must be divisible by heads ({})",

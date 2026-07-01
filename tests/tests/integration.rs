@@ -610,7 +610,7 @@ fn all_classification_models_output_valid_distributions() {
             let out = model.forward(&input).unwrap();
             // All probabilities in [0,1]
             assert!(
-                out.data.iter().all(|&p| p >= -1e-6 && p <= 1.0 + 1e-6),
+                out.data.iter().all(|&p| (-1e-6..=1.0 + 1e-6).contains(&p)),
                 "{path}: probability out of [0,1]: {:?}",
                 out.data
             );

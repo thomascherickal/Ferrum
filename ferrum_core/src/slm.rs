@@ -168,6 +168,7 @@ impl GenerativeSLM {
     }
 
     /// Train a hand-crafted edge Generative SLM (MLP Causal model) on any customized raw text corpus.
+    #[allow(clippy::too_many_arguments)] // stable public training API; kept flat rather than a config struct
     pub fn train(
         corpus: &str,
         context_len: usize,
@@ -192,6 +193,7 @@ impl GenerativeSLM {
     }
 
     /// Train a hand-crafted edge Generative SLM with a callback invoked at each epoch with loss.
+    #[allow(clippy::too_many_arguments)] // stable public training API; kept flat rather than a config struct
     pub fn train_with_callback<F>(
         corpus: &str,
         context_len: usize,
@@ -1726,7 +1728,9 @@ pub(crate) fn sample_with_params(
     let max = work.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut probs: Vec<f32> = work.iter().map(|&l| ((l - max) / t).exp()).collect();
     let sum: f32 = probs.iter().sum();
-    if !(sum > 1e-10) {
+    // `sum <= threshold || NaN` — a degenerate/non-finite softmax mass triggers
+    // the random fallback (equivalent to the previous `!(sum > 1e-10)`).
+    if sum.is_nan() || sum <= 1e-10 {
         let fallback = rng.next_u64() as usize % n;
         vprintln!("[slm::sample] ⚠️  Near-zero softmax sum, random fallback idx={}", fallback);
         return fallback;
@@ -1769,7 +1773,7 @@ pub(crate) fn sample_with_params(
 
     // 5. Renormalise the surviving mass and sample.
     let sum2: f32 = probs.iter().sum();
-    if !(sum2 > 1e-10) {
+    if sum2.is_nan() || sum2 <= 1e-10 {
         return rng.next_u64() as usize % n;
     }
     for p in &mut probs {

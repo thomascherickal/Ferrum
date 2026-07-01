@@ -413,8 +413,8 @@ mod tests {
         put_u64(&mut bytes, n_kv);
         bytes.extend_from_slice(kvs);
         // Pad to alignment 32 so the (empty) data section is in-bounds.
-        let pad = (bytes.len() + 31) / 32 * 32 - bytes.len();
-        bytes.extend(std::iter::repeat(0u8).take(pad));
+        let pad = bytes.len().div_ceil(32) * 32 - bytes.len();
+        bytes.extend(std::iter::repeat_n(0u8, pad));
         Gguf::parse(bytes).unwrap()
     }
 

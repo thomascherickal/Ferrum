@@ -174,12 +174,12 @@ impl Attention {
         rope_base: f32,
         rope_type: RopeType,
     ) -> Result<Self> {
-        if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+        if n_kv_heads == 0 || !n_heads.is_multiple_of(n_kv_heads) {
             return Err(InferError::DimMismatch(format!(
                 "n_heads {n_heads} must be a multiple of n_kv_heads {n_kv_heads}"
             )));
         }
-        if rope_dim > head_dim || rope_dim % 2 != 0 {
+        if rope_dim > head_dim || !rope_dim.is_multiple_of(2) {
             return Err(InferError::DimMismatch(format!(
                 "rope_dim {rope_dim} must be even and ≤ head_dim {head_dim}"
             )));
@@ -308,12 +308,12 @@ impl FeedForward {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let g = self.gate.forward(x)?;
         let u = self.up.forward(x)?;
-        let mut h = vec![0.0f32; g.data.len()];
-        for i in 0..h.len() {
-            let gi = g.data[i];
-            let silu = gi / (1.0 + (-gi).exp());
-            h[i] = silu * u.data[i];
-        }
+        let h: Vec<f32> = g
+            .data
+            .iter()
+            .zip(&u.data)
+            .map(|(&gi, &ui)| (gi / (1.0 + (-gi).exp())) * ui)
+            .collect();
         let (rows, ffn) = g.matrix_dims()?;
         self.down.forward(&Tensor::matrix(rows, ffn, h)?)
     }
@@ -607,9 +607,9 @@ mod tests {
         for t in 0..seq {
             let row = &x.data[t * dim..(t + 1) * dim];
             let inc = attn.forward_one(row, t, &mut cache).unwrap();
-            for d in 0..dim {
-                assert!((inc[d] - full.data[t * dim + d]).abs() < 1e-4,
-                    "row {t} dim {d}: cached {} vs full {}", inc[d], full.data[t * dim + d]);
+            for (d, &got) in inc.iter().enumerate() {
+                assert!((got - full.data[t * dim + d]).abs() < 1e-4,
+                    "row {t} dim {d}: cached {got} vs full {}", full.data[t * dim + d]);
             }
         }
     }
@@ -624,8 +624,8 @@ mod tests {
         let mut cache = KvLayer::default();
         for t in 0..seq {
             let inc = attn.forward_one(&x.data[t * dim..(t + 1) * dim], t, &mut cache).unwrap();
-            for d in 0..dim {
-                assert!((inc[d] - full.data[t * dim + d]).abs() < 1e-4);
+            for (d, &got) in inc.iter().enumerate() {
+                assert!((got - full.data[t * dim + d]).abs() < 1e-4);
             }
         }
     }
@@ -681,8 +681,8 @@ mod tests {
         let mut cache = KvLayer::default();
         for t in 0..seq {
             let inc = b.forward_one(&x.data[t * dim..(t + 1) * dim], t, &mut cache).unwrap();
-            for d in 0..dim {
-                assert!((inc[d] - full.data[t * dim + d]).abs() < 1e-4,
+            for (d, &got) in inc.iter().enumerate() {
+                assert!((got - full.data[t * dim + d]).abs() < 1e-4,
                     "block row {t} dim {d}");
             }
         }

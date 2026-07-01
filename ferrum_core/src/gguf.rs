@@ -292,7 +292,7 @@ pub fn f16_to_f32(h: u16) -> f32 {
 /// Bytes one tensor of `n` elements of `ggml_type` occupies on disk.
 fn type_nbytes(ggml_type: u32, n: usize) -> Result<usize> {
     let blocks = || -> Result<usize> {
-        if n % QK != 0 {
+        if !n.is_multiple_of(QK) {
             return Err(fmt(&format!(
                 "quantized tensor element count {n} is not a multiple of {QK}"
             )));
@@ -300,7 +300,7 @@ fn type_nbytes(ggml_type: u32, n: usize) -> Result<usize> {
         Ok(n / QK)
     };
     let kblocks = || -> Result<usize> {
-        if n % QK_K != 0 {
+        if !n.is_multiple_of(QK_K) {
             return Err(fmt(&format!(
                 "k-quant tensor element count {n} is not a multiple of {QK_K}"
             )));
@@ -996,7 +996,7 @@ mod tests {
         bytes.extend_from_slice(&dir);
         // Pad to default alignment (32) before the data section.
         let pad = align_up(bytes.len(), DEFAULT_ALIGNMENT as usize) - bytes.len();
-        bytes.extend(std::iter::repeat(0u8).take(pad));
+        bytes.extend(std::iter::repeat_n(0u8, pad));
         bytes.extend_from_slice(&data);
 
         // Recompute q4 expected values to match the writer's nibble layout.
@@ -1201,7 +1201,7 @@ mod tests {
         bytes.extend_from_slice(&meta);
         bytes.extend_from_slice(&t.infos);
         let pad = align_up(bytes.len(), DEFAULT_ALIGNMENT as usize) - bytes.len();
-        bytes.extend(std::iter::repeat(0u8).take(pad));
+        bytes.extend(std::iter::repeat_n(0u8, pad));
         bytes.extend_from_slice(&t.data);
         bytes
     }
@@ -1230,8 +1230,8 @@ mod tests {
         let (_, vocab) = logits.matrix_dims().unwrap();
         for (ti, &tok) in tokens.iter().enumerate() {
             let step = model.forward_one(tok, &mut cache).unwrap();
-            for v in 0..vocab {
-                assert!((step[v] - logits.data[ti * vocab + v]).abs() < 1e-2,
+            for (v, &s) in step.iter().enumerate() {
+                assert!((s - logits.data[ti * vocab + v]).abs() < 1e-2,
                     "imported model cached vs full mismatch at {ti},{v}");
             }
         }
@@ -1263,7 +1263,7 @@ mod tests {
         bytes.extend_from_slice(&meta);
         bytes.extend_from_slice(&t.infos);
         let pad = align_up(bytes.len(), DEFAULT_ALIGNMENT as usize) - bytes.len();
-        bytes.extend(std::iter::repeat(0u8).take(pad));
+        bytes.extend(std::iter::repeat_n(0u8, pad));
         bytes.extend_from_slice(&t.data);
 
         let g = Gguf::parse(bytes).unwrap();
@@ -1309,7 +1309,7 @@ mod tests {
         kv_str(&mut bytes, "general.architecture", "llama");
         // Pad to the alignment boundary so the (empty) data section starts in-bounds.
         let pad = align_up(bytes.len(), DEFAULT_ALIGNMENT as usize) - bytes.len();
-        bytes.extend(std::iter::repeat(0u8).take(pad));
+        bytes.extend(std::iter::repeat_n(0u8, pad));
         let g = Gguf::parse(bytes).unwrap();
         assert!(g.load_llama(QKind::Int8).is_err(), "missing embedding_length must error");
     }
@@ -1326,8 +1326,8 @@ mod tests {
             raw.push(((i - 16) as i8) as u8);
         }
         let out = dequant_q8_1(&raw, QK).unwrap();
-        for i in 0..QK {
-            assert!((out[i] - d * (i as i32 - 16) as f32).abs() < 1e-3);
+        for (i, &o) in out.iter().enumerate() {
+            assert!((o - d * (i as i32 - 16) as f32).abs() < 1e-3);
         }
     }
 
@@ -1374,7 +1374,7 @@ mod tests {
         // scales = 2, d = 0.5 ⇒ every value = 0.5·2·8 = 8.0.
         let mut raw = vec![0x88u8; QK_K / 2];
         raw.extend_from_slice(&[0xAAu8; QK_K / 4]);
-        raw.extend(std::iter::repeat(2i8 as u8).take(QK_K / 16));
+        raw.extend(std::iter::repeat_n(2i8 as u8, QK_K / 16));
         raw.extend_from_slice(&f32_to_f16(0.5).to_le_bytes());
         let out = dequant_q6_k(&raw, QK_K).unwrap();
         assert_eq!(out.len(), QK_K);

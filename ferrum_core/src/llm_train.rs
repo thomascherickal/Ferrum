@@ -621,6 +621,8 @@ fn forward_train(model: &LlamaModel, tokens: &[usize], dropout: f32, seed: u64) 
     for (bi, block) in model.blocks.iter().enumerate() {
         let mut n1 = vec![0.0f32; seq * dim];
         let mut n1_inv = vec![0.0f32; seq];
+        // `t` derives the row offset (for x/n1 slices) and indexes n1_inv.
+        #[allow(clippy::needless_range_loop)]
         for t in 0..seq {
             let s = t * dim;
             let (y, inv) = rmsnorm_forward_row(&x[s..s + dim], &block.attn_norm.weight, cfg.norm_eps);
@@ -633,6 +635,7 @@ fn forward_train(model: &LlamaModel, tokens: &[usize], dropout: f32, seed: u64) 
 
         let mut n2 = vec![0.0f32; seq * dim];
         let mut n2_inv = vec![0.0f32; seq];
+        #[allow(clippy::needless_range_loop)] // see the n1 loop above
         for t in 0..seq {
             let s = t * dim;
             let (y, inv) = rmsnorm_forward_row(&h[s..s + dim], &block.ffn_norm.weight, cfg.norm_eps);
@@ -651,6 +654,7 @@ fn forward_train(model: &LlamaModel, tokens: &[usize], dropout: f32, seed: u64) 
     let xfinal = x.clone();
     let mut xn = vec![0.0f32; seq * dim];
     let mut nf_inv = vec![0.0f32; seq];
+    #[allow(clippy::needless_range_loop)] // `t` derives the row offset and indexes nf_inv
     for t in 0..seq {
         let s = t * dim;
         let (y, inv) = rmsnorm_forward_row(&xfinal[s..s + dim], &model.final_norm.weight, cfg.norm_eps);
@@ -1069,19 +1073,21 @@ impl LlamaTrainer {
     /// optionally across threads, followed by a single AdamW step. Returns the
     /// mean loss over the batch.
     fn step_over_windows(&mut self, windows: &[&[usize]], base_seed: u64, threads: usize) -> Result<f32> {
-        let nshards = threads.max(1).min(windows.len().max(1));
-
-        #[cfg(not(target_arch = "wasm32"))]
-        let multi = nshards > 1;
+        // No threads on wasm: always take the serial accumulator path.
         #[cfg(target_arch = "wasm32")]
-        let multi = false;
-
-        if !multi {
-            return self.train_batch_seeded(windows, base_seed);
+        {
+            let _ = threads;
+            self.train_batch_seeded(windows, base_seed)
         }
 
         #[cfg(not(target_arch = "wasm32"))]
         {
+            let nshards = threads.max(1).min(windows.len().max(1));
+            // One shard (or a single-window batch) is exactly the serial path.
+            if nshards <= 1 {
+                return self.train_batch_seeded(windows, base_seed);
+            }
+
             let dropout = self.dropout;
             let masters = if self.qat {
                 let snap = self.snapshot_weights();
