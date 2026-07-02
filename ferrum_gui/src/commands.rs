@@ -1002,6 +1002,135 @@ fn finetune_inner(app: AppHandle, p: FinetuneParams) -> Result<FinetuneResult, S
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GGUF export (Export tab): write a loaded — optionally fine-tuned — llama/
+// qwen2 model back out as a runnable GGUF at a chosen quantization.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportParams {
+    pub model_path: String,
+    pub out_path: String,
+    /// Output type name, parsed by `GgufQuant::from_str` ("q8_0", "q4_k", "f16", …).
+    pub quant: String,
+    /// Optional `.flck` fine-tune checkpoint to overlay before export.
+    pub resume: Option<String>,
+    /// Bypass the RAM guard.
+    pub force: bool,
+    #[allow(dead_code)] // wired to the export_gguf command in the next commit
+    pub verbose: bool,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportResult {
+    pub out_path: String,
+    pub bytes: u64,
+    pub seconds: f64,
+    /// Per-type tensor counts of the written file, e.g. "42× Q6_K, 19× F32".
+    pub tensor_summary: String,
+}
+
+/// Output-buffer size estimate for the RAM guard: the whole encoded file is
+/// built in memory before the atomic write, so a lossless f32 target costs a
+/// second model's worth; f16 half; quantized targets ≤ ~a third (conservative).
+fn export_output_estimate(est_model: usize, quant: ferrum_core::GgufQuant) -> usize {
+    use ferrum_core::GgufQuant as Q;
+    match quant {
+        Q::F32 => est_model,
+        Q::F16 => est_model / 2,
+        _ => est_model / 3,
+    }
+}
+
+/// Human name for the GGML tensor-type ids the exporter can emit.
+fn ggml_type_name(t: u32) -> String {
+    match t {
+        0 => "F32".into(),
+        1 => "F16".into(),
+        2 => "Q4_0".into(),
+        3 => "Q4_1".into(),
+        8 => "Q8_0".into(),
+        9 => "Q8_1".into(),
+        12 => "Q4_K".into(),
+        13 => "Q5_K".into(),
+        14 => "Q6_K".into(),
+        other => format!("type{other}"),
+    }
+}
+
+/// The testable core of the Export tab: everything `export_gguf` does except
+/// event emission. `progress` receives one human-readable line per phase
+/// (prefixes: "opening", "loading", "applying", "encoding").
+#[allow(dead_code)] // wired to the export_gguf command in the next commit
+pub(crate) fn do_export(p: &ExportParams, progress: &dyn Fn(&str)) -> Result<ExportResult, String> {
+    if p.out_path.trim().is_empty() {
+        return Err("please provide an output path (.gguf)".into());
+    }
+    let quant = ferrum_core::GgufQuant::from_str(&p.quant)
+        .ok_or_else(|| format!("unknown output type '{}'", p.quant))?;
+
+    progress(&format!("opening {} (streamed)…", p.model_path));
+    let g = Gguf::open(&p.model_path).map_err(|e| format!("cannot open {}: {e}", p.model_path))?;
+
+    // Memory guard: f32 model + in-RAM output buffer.
+    let est_model = gguf_resident_bytes(&g, None);
+    let est = est_model.saturating_add(export_output_estimate(est_model, quant));
+    if let Some(avail) = available_memory_bytes() {
+        if (est as f64) > 0.9 * avail as f64 && !p.force {
+            return Err(format!(
+                "estimated peak memory ({:.2} GB: f32 model + output buffer) exceeds 90% of \
+                 available ({:.2} GB) — pick a smaller output type or tick 'Export anyway'.",
+                est as f64 / 1e9,
+                avail as f64 / 1e9
+            ));
+        }
+    }
+
+    let t0 = std::time::Instant::now();
+    progress("loading weights (f32)…");
+    let mut model = g
+        .load_llama_prec(None)
+        .map_err(|e| format!("cannot load model: {e}"))?;
+
+    if let Some(ckpt) = &p.resume {
+        progress(&format!("applying {ckpt}…"));
+        let bytes =
+            std::fs::read(ckpt).map_err(|e| format!("cannot read checkpoint {ckpt}: {e}"))?;
+        let mut tr = LlamaTrainer::new(model).map_err(|e| format!("cannot wrap model: {e}"))?;
+        tr.load_checkpoint_into(&bytes)
+            .map_err(|e| format!("cannot apply checkpoint: {e}"))?;
+        model = tr.model;
+    }
+
+    progress(&format!("encoding + writing ({})…", p.quant));
+    ferrum_core::write_llama_gguf(&model, &g, quant, &p.out_path)
+        .map_err(|e| format!("export failed: {e}"))?;
+
+    // Per-type summary, read back from the written file (also proves it
+    // re-opens as valid GGUF).
+    let gout =
+        Gguf::open(&p.out_path).map_err(|e| format!("written file failed to re-open: {e}"))?;
+    let mut counts: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
+    for t in &gout.tensors {
+        *counts.entry(t.ggml_type).or_default() += 1;
+    }
+    let tensor_summary = counts
+        .iter()
+        .map(|(ty, n)| format!("{n}× {}", ggml_type_name(*ty)))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let bytes = std::fs::metadata(&p.out_path).map(|m| m.len()).unwrap_or(0);
+    Ok(ExportResult {
+        out_path: p.out_path.clone(),
+        bytes,
+        seconds: t0.elapsed().as_secs_f64(),
+        tensor_summary,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 6. Interactive terminal (requirement #3)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1217,5 +1346,192 @@ mod tests {
     #[test]
     fn time_seed_is_nonzero() {
         assert_ne!(time_seed(), 0);
+    }
+
+    // ── GGUF export (do_export) ──────────────────────────────────────────────
+
+    use ferrum_core::GgufQuant;
+
+    #[test]
+    fn export_output_estimate_matches_cli_heuristic() {
+        assert_eq!(export_output_estimate(900, GgufQuant::F32), 900);
+        assert_eq!(export_output_estimate(900, GgufQuant::F16), 450);
+        assert_eq!(export_output_estimate(900, GgufQuant::Q8_0), 300);
+        assert_eq!(export_output_estimate(900, GgufQuant::Q4K), 300);
+    }
+
+    #[test]
+    fn do_export_rejects_bad_inputs() {
+        let base = ExportParams {
+            model_path: "/nonexistent.gguf".into(),
+            out_path: "/tmp/out.gguf".into(),
+            quant: "q8_0".into(),
+            resume: None,
+            force: false,
+            verbose: false,
+        };
+        let noop = |_: &str| {};
+
+        let mut p = base;
+        p.out_path = "  ".into();
+        assert!(do_export(&p, &noop).unwrap_err().contains("output"));
+
+        p.out_path = "/tmp/out.gguf".into();
+        p.quant = "q9_9".into();
+        assert!(do_export(&p, &noop).unwrap_err().contains("q9_9"));
+    }
+
+    // Build a minimal valid `llama` GGUF (dim 8, 2 layers, gpt2 tokenizer
+    // metadata) with deterministic weights — same shape as ferrum_core's own
+    // export-test fixture. Returns the file's bytes.
+    fn tiny_llama_gguf() -> Vec<u8> {
+        use ferrum_core::{GgufBuilder, MetaValue};
+        const GGML_F32: u32 = 0;
+        let (dim, n_layers, n_heads, ffn, vocab) = (8usize, 2usize, 2usize, 16usize, 32usize);
+        let head_dim = dim / n_heads;
+        let gen = |seed: usize, n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((seed * 131 + i * 17) % 101) as f32 / 500.0) - 0.1)
+                .collect()
+        };
+        let f32_bytes = |xs: &[f32]| -> Vec<u8> {
+            let mut o = Vec::with_capacity(xs.len() * 4);
+            for &x in xs {
+                o.extend_from_slice(&x.to_le_bytes());
+            }
+            o
+        };
+        let mut b = GgufBuilder::new();
+        b.meta("general.architecture", MetaValue::String("llama".into()));
+        b.meta("llama.embedding_length", MetaValue::U32(dim as u32));
+        b.meta("llama.block_count", MetaValue::U32(n_layers as u32));
+        b.meta("llama.attention.head_count", MetaValue::U32(n_heads as u32));
+        b.meta(
+            "llama.attention.head_count_kv",
+            MetaValue::U32(n_heads as u32),
+        );
+        b.meta("llama.feed_forward_length", MetaValue::U32(ffn as u32));
+        b.meta("llama.context_length", MetaValue::U32(16));
+        b.meta(
+            "llama.attention.layer_norm_rms_epsilon",
+            MetaValue::F32(1e-5),
+        );
+        b.meta("tokenizer.ggml.model", MetaValue::String("gpt2".into()));
+        b.meta(
+            "tokenizer.ggml.tokens",
+            MetaValue::Array(
+                (0..vocab)
+                    .map(|i| MetaValue::String(format!("t{i}")))
+                    .collect(),
+            ),
+        );
+        let t = |b: &mut GgufBuilder, name: &str, dims: &[u64], seed: usize| {
+            let n: usize = dims.iter().product::<u64>() as usize;
+            b.tensor(name, dims, GGML_F32, f32_bytes(&gen(seed, n)));
+        };
+        t(&mut b, "token_embd.weight", &[dim as u64, vocab as u64], 1);
+        for i in 0..n_layers {
+            let p = format!("blk.{i}");
+            t(
+                &mut b,
+                &format!("{p}.attn_norm.weight"),
+                &[dim as u64],
+                10 + i,
+            );
+            let qkv = (n_heads * head_dim) as u64;
+            t(
+                &mut b,
+                &format!("{p}.attn_q.weight"),
+                &[dim as u64, qkv],
+                20 + i,
+            );
+            t(
+                &mut b,
+                &format!("{p}.attn_k.weight"),
+                &[dim as u64, qkv],
+                30 + i,
+            );
+            t(
+                &mut b,
+                &format!("{p}.attn_v.weight"),
+                &[dim as u64, qkv],
+                40 + i,
+            );
+            t(
+                &mut b,
+                &format!("{p}.attn_output.weight"),
+                &[qkv, dim as u64],
+                50 + i,
+            );
+            t(
+                &mut b,
+                &format!("{p}.ffn_norm.weight"),
+                &[dim as u64],
+                60 + i,
+            );
+            t(
+                &mut b,
+                &format!("{p}.ffn_gate.weight"),
+                &[dim as u64, ffn as u64],
+                70 + i,
+            );
+            t(
+                &mut b,
+                &format!("{p}.ffn_up.weight"),
+                &[dim as u64, ffn as u64],
+                80 + i,
+            );
+            t(
+                &mut b,
+                &format!("{p}.ffn_down.weight"),
+                &[ffn as u64, dim as u64],
+                90 + i,
+            );
+        }
+        t(&mut b, "output_norm.weight", &[dim as u64], 200);
+        t(&mut b, "output.weight", &[dim as u64, vocab as u64], 201);
+        b.into_bytes()
+    }
+
+    #[test]
+    fn do_export_roundtrips_a_tiny_model_with_phases() {
+        use ferrum_core::Gguf;
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let src = dir.join(format!("ferrum_gui_export_src_{pid}.gguf"));
+        let dst = dir.join(format!("ferrum_gui_export_dst_{pid}.gguf"));
+        std::fs::write(&src, tiny_llama_gguf()).unwrap();
+
+        let p = ExportParams {
+            model_path: src.to_string_lossy().into_owned(),
+            out_path: dst.to_string_lossy().into_owned(),
+            quant: "f32".into(),
+            resume: None,
+            force: false,
+            verbose: false,
+        };
+        let phases = std::cell::RefCell::new(Vec::<String>::new());
+        let r = do_export(&p, &|m| phases.borrow_mut().push(m.to_string())).unwrap();
+
+        // Phases arrive in order: opening → loading → encoding (no resume).
+        let ph = phases.borrow();
+        assert!(ph.len() >= 3, "want ≥3 phases, got {ph:?}");
+        assert!(ph[0].starts_with("opening"), "{ph:?}");
+        assert!(ph[1].starts_with("loading"), "{ph:?}");
+        assert!(ph.last().unwrap().starts_with("encoding"), "{ph:?}");
+        assert!(!ph.iter().any(|m| m.starts_with("applying")), "{ph:?}");
+
+        // Result: real file, non-trivial summary naming F32 tensors.
+        assert!(r.bytes > 0);
+        assert!(r.seconds >= 0.0);
+        assert!(r.tensor_summary.contains("F32"), "{}", r.tensor_summary);
+
+        // The output re-opens and re-loads as a runnable llama model.
+        let g = Gguf::open(&p.out_path).unwrap();
+        assert_eq!(g.architecture(), Some("llama"));
+        g.load_llama_prec(None).unwrap();
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
     }
 }
