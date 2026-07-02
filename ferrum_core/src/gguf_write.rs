@@ -849,18 +849,26 @@ pub fn llama_gguf_bytes(model: &LlamaModel, source: &Gguf, quant: GgufQuant) -> 
             &format!("{p}.attn_norm.weight"),
             &blk.attn_norm.weight,
         );
-        add_linear(&mut b, &p, "attn_q", &blk.attn.wq, source, quant)?;
-        add_linear(&mut b, &p, "attn_k", &blk.attn.wk, source, quant)?;
-        add_linear(&mut b, &p, "attn_v", &blk.attn.wv, source, quant)?;
-        add_linear(&mut b, &p, "attn_output", &blk.attn.wo, source, quant)?;
+        add_linear(&mut b, &p, "attn_q", &blk.attn.wq, source, true, quant)?;
+        add_linear(&mut b, &p, "attn_k", &blk.attn.wk, source, true, quant)?;
+        add_linear(&mut b, &p, "attn_v", &blk.attn.wv, source, true, quant)?;
+        add_linear(
+            &mut b,
+            &p,
+            "attn_output",
+            &blk.attn.wo,
+            source,
+            false,
+            quant,
+        )?;
         add_norm(
             &mut b,
             &format!("{p}.ffn_norm.weight"),
             &blk.ffn_norm.weight,
         );
-        add_linear(&mut b, &p, "ffn_gate", &blk.ffn.gate, source, quant)?;
-        add_linear(&mut b, &p, "ffn_up", &blk.ffn.up, source, quant)?;
-        add_linear(&mut b, &p, "ffn_down", &blk.ffn.down, source, quant)?;
+        add_linear(&mut b, &p, "ffn_gate", &blk.ffn.gate, source, false, quant)?;
+        add_linear(&mut b, &p, "ffn_up", &blk.ffn.up, source, false, quant)?;
+        add_linear(&mut b, &p, "ffn_down", &blk.ffn.down, source, false, quant)?;
     }
 
     add_norm(&mut b, "output_norm.weight", &model.final_norm.weight);
@@ -885,15 +893,6 @@ pub fn write_llama_gguf(
 
 // ── tensor emission helpers ──────────────────────────────────────────────────
 
-/// f32 weights of a Linear in Ferrum `[n_in, n_out]` order (dequantizing if the
-/// model is stored quantized in memory).
-fn linear_f32(lin: &Linear) -> Vec<f32> {
-    match lin.qweight() {
-        Some(qw) => qw.to_f32(),
-        None => lin.weight.data.clone(),
-    }
-}
-
 /// Transpose row-major `[rows, cols]` → `[cols, rows]`.
 fn transpose(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; rows * cols];
@@ -913,22 +912,32 @@ fn add_norm(b: &mut GgufBuilder, name: &str, weight: &[f32]) {
 }
 
 /// A projection weight (+ optional bias) named `{prefix}.{stem}.weight`.
+///
+/// `can_have_bias` must be `true` only for `attn_q`/`attn_k`/`attn_v`: those are
+/// the only stems [`crate::gguf::Gguf::load_llama_prec`] ever loads a bias for
+/// (it passes `bias_name: None` when building the `attn_output`/`ffn_*`
+/// `Linear`s). For those stems `lin.bias.data` is therefore always a zero-filled
+/// placeholder, not source data — emitting it would silently synthesize a bogus
+/// all-zeros bias tensor, so callers for those stems must pass `false`.
 fn add_linear(
     b: &mut GgufBuilder,
     prefix: &str,
     stem: &str,
     lin: &Linear,
     source: &Gguf,
+    can_have_bias: bool,
     quant: GgufQuant,
 ) -> Result<()> {
     let wname = format!("{prefix}.{stem}.weight");
     add_weight_2d(b, &wname, lin, quant)?;
-    // Emit the bias only if the source carried it (Qwen2 q/k/v biases).
-    let bname = format!("{prefix}.{stem}.bias");
-    if source.tensor(&bname).is_some() {
-        let bias = &lin.bias.data;
-        let bytes = encode_tensor(bias, GGML_F32).unwrap();
-        b.tensor(&bname, &[bias.len() as u64], GGML_F32, bytes);
+    // Emit the bias only if this stem can carry one *and* the source had it.
+    if can_have_bias {
+        let bname = format!("{prefix}.{stem}.bias");
+        if source.tensor(&bname).is_some() {
+            let bias = &lin.bias.data;
+            let bytes = encode_tensor(bias, GGML_F32).unwrap();
+            b.tensor(&bname, &[bias.len() as u64], GGML_F32, bytes);
+        }
     }
     Ok(())
 }
@@ -937,7 +946,7 @@ fn add_linear(
 /// `[n_in, n_out]`, quantized per policy.
 fn add_weight_2d(b: &mut GgufBuilder, name: &str, lin: &Linear, quant: GgufQuant) -> Result<()> {
     let (n_in, n_out) = (lin.in_features(), lin.out_features());
-    let w = linear_f32(lin); // [n_in, n_out]
+    let w = lin.weight_f32(); // [n_in, n_out]
     let raw = transpose(&w, n_in, n_out); // [n_out, n_in]
     add_tensor(
         b,
@@ -963,7 +972,7 @@ fn add_tensor(
 ) -> Result<()> {
     let (ggml_type, fell_back) = plan_tensor_type(is_2d, block_axis, quant);
     if fell_back {
-        eprintln!(
+        vprintln!(
             "note: tensor '{name}' (axis {block_axis}) is not block-aligned for the chosen \
              quant; storing it as F16"
         );
@@ -1275,20 +1284,31 @@ mod tests {
 
     // ── write_llama_gguf ─────────────────────────────────────────────────────
 
+    // Deterministic filler in [-0.1, 0.1], shared by fixture builders below and
+    // by tests that need to know a fixture tensor's exact source values.
+    fn det_fill(seed: usize, n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| (((seed * 131 + i * 17) % 101) as f32 / 500.0) - 0.1)
+            .collect()
+    }
+
     // Build a minimal but valid `llama` GGUF (2 layers, dim 8) as bytes, with all
     // tensors F32 and a small gpt2 tokenizer block. Deterministic weights.
     fn tiny_llama_gguf_bytes() -> Vec<u8> {
+        tiny_llama_gguf_bytes_ex(false)
+    }
+
+    // Same fixture as `tiny_llama_gguf_bytes`, but when `with_qkv_bias` is true
+    // also emits deterministic F32 `blk.{i}.attn_{q,k,v}.bias` tensors (used by
+    // `write_llama_gguf_roundtrips_qkv_biases` to exercise the bias-emission
+    // path, which the plain fixture never touches).
+    fn tiny_llama_gguf_bytes_ex(with_qkv_bias: bool) -> Vec<u8> {
         use crate::gguf::{MetaValue, GGML_F32};
         let (dim, n_layers, n_heads, ffn, vocab, ctx) =
             (8usize, 2usize, 2usize, 16usize, 32usize, 16usize);
         let head_dim = dim / n_heads;
 
-        // Deterministic filler in [-0.1, 0.1].
-        let gen = |seed: usize, n: usize| -> Vec<f32> {
-            (0..n)
-                .map(|i| (((seed * 131 + i * 17) % 101) as f32 / 500.0) - 0.1)
-                .collect()
-        };
+        let gen = det_fill;
 
         let mut b = GgufBuilder::new();
         b.meta("general.architecture", MetaValue::String("llama".into()));
@@ -1335,24 +1355,63 @@ mod tests {
                 &[dim as u64, (n_heads * head_dim) as u64],
                 20 + i,
             );
+            if with_qkv_bias {
+                f32t(
+                    &mut b,
+                    &format!("{p}.attn_q.bias"),
+                    &[(n_heads * head_dim) as u64],
+                    300 + i,
+                );
+            }
             f32t(
                 &mut b,
                 &format!("{p}.attn_k.weight"),
                 &[dim as u64, (n_heads * head_dim) as u64],
                 30 + i,
             );
+            if with_qkv_bias {
+                f32t(
+                    &mut b,
+                    &format!("{p}.attn_k.bias"),
+                    &[(n_heads * head_dim) as u64],
+                    310 + i,
+                );
+            }
             f32t(
                 &mut b,
                 &format!("{p}.attn_v.weight"),
                 &[dim as u64, (n_heads * head_dim) as u64],
                 40 + i,
             );
+            if with_qkv_bias {
+                f32t(
+                    &mut b,
+                    &format!("{p}.attn_v.bias"),
+                    &[(n_heads * head_dim) as u64],
+                    320 + i,
+                );
+            }
             f32t(
                 &mut b,
                 &format!("{p}.attn_output.weight"),
                 &[(n_heads * head_dim) as u64, dim as u64],
                 50 + i,
             );
+            if with_qkv_bias {
+                // The reader never loads a bias for attn_output (it calls
+                // `linear_from` with `bias_name: None`), so this tensor is inert
+                // for `load_llama_prec` — it exists only so the writer's "never
+                // emit for non-qkv stems" invariant (Fix 1) is a genuine
+                // regression guard below: without it, `source.tensor(&bname)`
+                // would be `None` for this stem regardless of the `can_have_bias`
+                // gate, and a wrongly-gated regression would go undetected.
+                f32t(
+                    &mut b,
+                    &format!("{p}.attn_output.bias"),
+                    &[dim as u64],
+                    330 + i,
+                );
+            }
             f32t(
                 &mut b,
                 &format!("{p}.ffn_norm.weight"),
@@ -1416,5 +1475,57 @@ mod tests {
             g0.meta("tokenizer.ggml.tokens"),
             g1.meta("tokenizer.ggml.tokens")
         );
+    }
+
+    // Positive-path counterpart to the gating in `add_linear` (Task 11 review,
+    // Fix 1/2): `tiny_llama_gguf_bytes` never carries a `*.bias` tensor, so
+    // without this test the bias-emission branch is only ever exercised as
+    // `false`. This fixture adds deterministic q/k/v biases and checks both
+    // that they round-trip and that no other stem ever emits one.
+    #[test]
+    fn write_llama_gguf_roundtrips_qkv_biases() {
+        use crate::gguf::Gguf;
+
+        // Mirrors the (dim, n_layers, n_heads, head_dim) fixed inside
+        // `tiny_llama_gguf_bytes_ex`: dim=8, n_heads=2 → head_dim=4, so the q/k/v
+        // output dim (n_heads*head_dim) is 8.
+        let n_layers = 2usize;
+        let qkv_dim = 8usize;
+
+        let g0 = Gguf::parse(tiny_llama_gguf_bytes_ex(true)).unwrap();
+        let model = g0.load_llama_prec(None).unwrap();
+
+        let out = llama_gguf_bytes(&model, &g0, GgufQuant::F32).unwrap();
+        let g1 = Gguf::parse(out).unwrap();
+
+        // (a) q/k/v biases are present and match the source values exactly
+        // (F32 in, F32 out — lossless).
+        for i in 0..n_layers {
+            let p = format!("blk.{i}");
+            for (stem, seed) in [
+                ("attn_q", 300 + i),
+                ("attn_k", 310 + i),
+                ("attn_v", 320 + i),
+            ] {
+                let name = format!("{p}.{stem}.bias");
+                let expected = det_fill(seed, qkv_dim);
+                let t = g1
+                    .tensor(&name)
+                    .unwrap_or_else(|| panic!("expected '{name}' to be emitted"));
+                let got = g1.dequantize(t).unwrap();
+                assert_eq!(got.len(), expected.len(), "{name}: length mismatch");
+                for (g, e) in got.iter().zip(&expected) {
+                    assert!((g - e).abs() < 1e-6, "{name}: got {g}, want {e}");
+                }
+            }
+        }
+
+        // (b) non-qkv stems never emit a bias, even though every Linear (incl.
+        // attn_output/ffn_*) carries a zero-filled in-memory `bias` vector.
+        assert!(g1.tensor("blk.0.attn_output.bias").is_none());
+        assert!(g1.tensor("blk.0.ffn_gate.bias").is_none());
+        assert!(g1.tensor("blk.0.ffn_up.bias").is_none());
+        assert!(g1.tensor("blk.0.ffn_down.bias").is_none());
+        assert!(g1.tensor("blk.1.attn_output.bias").is_none());
     }
 }
