@@ -950,22 +950,43 @@ fn cmd_export_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         g.architecture().unwrap_or("?")
     );
 
+    // Whitespace-only --resume means "none".
+    let resume = args
+        .flags
+        .get("resume")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+
     // Export loads f32 masters AND builds the whole encoded output in memory
     // before the atomic write, so peak ≈ model + output buffer (which for a
-    // lossless f32 target is another full model's worth).
+    // lossless f32 target is another full model's worth). Applying a --resume
+    // checkpoint has its own, separate transient peak: LlamaTrainer allocates
+    // grads + both Adam moments (≈4× the f32 model), freed before the write.
     let est_model = estimate_resident_bytes(&g, None);
     let est_out = match quant {
         GgufQuant::F32 => est_model,
         GgufQuant::F16 => est_model / 2,
         _ => est_model / 3, // quantized outputs are smaller; /3 is conservative
     };
-    let est = est_model.saturating_add(est_out);
-    println!(
-        "  estimated peak ≈ {:.2} GB  (f32 model {:.2} + output buffer {:.2})",
-        est as f64 / 1e9,
-        est_model as f64 / 1e9,
-        est_out as f64 / 1e9
-    );
+    let write_peak = est_model.saturating_add(est_out);
+    let est = if resume.is_some() {
+        est_model.saturating_mul(4).max(write_peak)
+    } else {
+        write_peak
+    };
+    if resume.is_some() {
+        println!(
+            "  estimated peak ≈ {:.2} GB  (checkpoint apply: weights + grad + Adam m/v)",
+            est as f64 / 1e9
+        );
+    } else {
+        println!(
+            "  estimated peak ≈ {:.2} GB  (f32 model {:.2} + output buffer {:.2})",
+            est as f64 / 1e9,
+            est_model as f64 / 1e9,
+            est_out as f64 / 1e9
+        );
+    }
     if let Some(avail) = available_memory_bytes() {
         if (est as f64) > 0.9 * avail as f64 && !args.has("force") {
             return Err(format!(
@@ -984,7 +1005,7 @@ fn cmd_export_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("cannot load model: {e}"))?;
 
     // Optional: apply a fine-tune checkpoint's f32 masters before export.
-    if let Some(ckpt) = args.flags.get("resume") {
+    if let Some(ckpt) = resume {
         println!("Applying fine-tune checkpoint {ckpt}…");
         let bytes = std::fs::read(ckpt)?;
         let mut trainer = LlamaTrainer::new(model)?;

@@ -184,7 +184,8 @@ format and saves it, runnable in llama.cpp, ollama, or LM Studio.
 3. To export a fine-tune, point **Fine-tune checkpoint** at the `.flck` the
    Fine-tune tab produced.
 4. **Save as…** the output path and click **Export**. The status line follows
-   the phases (opening → loading → writing), and the result shows a per-type
+   the phases (opening → loading → applying, if a checkpoint is set → writing),
+   and the result shows a per-type
    tensor summary — any matrix that fell back to f16 shows up there.
 5. The written file runs unchanged in llama.cpp, ollama, or LM Studio.
 

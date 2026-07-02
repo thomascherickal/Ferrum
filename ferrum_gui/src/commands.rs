@@ -1067,19 +1067,33 @@ pub(crate) fn do_export(p: &ExportParams, progress: &dyn Fn(&str)) -> Result<Exp
     }
     let quant = ferrum_core::GgufQuant::from_str(&p.quant)
         .ok_or_else(|| format!("unknown output type '{}'", p.quant))?;
+    // Whitespace-only checkpoint paths mean "none" (parity with `gguf_run_inner`).
+    let resume = p.resume.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
     progress(&format!("opening {} (streamed)…", p.model_path));
     let g = Gguf::open(&p.model_path).map_err(|e| format!("cannot open {}: {e}", p.model_path))?;
 
-    // Memory guard: f32 model + in-RAM output buffer.
+    // Memory guard. Two transient peaks, not additive: applying a checkpoint
+    // allocates grads + both Adam moments (≈4× the f32 model — freed before the
+    // write), and the write itself holds model + encoded output buffer.
     let est_model = gguf_resident_bytes(&g, None);
-    let est = est_model.saturating_add(export_output_estimate(est_model, quant));
+    let write_peak = est_model.saturating_add(export_output_estimate(est_model, quant));
+    let est = if resume.is_some() {
+        est_model.saturating_mul(4).max(write_peak)
+    } else {
+        write_peak
+    };
     if let Some(avail) = available_memory_bytes() {
         if (est as f64) > 0.9 * avail as f64 && !p.force {
             return Err(format!(
-                "estimated peak memory ({:.2} GB: f32 model + output buffer) exceeds 90% of \
-                 available ({:.2} GB) — pick a smaller output type or tick 'Export anyway'.",
+                "estimated peak memory ({:.2} GB{}) exceeds 90% of available ({:.2} GB) — \
+                 pick a smaller output type or tick 'Export anyway'.",
                 est as f64 / 1e9,
+                if resume.is_some() {
+                    ": checkpoint apply needs weights + grads + Adam moments"
+                } else {
+                    ": f32 model + output buffer"
+                },
                 avail as f64 / 1e9
             ));
         }
@@ -1091,7 +1105,7 @@ pub(crate) fn do_export(p: &ExportParams, progress: &dyn Fn(&str)) -> Result<Exp
         .load_llama_prec(None)
         .map_err(|e| format!("cannot load model: {e}"))?;
 
-    if let Some(ckpt) = &p.resume {
+    if let Some(ckpt) = resume {
         progress(&format!("applying {ckpt}…"));
         let bytes =
             std::fs::read(ckpt).map_err(|e| format!("cannot read checkpoint {ckpt}: {e}"))?;
@@ -1395,6 +1409,10 @@ mod tests {
         p.out_path = "/tmp/out.gguf".into();
         p.quant = "q9_9".into();
         assert!(do_export(&p, &noop).unwrap_err().contains("q9_9"));
+
+        // A missing source file reaches — and names — the open failure.
+        p.quant = "q8_0".into();
+        assert!(do_export(&p, &noop).unwrap_err().contains("cannot open"));
     }
 
     // Build a minimal valid `llama` GGUF (dim 8, 2 layers, gpt2 tokenizer
@@ -1537,9 +1555,11 @@ mod tests {
         assert!(ph.last().unwrap().starts_with("encoding"), "{ph:?}");
         assert!(!ph.iter().any(|m| m.starts_with("applying")), "{ph:?}");
 
-        // Result: real file, non-trivial summary naming F32 tensors.
+        // Result: the reported path/size match the real file, and the summary
+        // names F32 tensors (the whole fixture is F32).
+        assert_eq!(r.out_path, p.out_path);
+        assert_eq!(r.bytes, std::fs::metadata(&p.out_path).unwrap().len());
         assert!(r.bytes > 0);
-        assert!(r.seconds >= 0.0);
         assert!(r.tensor_summary.contains("F32"), "{}", r.tensor_summary);
 
         // The output re-opens and re-loads as a runnable llama model.
