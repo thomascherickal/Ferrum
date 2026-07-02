@@ -70,7 +70,9 @@ impl GgufQuant {
             Self::Q4_0 => 2,
             Self::Q4_1 => 3,
             Self::Q8_0 => 7,
-            Self::Q8_1 => 9,
+            // There is no standard whole-model Q8_1 ftype (9 is MOSTLY_Q5_1);
+            // the nearest honest hint is MOSTLY_Q8_0.
+            Self::Q8_1 => 7,
             Self::Q4K => 15, // MOSTLY_Q4_K_M
             Self::Q5K => 17, // MOSTLY_Q5_K_M
             Self::Q6K => 18, // MOSTLY_Q6_K
@@ -594,6 +596,12 @@ impl GgufBuilder {
     }
 
     pub fn tensor(&mut self, name: &str, dims: &[u64], ggml_type: u32, data: Vec<u8>) -> &mut Self {
+        // Duplicate names would parse (readers resolve first-match) but the
+        // file would be malformed; this is a caller bug, so catch it in tests.
+        debug_assert!(
+            self.tensors.iter().all(|t| t.name != name),
+            "GgufBuilder: duplicate tensor name '{name}'"
+        );
         self.tensors.push(TensorOut {
             name: name.to_string(),
             dims: dims.to_vec(),
@@ -649,9 +657,10 @@ impl GgufBuilder {
         o
     }
 
+    /// Emit to a file (atomically — see [`atomic_write`]).
     pub fn write(self, path: &str) -> crate::error::Result<()> {
         let bytes = self.into_bytes();
-        std::fs::write(path, bytes).map_err(InferError::from)
+        atomic_write(path, &bytes)
     }
 }
 
@@ -808,8 +817,9 @@ pub fn llama_gguf_bytes(model: &LlamaModel, source: &Gguf, quant: GgufQuant) -> 
         }
         b.meta(k, v.clone());
     }
-    b.meta("general.file_type", MetaValue::U32(quant.file_type()));
-    b.meta("general.quantization_version", MetaValue::U32(2));
+    // `general.file_type` / `general.quantization_version` are refreshed after
+    // tensor emission, once we know whether the requested type was actually
+    // used (block-alignment fallbacks can turn a k-quant request into F16).
 
     // 2. Tensors.
     let cfg = &model.cfg;
@@ -859,10 +869,23 @@ pub fn llama_gguf_bytes(model: &LlamaModel, source: &Gguf, quant: GgufQuant) -> 
         add_weight_2d(&mut b, "output.weight", &model.lm_head, quant)?;
     }
 
+    // 3. File-type hint, decided from what was *actually* emitted: if every
+    //    matrix fell back (no tensor of the requested type exists), stamping
+    //    the requested ftype would mislead external tools — stamp the
+    //    fallback's instead.
+    let used_requested = b.tensors.iter().any(|t| t.ggml_type == quant.ggml_type());
+    let effective = if used_requested {
+        quant
+    } else {
+        GgufQuant::F16
+    };
+    b.meta("general.file_type", MetaValue::U32(effective.file_type()));
+    b.meta("general.quantization_version", MetaValue::U32(2));
+
     Ok(b.into_bytes())
 }
 
-/// Write `llama_gguf_bytes` to a file.
+/// Write `llama_gguf_bytes` to a file (atomically — see [`atomic_write`]).
 pub fn write_llama_gguf(
     model: &LlamaModel,
     source: &Gguf,
@@ -870,7 +893,19 @@ pub fn write_llama_gguf(
     path: &str,
 ) -> Result<()> {
     let bytes = llama_gguf_bytes(model, source, quant)?;
-    std::fs::write(path, bytes).map_err(InferError::from)
+    atomic_write(path, &bytes)
+}
+
+/// Write `bytes` to `path` via a same-directory temp file + rename, so a crash
+/// or full disk mid-write can never leave a truncated `.gguf` at `path`
+/// (`rename` replaces an existing destination on both Unix and Windows).
+fn atomic_write(path: &str, bytes: &[u8]) -> Result<()> {
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, bytes).map_err(InferError::from)?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp); // best-effort cleanup
+        InferError::from(e)
+    })
 }
 
 // ── tensor emission helpers ──────────────────────────────────────────────────
@@ -1285,9 +1320,15 @@ mod tests {
     // `write_llama_gguf_roundtrips_qkv_biases` to exercise the bias-emission
     // path, which the plain fixture never touches).
     fn tiny_llama_gguf_bytes_ex(with_qkv_bias: bool) -> Vec<u8> {
+        build_tiny_llama(8, 2, with_qkv_bias)
+    }
+
+    // Generalized fixture builder. `dim` also sets `ffn = 2·dim`; a `dim` that
+    // is a multiple of 256 makes every projection k-quantizable end-to-end
+    // (used by `write_llama_gguf_emits_kquant_at_dim_256`).
+    fn build_tiny_llama(dim: usize, n_layers: usize, with_qkv_bias: bool) -> Vec<u8> {
         use crate::gguf::{MetaValue, GGML_F32};
-        let (dim, n_layers, n_heads, ffn, vocab, ctx) =
-            (8usize, 2usize, 2usize, 16usize, 32usize, 16usize);
+        let (n_heads, ffn, vocab, ctx) = (2usize, 2 * dim, 32usize, 16usize);
         let head_dim = dim / n_heads;
 
         let gen = det_fill;
@@ -1379,21 +1420,6 @@ mod tests {
                 &[(n_heads * head_dim) as u64, dim as u64],
                 50 + i,
             );
-            if with_qkv_bias {
-                // The reader never loads a bias for attn_output (it calls
-                // `linear_from` with `bias_name: None`), so this tensor is inert
-                // for `load_llama_prec` — it exists only so the writer's "never
-                // emit for non-qkv stems" invariant (Fix 1) is a genuine
-                // regression guard below: without it, `source.tensor(&bname)`
-                // would be `None` for this stem regardless of the `can_have_bias`
-                // gate, and a wrongly-gated regression would go undetected.
-                f32t(
-                    &mut b,
-                    &format!("{p}.attn_output.bias"),
-                    &[dim as u64],
-                    330 + i,
-                );
-            }
             f32t(
                 &mut b,
                 &format!("{p}.ffn_norm.weight"),
@@ -1474,8 +1500,21 @@ mod tests {
         let n_layers = 2usize;
         let qkv_dim = 8usize;
 
-        let g0 = Gguf::parse(tiny_llama_gguf_bytes_ex(true)).unwrap();
+        let mut g0 = Gguf::parse(tiny_llama_gguf_bytes_ex(true)).unwrap();
         let model = g0.load_llama_prec(None).unwrap();
+
+        // Re-arm the writer-gate regression guard: plant a fake directory entry
+        // for a non-qkv bias in the *source* (the reader rejects real ones at
+        // load time, so the model above is clean — but the writer's
+        // `can_have_bias` gate must refuse the emission even when
+        // `source.tensor(&bname)` is `Some`). The offset is never read: the
+        // writer takes bias values from the model, not the source bytes.
+        g0.tensors.push(crate::gguf::TensorInfo {
+            name: "blk.0.attn_output.bias".into(),
+            dims: vec![8],
+            ggml_type: crate::gguf::GGML_F32,
+            offset: 0,
+        });
 
         let out = llama_gguf_bytes(&model, &g0, GgufQuant::F32).unwrap();
         let g1 = Gguf::parse(out).unwrap();
@@ -1533,6 +1572,65 @@ mod tests {
         assert_eq!(
             model.forward_tokens(&[1usize, 2, 3]).unwrap().data,
             m2.forward_tokens(&[1usize, 2, 3]).unwrap().data
+        );
+    }
+
+    // The reader loads biases only for q/k/v; a file carrying one on any other
+    // projection (or the LM head) must be rejected loudly at load time, never
+    // run silently without it. The planted directory entry is enough — the
+    // check fires on presence, before any tensor bytes are read.
+    #[test]
+    fn load_llama_rejects_non_qkv_biases() {
+        for name in ["blk.0.ffn_up.bias", "blk.1.attn_output.bias", "output.bias"] {
+            let mut g = Gguf::parse(tiny_llama_gguf_bytes()).unwrap();
+            g.tensors.push(crate::gguf::TensorInfo {
+                name: name.into(),
+                dims: vec![8],
+                ggml_type: crate::gguf::GGML_F32,
+                offset: 0,
+            });
+            let msg = match g.load_llama_prec(None) {
+                Ok(_) => panic!("load should reject a file carrying '{name}'"),
+                Err(e) => e.to_string(),
+            };
+            assert!(msg.contains(name), "error should name '{name}': {msg}");
+        }
+    }
+
+    // End-to-end k-quant export: at dim 256 every projection's block axis is a
+    // QK_K multiple, so no F16 fallback occurs — the output must actually
+    // contain Q4_K tensors, carry the k-quant file-type hint, and reload as a
+    // runnable model. (The tiny dim-8 fixture always falls back, so without
+    // this test k-quants were only covered at the encoder level.)
+    #[test]
+    fn write_llama_gguf_emits_kquant_at_dim_256() {
+        use crate::gguf::GGML_Q4_K;
+        let g0 = Gguf::parse(build_tiny_llama(256, 1, false)).unwrap();
+        let model = g0.load_llama_prec(None).unwrap();
+        let out = llama_gguf_bytes(&model, &g0, GgufQuant::Q4K).unwrap();
+        let g1 = Gguf::parse(out).unwrap();
+        let t = g1.tensor("blk.0.attn_q.weight").unwrap();
+        assert_eq!(t.ggml_type, GGML_Q4_K, "attn_q should be Q4_K, no fallback");
+        assert_eq!(
+            g1.meta("general.file_type").and_then(|v| v.as_usize()),
+            Some(15), // MOSTLY_Q4_K_M — the requested type was actually used
+        );
+        let m2 = g1.load_llama_prec(None).unwrap();
+        let logits = m2.forward_tokens(&[1usize, 3, 5]).unwrap();
+        assert!(logits.data.iter().all(|v| v.is_finite()));
+    }
+
+    // When every matrix falls back to F16 (tiny dims), the file-type hint must
+    // say F16, not the k-quant that was requested but never used.
+    #[test]
+    fn file_type_reflects_total_fallback() {
+        let g0 = Gguf::parse(tiny_llama_gguf_bytes()).unwrap();
+        let model = g0.load_llama_prec(None).unwrap();
+        let out = llama_gguf_bytes(&model, &g0, GgufQuant::Q4K).unwrap();
+        let g1 = Gguf::parse(out).unwrap();
+        assert_eq!(
+            g1.meta("general.file_type").and_then(|v| v.as_usize()),
+            Some(1), // MOSTLY_F16
         );
     }
 }

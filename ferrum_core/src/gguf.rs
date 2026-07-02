@@ -133,9 +133,14 @@ pub struct TensorInfo {
 }
 
 impl TensorInfo {
-    /// Total element count (product of dimensions).
+    /// Total element count (product of dimensions). Saturates at `usize::MAX`
+    /// instead of overflowing, so a malicious dims table cannot panic a debug
+    /// build (or truncate on 32-bit); the impossible size then fails the
+    /// checked sizing in `type_nbytes` with a clean error rather than wrapping.
     pub fn num_elements(&self) -> usize {
-        self.dims.iter().product::<u64>() as usize
+        self.dims.iter().fold(1usize, |acc, &d| {
+            acc.saturating_mul(usize::try_from(d).unwrap_or(usize::MAX))
+        })
     }
 }
 
@@ -312,22 +317,27 @@ fn type_nbytes(ggml_type: u32, n: usize) -> Result<usize> {
         }
         Ok(n / QK_K)
     };
-    Ok(match ggml_type {
-        GGML_F32 => n * 4,
-        GGML_F16 => n * 2,
-        GGML_Q8_0 => blocks()? * (2 + QK),         // f16 d + 32×i8
-        GGML_Q8_1 => blocks()? * (2 + 2 + QK),     // f16 d + f16 s + 32×i8
-        GGML_Q4_0 => blocks()? * (2 + QK / 2),     // f16 d + 16 bytes
-        GGML_Q4_1 => blocks()? * (2 + 2 + QK / 2), // f16 d + f16 m + 16 bytes
-        GGML_Q4_K => kblocks()? * Q4_K_BLOCK,
-        GGML_Q5_K => kblocks()? * Q5_K_BLOCK,
-        GGML_Q6_K => kblocks()? * Q6_K_BLOCK,
-        other => {
-            return Err(fmt(&format!(
-                "GGUF tensor type {other} is unsupported for sizing"
-            )))
-        }
-    })
+    // Checked multiplications: a hostile dims table (whose element count
+    // saturates in `num_elements`) must produce a clean error, never an
+    // overflow panic (debug) or a wrapped size (release).
+    let mul = |a: usize, b: usize| {
+        a.checked_mul(b)
+            .ok_or_else(|| fmt("tensor byte size overflows"))
+    };
+    match ggml_type {
+        GGML_F32 => mul(n, 4),
+        GGML_F16 => mul(n, 2),
+        GGML_Q8_0 => mul(blocks()?, 2 + QK),     // f16 d + 32×i8
+        GGML_Q8_1 => mul(blocks()?, 2 + 2 + QK), // f16 d + f16 s + 32×i8
+        GGML_Q4_0 => mul(blocks()?, 2 + QK / 2), // f16 d + 16 bytes
+        GGML_Q4_1 => mul(blocks()?, 2 + 2 + QK / 2), // f16 d + f16 m + 16 bytes
+        GGML_Q4_K => mul(kblocks()?, Q4_K_BLOCK),
+        GGML_Q5_K => mul(kblocks()?, Q5_K_BLOCK),
+        GGML_Q6_K => mul(kblocks()?, Q6_K_BLOCK),
+        other => Err(fmt(&format!(
+            "GGUF tensor type {other} is unsupported for sizing"
+        ))),
+    }
 }
 
 fn align_up(x: usize, a: usize) -> usize {
@@ -706,6 +716,18 @@ impl Gguf {
         let mut blocks = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
             let p = format!("blk.{i}");
+            // Ferrum loads biases only for q/k/v (the qwen2 convention). A file
+            // carrying a bias on any other projection would run silently wrong
+            // with that bias dropped — refuse loudly instead.
+            for stem in ["attn_output", "ffn_gate", "ffn_up", "ffn_down"] {
+                let bname = format!("{p}.{stem}.bias");
+                if self.tensor(&bname).is_some() {
+                    return Err(fmt(&format!(
+                        "GGUF tensor '{bname}' is not supported: Ferrum loads biases \
+                         only for attn_q/attn_k/attn_v"
+                    )));
+                }
+            }
             let attn_norm =
                 RmsNorm::new(self.dequant_named(&format!("{p}.attn_norm.weight"))?, eps);
             // Qwen2 carries q/k/v biases; Llama does not (loaded only if present).
@@ -750,6 +772,13 @@ impl Gguf {
         }
 
         let final_norm = RmsNorm::new(self.dequant_named("output_norm.weight")?, eps);
+        // Same rule for the LM head: a bias there is never loaded, so refuse it.
+        if self.tensor("output.bias").is_some() {
+            return Err(fmt(
+                "GGUF tensor 'output.bias' is not supported: Ferrum loads biases \
+                 only for attn_q/attn_k/attn_v",
+            ));
+        }
         // LM head: explicit `output.weight`, or tied to the token embedding.
         let lm_head = if self.tensor("output.weight").is_some() {
             self.linear_from("output.weight", None, prec)?
@@ -1103,6 +1132,21 @@ mod tests {
         assert!(g.tensor("t_f32").is_some());
         assert_eq!(g.tensor("t_q8").unwrap().ggml_type, GGML_Q8_0);
         assert_eq!(g.tensor("t_q4").unwrap().num_elements(), QK);
+    }
+
+    // A hostile dims table must degrade to a clean error, never an overflow
+    // panic (debug builds) or a wrapped size (release builds).
+    #[test]
+    fn hostile_dims_error_instead_of_panicking() {
+        let t = TensorInfo {
+            name: "x".into(),
+            dims: vec![u64::MAX, 8],
+            ggml_type: GGML_F32,
+            offset: 0,
+        };
+        assert_eq!(t.num_elements(), usize::MAX); // saturated, not wrapped
+        assert!(type_nbytes(GGML_F32, t.num_elements()).is_err());
+        assert!(type_nbytes(GGML_F16, t.num_elements()).is_err());
     }
 
     #[test]

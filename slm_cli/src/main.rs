@@ -950,13 +950,26 @@ fn cmd_export_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         g.architecture().unwrap_or("?")
     );
 
-    // Export re-quantizes from f32, so guard for an f32-sized load.
-    let est = estimate_resident_bytes(&g, None);
-    println!("  estimated resident (f32) ≈ {:.2} GB", est as f64 / 1e9);
+    // Export loads f32 masters AND builds the whole encoded output in memory
+    // before the atomic write, so peak ≈ model + output buffer (which for a
+    // lossless f32 target is another full model's worth).
+    let est_model = estimate_resident_bytes(&g, None);
+    let est_out = match quant {
+        GgufQuant::F32 => est_model,
+        GgufQuant::F16 => est_model / 2,
+        _ => est_model / 3, // quantized outputs are smaller; /3 is conservative
+    };
+    let est = est_model.saturating_add(est_out);
+    println!(
+        "  estimated peak ≈ {:.2} GB  (f32 model {:.2} + output buffer {:.2})",
+        est as f64 / 1e9,
+        est_model as f64 / 1e9,
+        est_out as f64 / 1e9
+    );
     if let Some(avail) = available_memory_bytes() {
         if (est as f64) > 0.9 * avail as f64 && !args.has("force") {
             return Err(format!(
-                "estimated resident memory ({:.2} GB) exceeds 90% of available ({:.2} GB) — \
+                "estimated peak memory ({:.2} GB) exceeds 90% of available ({:.2} GB) — \
                  pass --force to attempt it anyway.",
                 est as f64 / 1e9,
                 avail as f64 / 1e9
@@ -982,7 +995,38 @@ fn cmd_export_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     println!("Writing {out_path}  (--quant {quant_name})…");
     ferrum_core::write_llama_gguf(&model, &g, quant, out_path)
         .map_err(|e| format!("export failed: {e}"))?;
+
+    // Per-type tensor summary, read back from the written file — this both
+    // shows what was actually emitted (block-alignment fallbacks appear as
+    // F16 counts) and proves the output re-opens.
+    let gout = Gguf::open(out_path).map_err(|e| format!("written file failed to re-open: {e}"))?;
+    let mut counts: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
+    for t in &gout.tensors {
+        *counts.entry(t.ggml_type).or_default() += 1;
+    }
+    let summary: Vec<String> = counts
+        .iter()
+        .map(|(ty, n)| format!("{n}× {}", ggml_type_name(*ty)))
+        .collect();
+    println!("  tensors: {}", summary.join(", "));
+
     let sz = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
     println!("Done: {out_path}  ({:.2} MB)", sz as f64 / 1e6);
     Ok(())
+}
+
+/// Human name for the GGML tensor-type ids the exporter can emit.
+fn ggml_type_name(t: u32) -> String {
+    match t {
+        0 => "F32".into(),
+        1 => "F16".into(),
+        2 => "Q4_0".into(),
+        3 => "Q4_1".into(),
+        8 => "Q8_0".into(),
+        9 => "Q8_1".into(),
+        12 => "Q4_K".into(),
+        13 => "Q5_K".into(),
+        14 => "Q6_K".into(),
+        other => format!("type{other}"),
+    }
 }
