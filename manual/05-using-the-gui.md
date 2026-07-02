@@ -78,7 +78,7 @@ The tabs, left to right:
 | **Export** | Write a loaded (or fine-tuned) GGUF back out at a chosen quantization. |
 | **Tabular (CLI)** | Train a spreadsheet/CSV model via `train_cli`. |
 | **System** | A fuller view of CPU and memory load. |
-| **Capable** | Benchmark this machine and estimate the largest model it can run, train, or evaluate. |
+| **Capable** | Benchmark this machine and see the parameter range of an SLM it can load, train, fine-tune, and run. |
 | **Terminal** (docked) | A real shell *and* the engine's live `--verbose` log. |
 
 A friendly design touch: every form gives **clear, plain-language error messages**
