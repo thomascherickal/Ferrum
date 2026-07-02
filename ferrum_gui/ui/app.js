@@ -632,6 +632,75 @@ $("ftRun").addEventListener("click", async () => {
   } finally { $("ftRun").disabled = false; }
 });
 
+// ── Export (write a GGUF back out) ──────────────────────────────────────────────
+$("exInspect").addEventListener("click", async () => {
+  clearErr("errExport");
+  let path;
+  try { path = reqStr("exPath", "Source GGUF"); } catch (e) { setErr("errExport", String(e)); return; }
+  $("exStatus").textContent = "inspecting…";
+  try {
+    const i = await invoke("gguf_info", { path });
+    const card = (k, v) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`;
+    const avail = i.availMb == null ? "unknown" : (i.availMb / 1024).toFixed(2) + " GB";
+    $("exInfo").innerHTML =
+      card("Architecture", i.architecture + (i.runnable ? " ✓" : " ✗ not exportable")) +
+      card("GGUF", "v" + i.version + " · " + i.numTensors + " tensors") +
+      card("Shape", `dim ${i.modelDim} · ${i.nLayers}L · ${i.nHeads}h/${i.nKvHeads}kv · vocab ${i.vocabSize}`) +
+      card("Tokenizer", i.tokenizer) +
+      card("Resident f32 (export loads f32)", (i.estF32Mb / 1024).toFixed(2) + " GB") +
+      card("Available RAM", avail);
+    $("exStatus").textContent = "";
+    toast(i.runnable ? "GGUF inspected" : "Inspected — architecture not exportable", i.runnable ? "ok" : "error");
+    const crossed = checkGgufBudget(i.paramCount);
+    if (crossed.length) await confirmGgufWarning(i.paramCount, crossed); // advisory; result ignored
+  } catch (e) { $("exStatus").textContent = "error"; setErr("errExport", String(e)); toast("Inspect failed: " + e, "error"); }
+});
+
+$("exExport").addEventListener("click", async () => {
+  clearErr("errExport");
+  let params;
+  try {
+    const resume = $("exResume").value.trim();
+    params = {
+      modelPath: reqStr("exPath", "Source GGUF"),
+      outPath: reqStr("exOut", "Output file"),
+      quant: $("exQuant").value,
+      resume: resume === "" ? null : resume,
+      force: $("exForce").checked,
+      verbose: false,
+    };
+  } catch (e) { setErr("errExport", String(e)); return; }
+
+  // Budget gate (advisory + confirm), mirroring the GGUF Run button.
+  if (capBounds) {
+    try {
+      const info = await invoke("gguf_info", { path: params.modelPath });
+      const crossed = checkGgufBudget(info.paramCount);
+      if (crossed.length) {
+        const ok = await confirmGgufWarning(info.paramCount, crossed);
+        if (!ok) { $("exStatus").textContent = "cancelled"; return; }
+      }
+    } catch (_) { /* inspection failed; the export itself will error clearly */ }
+  }
+
+  $("exResult").textContent = "";
+  $("exStatus").textContent = "starting… (CPU: a large model can take minutes)";
+  $("exExport").disabled = true;
+  try {
+    const r = await invoke("export_gguf", { params });
+    $("exStatus").textContent = "done";
+    $("exResult").textContent =
+      `Wrote ${r.bytes.toLocaleString()} bytes → ${r.outPath} in ${r.seconds.toFixed(1)}s\n` +
+      `tensors: ${r.tensorSummary}\n` +
+      `The file runs in llama.cpp / ollama / LM Studio as-is.`;
+    toast("Export complete", "ok");
+  } catch (e) {
+    $("exStatus").textContent = "error";
+    setErr("errExport", String(e));
+    toast("Export failed: " + e, "error");
+  } finally { $("exExport").disabled = false; }
+});
+
 // ── Tabular (train_cli via shell) ──────────────────────────────────────────────
 $("tbRun").addEventListener("click", async () => {
   clearErr("errTab");
@@ -769,6 +838,7 @@ async function wireEvents() {
     if (ftLossHistory.length > 1000) ftLossHistory.shift();
     drawFtChart();
   });
+  await listen("export-progress", (e) => { $("exStatus").textContent = e.payload; });
   await listen("gen-fragment", (e) => { if (generating) $("genOut").textContent += e.payload; });
 }
 

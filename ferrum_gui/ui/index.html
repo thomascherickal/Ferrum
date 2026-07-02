@@ -30,6 +30,7 @@
     <button class="tab" data-tab="models">Models</button>
     <button class="tab" data-tab="gguf">GGUF</button>
     <button class="tab" data-tab="finetune">Fine-tune</button>
+    <button class="tab" data-tab="export">Export</button>
     <button class="tab" data-tab="tabular">Tabular (CLI)</button>
     <button class="tab" data-tab="system">System</button>
     <button class="tab" data-tab="capable">Capable</button>
@@ -346,6 +347,53 @@
       </div>
       <canvas id="ftChart" width="900" height="140"></canvas>
       <div id="ftResult" class="result"></div>
+    </section>
+
+    <!-- ── Export (write a GGUF back out) ───────────────────────────────── -->
+    <section class="panel" id="panel-export">
+      <h2>Export — write a model back to GGUF</h2>
+      <p class="hint">Serializes a Llama/Qwen <code>.gguf</code> — optionally with a
+        fine-tune checkpoint applied — to a new GGUF that runs in llama.cpp, ollama,
+        or LM Studio. <strong>f16/f32</strong> are lossless (f32 masters); re-quantizing an
+        already-quantized file is lossy. Norms and biases stay f32; a matrix whose row
+        length is not block-aligned for the chosen type falls back to f16 (the summary
+        below shows exactly what was written).</p>
+      <div class="row">
+        <label>Source GGUF <input type="text" id="exPath" placeholder="/path/to/model.gguf" /></label>
+        <button class="ghost browse" data-target="exPath">Browse…</button>
+        <button id="exInspect" class="ghost">Inspect</button>
+      </div>
+      <div id="exInfo" class="infocards"></div>
+      <div class="grid">
+        <label>Output type
+          <select id="exQuant">
+            <option value="q8_0">q8_0 (default — high quality)</option>
+            <option value="q4_k">q4_k (small, modern)</option>
+            <option value="q5_k">q5_k</option>
+            <option value="q6_k">q6_k (near-lossless)</option>
+            <option value="q4_0">q4_0 (legacy)</option>
+            <option value="q4_1">q4_1 (legacy)</option>
+            <option value="q8_1">q8_1 (legacy)</option>
+            <option value="f16">f16 (lossless, 2 B/param)</option>
+            <option value="f32">f32 (lossless, 4 B/param)</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <label>Fine-tune checkpoint (optional) <input type="text" id="exResume" placeholder="/path/to/finetune.flck — export tuned weights" /></label>
+        <button class="ghost browse" data-target="exResume">Browse…</button>
+      </div>
+      <div class="row">
+        <label>Output file (.gguf) <input type="text" id="exOut" placeholder="/path/to/out.gguf" /></label>
+        <button class="ghost browse-save" data-target="exOut">Save as…</button>
+      </div>
+      <label class="chk"><input type="checkbox" id="exForce" /> Export even if the estimate exceeds available RAM</label>
+      <span class="err" id="errExport"></span>
+      <div class="row">
+        <button id="exExport" class="primary">Export</button>
+        <span id="exStatus" class="muted"></span>
+      </div>
+      <div id="exResult" class="result"></div>
     </section>
 
     <!-- ── Tabular (train_cli) ───────────────────────────────────────────── -->
