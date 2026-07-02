@@ -447,6 +447,7 @@ $("miInspect").addEventListener("click", async () => {
 function checkGgufBudget(paramCount) {
   if (!capBounds || !Number.isFinite(paramCount) || paramCount <= 0) return [];
   const checks = [
+    ["loading at int4 (fits in RAM)", capBounds.loadInt4],
     ["inference at int4 (≥ 3 tok/s)", capBounds.inferInt4],
     ["inference at int8 (≥ 3 tok/s)", capBounds.inferInt8],
     ["inference at f32 (≥ 3 tok/s)", capBounds.inferF32],
@@ -756,7 +757,7 @@ $("sysOn").addEventListener("change", restartMonitor);
 $("sysInterval").addEventListener("change", restartMonitor);
 
 // ── Capable (machine capability) ─────────────────────────────────────────────
-let capBounds = null; // {inferInt4, inferInt8, inferF32, trainChinchilla, trainFixed1b, testEval}
+let capBounds = null; // {inferInt4/8/F32, trainChinchilla, trainFixed1b, testEval, loadInt4, finetuneHi}
 
 function fmtParams(n) {
   if (!Number.isFinite(n) || n <= 0) return "—";
@@ -770,6 +771,7 @@ function renderCapReport(r) {
   capBounds = {
     inferInt4: r.inferInt4, inferInt8: r.inferInt8, inferF32: r.inferF32,
     trainChinchilla: r.trainChinchilla, trainFixed1b: r.trainFixed1b, testEval: r.testEval,
+    loadInt4: r.loadInt4, finetuneHi: r.finetuneHi,
   };
   // Summary cards on the panel.
   const card = (k, v) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`;
@@ -779,25 +781,37 @@ function renderCapReport(r) {
     card("Memory", `${fmtBytes(r.memAvail)} free / ${fmtBytes(r.memTotal)}`) +
     card("Mem bandwidth", r.memBwGbps.toFixed(1) + " GB/s") +
     card("GEMM throughput", r.gemmGflops.toFixed(1) + " GFLOP/s") +
+    card("Load @int4 ceiling", fmtParams(r.loadInt4)) +
     card("Infer @int8 ceiling", fmtParams(r.inferInt8));
-  // Detailed table inside the dialog.
+  // Detailed four-range table inside the dialog.
+  const rng = (lo, hi) => {
+    const l = fmtParams(lo), h = fmtParams(hi);
+    return l === h ? l : `${l} – ${h}`;
+  };
   const row = (label, val, note) =>
-    `<tr><td>${label}</td><td>${fmtParams(val)}</td><td class="muted">${note}</td></tr>`;
+    `<tr><td>${label}</td><td>${val}</td><td class="muted">${note}</td></tr>`;
+  const trainLo = Math.min(r.trainChinchilla, r.trainFixed1b);
+  const trainHi = Math.max(r.trainChinchilla, r.trainFixed1b);
   $("capDialogBody").innerHTML = `
     <p class="muted">${r.cpu} · ${r.cores} cores · ${r.memBwGbps.toFixed(1)} GB/s · ${r.gemmGflops.toFixed(1)} GFLOP/s</p>
     <table class="data">
-      <thead><tr><th>Workload</th><th>Max params</th><th>Basis</th></tr></thead>
+      <thead><tr><th>Capability</th><th>Range (params)</th><th>Basis</th></tr></thead>
       <tbody>
-        ${row("Inference · int4", r.inferInt4, `≥ ${r.targetToks} tok/s`)}
-        ${row("Inference · int8", r.inferInt8, `≥ ${r.targetToks} tok/s`)}
-        ${row("Inference · f32", r.inferF32, `≥ ${r.targetToks} tok/s`)}
-        ${row("Train · compute-optimal", r.trainChinchilla, `${r.chinchillaRatio}× tokens, < ${r.trainHours} h`)}
-        ${row("Train · fixed corpus", r.trainFixed1b, `${fmtParams(r.fixedTrainTokens)} tokens, < ${r.trainHours} h`)}
-        ${row("Test · eval pass", r.testEval, `${fmtParams(r.evalTokens)} tokens, < ${r.trainHours} h`)}
+        ${row("Load", rng(r.loadF32, r.loadInt4),
+              `f32 → int4 (int8: ${fmtParams(r.loadInt8)}); fits in ${Math.round(r.loadFraction * 100)}% of free RAM`)}
+        ${row("Train (scratch)", rng(trainLo, trainHi),
+              `Chinchilla ${r.chinchillaRatio}× → fixed ${fmtParams(r.fixedTrainTokens)} tokens; < ${r.trainHours} h, RAM-capped @16 B/param`)}
+        ${row("Fine-tune", rng(r.finetuneLo, r.finetuneHi),
+              `${fmtParams(r.finetuneTokensLo)} → ${fmtParams(r.finetuneTokensHi)} token corpus; < ${r.trainHours} h, RAM-capped @16 B/param`)}
+        ${row("Inference", rng(r.inferF32, r.inferInt4),
+              `f32 → int4 (int8: ${fmtParams(r.inferInt8)}); ≥ ${r.targetToks} tok/s, bandwidth-bound, RAM-capped`)}
+        ${row("Eval pass", fmtParams(r.testEval),
+              `${fmtParams(r.evalTokens)} tokens, < ${r.trainHours} h`)}
       </tbody>
     </table>
-    <p class="capfoot">Upper bounds from a live micro-benchmark. Decode is bandwidth-bound;
-      training/eval are compute-bound (≈6·N·T train, 2·N·T eval). Real throughput depends on
+    <p class="capfoot">Ranges from a live micro-benchmark: each capability spans its natural axis
+      (precision f32 → int4, or corpus size). Decode is bandwidth-bound; train/fine-tune/eval are
+      compute-bound (≈6·N·T train, 2·N·T eval) and memory-capped. Real throughput varies with
       architecture, context length, and other load.</p>`;
 }
 

@@ -456,10 +456,11 @@
     <section class="panel" id="panel-capable">
       <h2>Capable — what can this machine run?</h2>
       <p class="hint">Runs a quick (~1–2 s) micro-benchmark of memory bandwidth and
-        matmul throughput on <em>this</em> CPU, then estimates the largest model you can
-        realistically <strong>infer</strong> (≥ 3 tok/s), <strong>train</strong> (&lt; 24 h),
-        and <strong>test</strong> (&lt; 24 h). Estimates are upper bounds — real models
-        vary with architecture and context length.</p>
+        matmul throughput on <em>this</em> CPU, then estimates the parameter range of an
+        SLM this machine can <strong>load</strong>, <strong>train</strong> (&lt; 24 h),
+        <strong>fine-tune</strong> (&lt; 24 h), and <strong>run</strong> (≥ 3 tok/s),
+        plus a 24 h eval bound. Estimates are upper bounds — real models vary with
+        architecture and context length.</p>
       <div class="row">
         <button id="capCheck" class="primary">Check this machine</button>
         <span id="capStatus" class="muted"></span>
