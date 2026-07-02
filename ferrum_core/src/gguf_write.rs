@@ -819,9 +819,18 @@ pub fn llama_gguf_bytes(model: &LlamaModel, source: &Gguf, quant: GgufQuant) -> 
     let mut b = GgufBuilder::new();
 
     // 1. Metadata: copy every source key verbatim, except the file-type hints we
-    //    refresh to match the new target.
+    //    refresh to match the new target, and `general.alignment`: the builder
+    //    always lays out tensor data at `DEFAULT_ALIGNMENT` (32), so carrying a
+    //    source alignment (e.g. 64) forward would leave the output metadata
+    //    claiming an alignment the data isn't actually packed at, and the
+    //    reader would then compute every tensor offset from the wrong value
+    //    (silent corruption). Dropping the key makes the reader fall back to
+    //    the same default the builder used.
     for (k, v) in &source.metadata {
-        if k == "general.file_type" || k == "general.quantization_version" {
+        if k == "general.file_type"
+            || k == "general.quantization_version"
+            || k == "general.alignment"
+        {
             continue;
         }
         b.meta(k, v.clone());
@@ -1527,5 +1536,30 @@ mod tests {
         assert!(g1.tensor("blk.0.ffn_up.bias").is_none());
         assert!(g1.tensor("blk.0.ffn_down.bias").is_none());
         assert!(g1.tensor("blk.1.attn_output.bias").is_none());
+    }
+
+    // Regression guard (Task 11 final review, Fix 1): a source GGUF that
+    // declares a non-default `general.alignment` must not have that value
+    // carried into the export. The builder always packs tensor data at
+    // `DEFAULT_ALIGNMENT` (32) regardless of what the source claimed, so a
+    // stale alignment in the output metadata would make the reader compute
+    // every tensor offset from the wrong base — silent corruption.
+    #[test]
+    fn write_llama_gguf_strips_source_alignment() {
+        let mut g0 = Gguf::parse(tiny_llama_gguf_bytes()).unwrap();
+        let model = g0.load_llama_prec(None).unwrap();
+        // Simulate a source that declared a non-default alignment (metadata is a pub BTreeMap).
+        g0.metadata
+            .insert("general.alignment".into(), MetaValue::U32(64));
+        let out = llama_gguf_bytes(&model, &g0, GgufQuant::F32).unwrap();
+        let g1 = Gguf::parse(out).unwrap();
+        // The stale alignment must NOT be propagated (this is the reliable regression guard).
+        assert!(g1.meta("general.alignment").is_none());
+        // And the model still round-trips exactly.
+        let m2 = g1.load_llama_prec(None).unwrap();
+        assert_eq!(
+            model.forward_tokens(&[1usize, 2, 3]).unwrap().data,
+            m2.forward_tokens(&[1usize, 2, 3]).unwrap().data
+        );
     }
 }

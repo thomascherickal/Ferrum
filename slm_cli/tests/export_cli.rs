@@ -1,8 +1,13 @@
-//! End-to-end: build a tiny llama GGUF, export it via the library at several
-//! quant levels, and confirm every output re-opens and re-loads as a runnable
-//! model. Mirrors what the `export-gguf` CLI does internally.
+//! Binary-spawn happy-path test for the `export-gguf` subcommand.
+//!
+//! The library round-trip (`tests/tests/test_gguf_export.rs` in the
+//! `integration_tests` crate) covers `llama_gguf_bytes` directly, but the
+//! actual `train_transformer export-gguf` subcommand — its arg parsing,
+//! streamed open, and file write — was otherwise untested. This spawns the
+//! real binary against a tiny synthetic `llama` GGUF and confirms the output
+//! re-opens and re-loads as a runnable model.
 
-use ferrum_core::{Gguf, GgufBuilder, GgufQuant, MetaValue};
+use ferrum_core::{Gguf, GgufBuilder, MetaValue};
 
 fn f32_bytes(xs: &[f32]) -> Vec<u8> {
     let mut o = Vec::new();
@@ -12,7 +17,10 @@ fn f32_bytes(xs: &[f32]) -> Vec<u8> {
     o
 }
 
-fn tiny_llama() -> Vec<u8> {
+/// A tiny but complete `llama`-architecture GGUF (2 layers, dim 8, all F32
+/// tensors). Mirrors `tiny_llama` in `tests/tests/test_gguf_export.rs`; kept
+/// as a minimal duplicate here since that helper lives in a different crate.
+fn tiny_llama_gguf_bytes() -> Vec<u8> {
     const GGML_F32: u32 = 0;
     let (dim, n_layers, n_heads, ffn, vocab) = (8usize, 2usize, 2usize, 16usize, 32usize);
     let head_dim = dim / n_heads;
@@ -21,6 +29,7 @@ fn tiny_llama() -> Vec<u8> {
             .map(|i| (((seed * 131 + i * 17) % 101) as f32 / 500.0) - 0.1)
             .collect()
     };
+
     let mut b = GgufBuilder::new();
     b.meta("general.architecture", MetaValue::String("llama".into()));
     b.meta("llama.embedding_length", MetaValue::U32(dim as u32));
@@ -45,6 +54,7 @@ fn tiny_llama() -> Vec<u8> {
                 .collect(),
         ),
     );
+
     let t = |b: &mut GgufBuilder, name: &str, dims: &[u64], seed: usize| {
         let n: usize = dims.iter().product::<u64>() as usize;
         b.tensor(name, dims, GGML_F32, f32_bytes(&gen(seed, n)));
@@ -113,35 +123,41 @@ fn tiny_llama() -> Vec<u8> {
 }
 
 #[test]
-fn export_roundtrips_at_multiple_quants() {
-    let g0 = Gguf::parse(tiny_llama()).unwrap();
-    let model = g0.load_llama_prec(None).unwrap();
-    let source_logits = model.forward_tokens(&[1usize, 3, 5]).unwrap().data;
-    // Small dims fall back to F16 for k-quants; that is fine — the file must
-    // still re-open and re-load as a runnable model at every requested level.
-    for q in [
-        GgufQuant::F32,
-        GgufQuant::F16,
-        GgufQuant::Q8_0,
-        GgufQuant::Q4_0,
-        GgufQuant::Q4K,
-    ] {
-        let bytes = ferrum_core::llama_gguf_bytes(&model, &g0, q).unwrap();
-        let g1 = Gguf::parse(bytes).unwrap();
-        assert_eq!(g1.architecture(), Some("llama"));
-        let m2 = g1.load_llama_prec(None).unwrap();
-        let logits = m2.forward_tokens(&[1usize, 3, 5]).unwrap();
-        assert!(
-            logits.data.iter().all(|v| v.is_finite()),
-            "non-finite logits for {q:?}"
-        );
-        // F32 export is lossless: the reloaded model's logits must be
-        // bit-identical to the source model's, not just finite.
-        if q == GgufQuant::F32 {
-            assert_eq!(
-                logits.data, source_logits,
-                "F32 export must be bit-identical to the source model"
-            );
-        }
-    }
+fn export_gguf_cli_happy_path() {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let in_path = std::env::temp_dir().join(format!("ferrum_export_cli_in_{pid}_{nanos}.gguf"));
+    let out_path = std::env::temp_dir().join(format!("ferrum_export_cli_out_{pid}_{nanos}.gguf"));
+
+    std::fs::write(&in_path, tiny_llama_gguf_bytes()).expect("failed to write input GGUF fixture");
+
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_train_transformer"))
+        .args([
+            "export-gguf",
+            in_path.to_str().unwrap(),
+            out_path.to_str().unwrap(),
+            "--quant",
+            "q8_0",
+        ])
+        .status()
+        .expect("failed to spawn train_transformer binary");
+    assert!(
+        status.success(),
+        "export-gguf subcommand exited with failure status: {status:?}"
+    );
+
+    assert!(
+        out_path.exists(),
+        "export-gguf did not produce an output file at {out_path:?}"
+    );
+    let g = Gguf::open(out_path.to_str().unwrap()).expect("re-opening exported GGUF failed");
+    assert_eq!(g.architecture(), Some("llama"));
+    g.load_llama_prec(None)
+        .expect("exported GGUF failed to load as a runnable model");
+
+    let _ = std::fs::remove_file(&in_path);
+    let _ = std::fs::remove_file(&out_path);
 }
