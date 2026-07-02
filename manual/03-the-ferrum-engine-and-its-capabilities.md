@@ -31,8 +31,8 @@ Ferrum is organised into several cooperating parts:
 
 | Part | What it is | Think of it as… |
 |------|-----------|-----------------|
-| **`ferrum_core`** | The engine library — all the maths, layers, training, tokenizer, file format, and the GGUF importer | The brain. Everything else calls into this. |
-| **`slm_cli`** | A command-line tool (binary `train_transformer`): train / generate / evaluate / inspect, **plus `run-gguf`** | The text-model workbench. |
+| **`ferrum_core`** | The engine library — all the maths, layers, training, tokenizer, file format, and the GGUF importer/exporter | The brain. Everything else calls into this. |
+| **`slm_cli`** | A command-line tool (binary `train_transformer`): train / generate / evaluate / inspect, **plus `run-gguf` / `finetune-gguf` / `export-gguf`** | The text-model workbench. |
 | **`train_cli`** | A command-line tool for **tabular** models (spreadsheets/CSV) | The "predict-from-a-table" tool (not text). |
 | **`tabular_wasm`** | Bindings that let models run in a **web browser** | The bridge to the web. |
 | **`ferrum_gui`** | A point-and-click desktop app ("Ferrum SLM Studio") | The friendly face — see [the GUI guide](05-using-the-gui.md). |
@@ -61,8 +61,8 @@ assembled like LEGO:
 - **Quantization** — the int8/int4 compression trick explained in §3.6.
 - **The file format (FINF)** — how a finished model is saved into one file (§3.7).
 - **A KV-cache** — a speed optimisation that remembers past work during generation.
-- **A GGUF importer** — a from-scratch reader for the standard open-model file
-  format, plus a Llama/Qwen runner (§3.5b).
+- **A GGUF importer & exporter** — a from-scratch reader *and writer* for the
+  standard open-model file format, plus a Llama/Qwen runner (§3.5b).
 
 Everything is built only from Rust's standard library — there is genuinely no
 NumPy-equivalent under the hood; the matrix multiplication, and even the GGUF
@@ -117,6 +117,8 @@ Every feature here is implemented and tested in the project:
 **Running other people's models**
 - **Import and run a small open-weight Llama/Qwen GGUF** with its own tokenizer
   (§3.5b).
+- **Export back to GGUF**: write a loaded (and optionally fine-tuned) model out
+  as a standard GGUF file that runs in llama.cpp / ollama / LM Studio (§3.5b).
 
 **Shipping**
 - Save a model as **one self-contained file**; load it anywhere.
@@ -127,7 +129,7 @@ Every feature here is implemented and tested in the project:
 
 ---
 
-## 3.5b Running (and fine-tuning) external models — the GGUF importer
+## 3.5b Running, fine-tuning, and exporting external models — the GGUF importer
 
 Beyond models you train, Ferrum can **import a small open-weight model** that someone
 else trained, in the standard **GGUF** format used across the open-model world. The
@@ -148,9 +150,15 @@ What's honest about it:
 - The architecture is even **trainable**: a finite-difference-checked backward pass
   lets you fine-tune a *small* imported model. A 1B model, though, is out of reach
   on one CPU — its optimizer state alone would need ~16 GB of RAM (§3.10).
+- And the road runs **both ways**: `export-gguf` writes the loaded (or fine-tuned)
+  model back out as a standard GGUF v3 file — re-quantized to your chosen level
+  (`q8_0`, `q4_k`, …, or lossless `f16`/`f32`), with the source's tokenizer and
+  settings carried along — so the result runs unchanged in llama.cpp, ollama, or
+  LM Studio.
 
 Use it from the command line (`train_transformer run-gguf model.gguf "prompt"
---quant int4`) or the GUI's **GGUF** tab.
+--quant int4`, `train_transformer export-gguf in.gguf out.gguf --quant q8_0`)
+or the GUI's **GGUF** tab (import/run only for now).
 
 ---
 

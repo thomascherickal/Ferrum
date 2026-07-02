@@ -90,6 +90,16 @@ training needs f32 master weights. This works for *small* models; a 1B model is
 out of reach on a single CPU — the optimizer state alone is ~16 bytes/param
 (~16 GB for 1B), before any compute considerations.
 
+### Can Ferrum write GGUF files, or only read them?
+
+Both. `export-gguf` (CLI) / `LlamaModel::write_gguf` (library) serialize a
+loaded — and optionally fine-tuned — llama/qwen2 model back to a GGUF v3 file
+that runs in llama.cpp / ollama / LM Studio, at any of
+`f32/f16/q8_0/q8_1/q4_0/q4_1/q4_k/q5_k/q6_k`. The source file's hyperparameters
+and tokenizer are carried forward verbatim, so the output is self-contained.
+Typical uses: re-quantizing a download (e.g. `Q4_K` → `Q8_0`) and sharing a
+fine-tune as a standard GGUF.
+
 ### What are `--weight_decay` and `--dropout`?
 
 Regularizers for training. `--weight_decay` enables **AdamW** decoupled weight

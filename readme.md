@@ -134,7 +134,9 @@ cargo run -p slm_cli -- export-gguf base.gguf tuned.gguf --resume tuned.flck --q
 
 Ferrum writes GGUF v3 at `f32/f16/q8_0/q8_1/q4_0/q4_1/q4_k/q5_k/q6_k`. Norms and
 biases stay f32; a weight matrix whose row length is not block-aligned for the
-chosen quant is stored f16 (with a note). Only `llama`/`qwen2` models export
+chosen quant is stored f16 — the per-type tensor summary printed after export
+shows exactly what was emitted, and the `general.file_type` hint reflects the
+types the file actually contains. Only `llama`/`qwen2` models export
 (the only architectures that run in the GGUF ecosystem).
 
 ---

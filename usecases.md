@@ -21,7 +21,7 @@ from QAT, no runtime dependencies.
 
 ---
 
-## 2. Running small open-weight models offline (GGUF import)
+## 2. Running small open-weight models offline (GGUF import & export)
 
 Import a small open-weight **Llama/Qwen** checkpoint in GGUF — including the
 common `Q4_K`/`Q5_K`/`Q6_K` k-quants — along with its own tokenizer, and run it on
@@ -30,9 +30,15 @@ and a memory guard warns before a model that won't fit. Be realistic: a ~1B mode
 decodes at only a few tokens per second here — fine for a patient, private,
 offline demo; not an interactive chatbot.
 
+The pipeline also runs **in reverse**: `export-gguf` writes a loaded — and
+optionally fine-tuned — model back out as a standard GGUF v3 file, so you can
+re-quantize a download (`Q4_K` → `Q8_0`, or up to lossless `f16`/`f32`) or ship
+a fine-tune that runs unchanged in llama.cpp / ollama / LM Studio.
+
 **Why Ferrum:** run a downloaded model with zero Python and zero network, fully
 auditable, with no `unsafe`; `--quant` trades RAM for speed as your hardware
-demands.
+demands — and what you fine-tune here doesn't stay here: it exports back to the
+ecosystem's own format.
 
 ---
 

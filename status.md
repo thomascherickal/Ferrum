@@ -1,11 +1,11 @@
 # Project Status
 
-_Last updated: 2026-06-23_
+_Last updated: 2026-07-02_
 
 Ferrum is a working, tested, zero-dependency Rust engine for small Transformers,
-SLMs, and MLPs — and an importer/runner for small open-weight Llama/Qwen GGUF
-checkpoints. The workspace builds clean and the full test suite passes (0
-failures, 0 warnings).
+SLMs, and MLPs — and an importer/exporter/runner for small open-weight
+Llama/Qwen GGUF checkpoints. The workspace builds clean and the full test suite
+passes (0 failures, 0 warnings).
 
 ---
 
@@ -46,13 +46,22 @@ failures, 0 warnings).
   per-channel via a per-weight-vector marker), self-contained (weights +
   normalizer + metadata JSON + tokenizer state).
 
-### GGUF import, Llama/Qwen runner & training
+### GGUF import & export, Llama/Qwen runner & training
 
 - **GGUF reader** (`gguf`) — pure-`std`, `unsafe`-free GGUF v2/v3 parser:
   metadata, tensor directory, and dequantizers for `F32/F16/Q8_0/Q8_1/Q4_0/Q4_1`
   plus the **Q4_K/Q5_K/Q6_K** super-block k-quants. `Gguf::open` streams tensor
   data from disk (no whole-file resident); `from_path` keeps it in memory.
   `Q2_K`/`Q3_K`/`IQ*` are rejected with a clear error.
+- **GGUF writer** (`gguf_write`) — the reverse path: `GgufBuilder` emits
+  byte-exact GGUF v3, block *encoders* for all nine supported types are exact
+  inverses of the reader's decoders (verified by round-tripping through the
+  reader), and `write_llama_gguf` / `LlamaModel::write_gguf` serialize a loaded
+  (or fine-tuned) llama/qwen2 model — tokenizer and hyperparameters carried
+  forward verbatim — to a file that runs in llama.cpp/ollama. Writes are
+  atomic (temp + rename); norms/biases stay f32; non-block-aligned matrices
+  fall back to f16 with the `general.file_type` hint reflecting what was
+  actually emitted.
 - **GGUF tokenizer import** (`gguf_tokenizer`) — reconstructs a checkpoint's own
   tokenizer from `tokenizer.ggml.*`: BPE encode/decode (exact) and SPM decode
   (exact) / encode (greedy), so imported models run on **text**.
@@ -69,7 +78,8 @@ failures, 0 warnings).
 ### Tools
 
 - `slm_cli` → `train_transformer` binary: `train` / `run` / `generate` /
-  **`run-gguf`** / `eval` / `info`, with on-disk weight caching, int8 QAT, and
+  **`run-gguf`** / **`finetune-gguf`** / **`export-gguf`** / `eval` / `info`,
+  with on-disk weight caching, int8 QAT, and
   `--weight_decay` / `--dropout` / `--stream` / `--threads`.
 - `train_cli` → tabular MLP trainer with CSV auto-detection.
 - `tabular_wasm` → `wasm-bindgen` browser bindings.
@@ -82,9 +92,11 @@ failures, 0 warnings).
 - Unit tests across `ferrum_core` plus integration tests in the `tests` crate,
   including dedicated coverage for BPE training/generation, save/load round-trips,
   int8/int4 quantization fidelity, metadata serialization, the GGUF k-quant
-  decoders, the streamed reader, the Llama cached-decode-vs-full-forward
-  equivalence, the gradient-checked `llm_train` backward pass, and an end-to-end
-  synthetic-GGUF import + generate.
+  decoders *and encoders* (round-tripped through each other), the streamed
+  reader, the Llama cached-decode-vs-full-forward equivalence, the
+  gradient-checked `llm_train` backward pass, an end-to-end synthetic-GGUF
+  import + generate, and export round-trips (bit-exact f32 logits, qwen2-bias
+  preservation, k-quant emission at dim 256, CLI binary happy path).
 
 ---
 

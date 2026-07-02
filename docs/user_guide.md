@@ -131,6 +131,26 @@ compute make this practical only for *small* models, not 1B.
 
 ---
 
+## Export a model back to GGUF
+
+```rust
+use ferrum_core::{Gguf, GgufQuant};
+
+let g = Gguf::open("base.gguf").unwrap();          // source: metadata + tokenizer
+let model = g.load_llama_prec(None).unwrap();      // f32 (fine-tune here if desired)
+model.write_gguf(&g, GgufQuant::Q4K, "out.gguf").unwrap();
+```
+
+`write_gguf` carries the source's hyperparameters and tokenizer forward
+verbatim, so the exported file runs in llama.cpp / ollama unchanged. Output
+types span `F32/F16/Q8_0/Q8_1/Q4_0/Q4_1` and the `Q4K/Q5K/Q6K` k-quants; norms
+and biases always stay f32, and a matrix whose row length is not block-aligned
+for the chosen quant falls back to f16. On the CLI this is
+`train_transformer export-gguf in.gguf out.gguf --quant q8_0`
+(add `--resume tuned.flck` to export a fine-tune).
+
+---
+
 ## Common pitfalls
 
 - **Corpus too short for the context window.** Both tokenizers require more than

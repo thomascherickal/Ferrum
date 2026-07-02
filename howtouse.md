@@ -1,9 +1,10 @@
 # How to Use Ferrum
 
-This guide covers the two command-line tools, the GGUF runner, and the
+This guide covers the two command-line tools, the GGUF runner/exporter, and the
 `ferrum_core` library API. For a narrated end-to-end walkthrough see
 [example.md](example.md); for the complete reference see
-[docs/manual.md](docs/manual.md).
+[docs/manual.md](docs/manual.md); for the shorter library-level walkthrough see
+[docs/how_to_use.md](docs/how_to_use.md).
 
 ---
 
@@ -21,7 +22,9 @@ loads the saved model instead of retraining (use `--force` to retrain).
 train_transformer train    <corpus.txt> <model.bin> [options]
 train_transformer run      <corpus.txt> <model.bin> <seed text> [options]
 train_transformer generate <model.bin>  <seed text> [options]
-train_transformer run-gguf <model.gguf> [prompt] [options]
+train_transformer run-gguf      <model.gguf> [prompt] [options]
+train_transformer finetune-gguf <model.gguf> <corpus.txt> <out.flck> [options]
+train_transformer export-gguf   <in.gguf> <out.gguf> [options]
 train_transformer eval     <model.bin>  <heldout.txt>
 train_transformer info     <model.bin>
 ```
@@ -122,6 +125,41 @@ gives the fastest per-call decode; `int4` halves the RAM at a modest speed cost;
 precision required for training (see §3.4). The import is lossy by default
 (dequantize → re-quantize to Ferrum's per-row grid) and is **not** bit-exact to
 llama.cpp. See [benchmarks.md](benchmarks.md) §4 and [ferrum_review.md](ferrum_review.md) §4.
+
+### Fine-tuning (`finetune-gguf`)
+
+`finetune-gguf` loads the checkpoint at f32 (training needs full-precision
+masters), fine-tunes on a text corpus, and writes a `.flck` checkpoint that
+`run-gguf --resume` and `export-gguf --resume` can apply:
+
+```bash
+train_transformer finetune-gguf model.gguf corpus.txt tuned.flck --epochs 3
+```
+
+See the [readme](readme.md) for the full flag list (`--lr`, `--batch`, `--seq`,
+`--warmup`, `--clip`, `--weight_decay`, `--dropout`, `--qat`, `--sample`, …).
+
+### Exporting back to GGUF (`export-gguf`)
+
+`export-gguf` (alias: `export`) writes a loaded — and optionally fine-tuned —
+model back out as a **GGUF v3 file that runs in llama.cpp / ollama / LM Studio**,
+carrying the source's hyperparameters and tokenizer forward verbatim:
+
+```bash
+# Re-quantize a stock GGUF (e.g. a Q4_K download → Q8_0).
+train_transformer export-gguf in.gguf out.gguf --quant q8_0
+
+# Export a fine-tune: weights from the checkpoint, metadata from the source.
+train_transformer export-gguf base.gguf tuned.gguf --resume tuned.flck --quant q6_k
+```
+
+Output types: `f32 | f16 | q8_0 | q8_1 | q4_0 | q4_1 | q4_k | q5_k | q6_k`
+(default `q8_0`). Norms and biases always stay f32. A weight matrix whose row
+length is not block-aligned for the chosen quant (32 for the legacy formats,
+256 for k-quants) is stored **f16** instead — the per-type tensor summary
+printed after export shows exactly what was emitted. Re-quantizing an
+already-quantized source goes through f32 and is inherently lossy; the lossless
+paths are `f32`/`f16` or exporting fine-tuned f32 masters.
 
 ---
 
