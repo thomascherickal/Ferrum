@@ -1,6 +1,8 @@
 //! Machine-capability estimator: micro-benchmarks the host and derives
-//! upper-bound parameter counts for inference (>=3 tok/s), training (<24h),
-//! and evaluation (<24h). See docs/superpowers/specs/2026-06-23-capable-module-design.md.
+//! parameter ranges for four capabilities — load (fits in RAM), train (<24h),
+//! fine-tune (<24h), and inference (>=3 tok/s) — plus a 24h eval bound.
+//! See docs/superpowers/specs/2026-06-23-capable-module-design.md and
+//! docs/superpowers/specs/2026-07-02-capable-ranges-design.md.
 
 use crate::AppState;
 use serde::Serialize;
@@ -42,6 +44,14 @@ pub const TRAIN_BYTES_PER_PARAM: f64 = 16.0;
 /// Resident bytes per parameter for forward-only **eval** (fp32 weights).
 pub const EVAL_BYTES_PER_PARAM: f64 = 4.0;
 
+/// Usable share of available RAM for holding model weights (matches the 90%
+/// convention every RAM guard in this app uses).
+pub const LOAD_FRACTION: f64 = 0.9;
+/// Fine-tune corpus range: a large fine-tune (the range's low end)…
+pub const FINETUNE_TOKENS_LO: f64 = 1e7;
+/// …and a small one (the range's high end).
+pub const FINETUNE_TOKENS_HI: f64 = 1e6;
+
 // ── Pure bound math ──────────────────────────────────────────────────────────
 
 fn finite_pos(x: f64) -> bool {
@@ -56,6 +66,25 @@ fn mem_bound_params(mem_avail: u64, bytes_per_param: f64) -> f64 {
         return f64::INFINITY;
     }
     mem_avail as f64 / bytes_per_param
+}
+
+/// Max params whose weights fit in usable free RAM at `bytes_per_param`.
+/// Returns 0.0 when memory is unknown — this is a *display* bound (shown as
+/// "—"), unlike the ∞-sentinel cap conventions used for `min`-ing.
+pub fn load_max_params(mem_avail: u64, bytes_per_param: f64) -> f64 {
+    if mem_avail == 0 || !finite_pos(bytes_per_param) {
+        return 0.0;
+    }
+    LOAD_FRACTION * mem_avail as f64 / bytes_per_param
+}
+
+/// Load ceiling as a CAP: like [`load_max_params`] but +∞ when memory is
+/// unknown, so a `min` leaves the other bound untouched.
+fn load_cap_params(mem_avail: u64, bytes_per_param: f64) -> f64 {
+    if mem_avail == 0 || !finite_pos(bytes_per_param) {
+        return f64::INFINITY;
+    }
+    LOAD_FRACTION * mem_avail as f64 / bytes_per_param
 }
 
 /// Max parameters decodable at >= [`TARGET_TOKS`], bandwidth-bound: each decoded
@@ -83,9 +112,18 @@ pub fn train_max_chinchilla(gflops: f64) -> f64 {
     (b / (6.0 * CHINCHILLA_RATIO)).sqrt()
 }
 
-/// Max trainable params on a fixed [`FIXED_TRAIN_TOKENS`] corpus: `N = B / (6*T)`.
+/// Max params trainable on a `tokens`-token corpus within the wall-clock
+/// budget (compute only): `N = B / (6·T)`.
+pub fn train_max_on_corpus(gflops: f64, tokens: f64) -> f64 {
+    if !finite_pos(tokens) {
+        return 0.0;
+    }
+    flop_budget(gflops) / (6.0 * tokens)
+}
+
+/// Max trainable params on a fixed [`FIXED_TRAIN_TOKENS`] corpus.
 pub fn train_max_fixed(gflops: f64) -> f64 {
-    flop_budget(gflops) / (6.0 * FIXED_TRAIN_TOKENS)
+    train_max_on_corpus(gflops, FIXED_TRAIN_TOKENS)
 }
 
 /// Max params evaluable (forward-only, `2*N*T`) over [`EVAL_TOKENS`] within 24h.
@@ -113,12 +151,22 @@ pub struct CapabilityReport {
     pub train_chinchilla: f64,
     pub train_fixed1b: f64,
     pub test_eval: f64,
+    pub load_int4: f64,
+    pub load_int8: f64,
+    pub load_f32: f64,
+    /// Fine-tune range, RAM-capped: `lo` = [`FINETUNE_TOKENS_LO`]-token corpus,
+    /// `hi` = [`FINETUNE_TOKENS_HI`]-token corpus.
+    pub finetune_lo: f64,
+    pub finetune_hi: f64,
     // Assumptions echoed so the dialog can show its own workings.
     pub target_toks: f64,
     pub train_hours: f64,
     pub eval_tokens: f64,
     pub fixed_train_tokens: f64,
     pub chinchilla_ratio: f64,
+    pub finetune_tokens_lo: f64,
+    pub finetune_tokens_hi: f64,
+    pub load_fraction: f64,
 }
 
 /// Build a report from measured numbers (pure; no Tauri runtime needed).
@@ -147,17 +195,28 @@ fn assemble_report(
         mem_avail,
         mem_bw_gbps: bw_bytes_per_s / 1e9,
         gemm_gflops: gflops,
-        infer_int4: infer_max_params(bw_bytes_per_s, BPP_INT4),
-        infer_int8: infer_max_params(bw_bytes_per_s, BPP_INT8),
-        infer_f32: infer_max_params(bw_bytes_per_s, BPP_F32),
+        infer_int4: infer_max_params(bw_bytes_per_s, BPP_INT4)
+            .min(load_cap_params(mem_avail, BPP_INT4)),
+        infer_int8: infer_max_params(bw_bytes_per_s, BPP_INT8)
+            .min(load_cap_params(mem_avail, BPP_INT8)),
+        infer_f32: infer_max_params(bw_bytes_per_s, BPP_F32)
+            .min(load_cap_params(mem_avail, BPP_F32)),
         train_chinchilla: train_max_chinchilla(gflops).min(train_mem),
         train_fixed1b: train_max_fixed(gflops).min(train_mem),
         test_eval: test_max_params(gflops).min(eval_mem),
+        load_int4: load_max_params(mem_avail, BPP_INT4),
+        load_int8: load_max_params(mem_avail, BPP_INT8),
+        load_f32: load_max_params(mem_avail, BPP_F32),
+        finetune_lo: train_max_on_corpus(gflops, FINETUNE_TOKENS_LO).min(train_mem),
+        finetune_hi: train_max_on_corpus(gflops, FINETUNE_TOKENS_HI).min(train_mem),
         target_toks: TARGET_TOKS,
         train_hours: TRAIN_SECS / 3600.0,
         eval_tokens: EVAL_TOKENS,
         fixed_train_tokens: FIXED_TRAIN_TOKENS,
         chinchilla_ratio: CHINCHILLA_RATIO,
+        finetune_tokens_lo: FINETUNE_TOKENS_LO,
+        finetune_tokens_hi: FINETUNE_TOKENS_HI,
+        load_fraction: LOAD_FRACTION,
     }
 }
 
@@ -431,5 +490,108 @@ mod tests {
             (r.train_chinchilla - compute).abs() < 1.0,
             "should be compute-limited"
         );
+    }
+
+    #[test]
+    fn load_bound_orders_by_precision() {
+        let mem = 8_000_000_000u64;
+        let i4 = load_max_params(mem, BPP_INT4);
+        let i8 = load_max_params(mem, BPP_INT8);
+        let f = load_max_params(mem, BPP_F32);
+        assert!(
+            i4 > i8 && i8 > f,
+            "expected int4 > int8 > f32: {i4} {i8} {f}"
+        );
+        assert_eq!(load_max_params(0, BPP_INT8), 0.0); // unknown memory → display "—"
+    }
+
+    #[test]
+    fn load_uses_the_90_percent_fraction() {
+        // 10 GB free at int8 (1 B/param) → exactly 9e9 params.
+        assert!((load_max_params(10_000_000_000, BPP_INT8) - 9e9).abs() < 1.0);
+    }
+
+    #[test]
+    fn finetune_range_is_ordered_and_scales() {
+        let lo = train_max_on_corpus(100.0, FINETUNE_TOKENS_LO);
+        let hi = train_max_on_corpus(100.0, FINETUNE_TOKENS_HI);
+        assert!(hi > lo, "smaller corpus must allow more params: {lo} {hi}");
+        assert!(train_max_on_corpus(200.0, FINETUNE_TOKENS_LO) > lo);
+        assert_eq!(train_max_on_corpus(100.0, 0.0), 0.0); // degenerate corpus
+    }
+
+    #[test]
+    fn train_max_fixed_unchanged_by_refactor() {
+        for &g in &[10.0, 50.0, 400.0] {
+            assert_eq!(
+                train_max_fixed(g),
+                train_max_on_corpus(g, FIXED_TRAIN_TOKENS)
+            );
+        }
+    }
+
+    #[test]
+    fn finetune_is_ram_capped_when_ram_is_scarce() {
+        // Huge compute, 1 GB free: both range ends collapse to the 16 B/param cap.
+        let r = assemble_report(
+            "cpu".into(),
+            64,
+            64,
+            2_000_000_000,
+            1_000_000_000,
+            50e9,
+            200.0,
+        );
+        let cap = 1_000_000_000.0 / TRAIN_BYTES_PER_PARAM;
+        assert!(
+            (r.finetune_hi - cap).abs() < 1.0,
+            "hi not capped: {}",
+            r.finetune_hi
+        );
+        assert!(
+            (r.finetune_lo - cap).abs() < 1.0,
+            "lo not capped: {}",
+            r.finetune_lo
+        );
+    }
+
+    #[test]
+    fn inference_is_ram_capped_when_ram_is_scarce() {
+        // Regression test for the fix: huge bandwidth (100 GB/s), 1 GB free —
+        // f32 inference must equal the f32 LOAD ceiling, not the bandwidth figure.
+        let r = assemble_report(
+            "cpu".into(),
+            8,
+            8,
+            2_000_000_000,
+            1_000_000_000,
+            100e9,
+            10.0,
+        );
+        let cap = LOAD_FRACTION * 1_000_000_000.0 / BPP_F32;
+        assert!(
+            (r.infer_f32 - cap).abs() < 1.0,
+            "not RAM-capped: {}",
+            r.infer_f32
+        );
+        // Premise check: bandwidth alone would have allowed more.
+        assert!(infer_max_params(100e9, BPP_F32) > cap);
+    }
+
+    #[test]
+    fn report_keeps_backcompat_fields_and_range_order() {
+        let r = assemble_report("cpu".into(), 8, 4, 16_000_000_000, 8_000_000_000, 8e9, 10.0);
+        // Legacy fields alive and still ordered.
+        assert!(r.infer_int4 > r.infer_int8 && r.infer_int8 > r.infer_f32);
+        assert!(r.train_chinchilla > 0.0 && r.train_fixed1b > 0.0 && r.test_eval > 0.0);
+        // A model you can decode always fits: load ≥ infer per precision.
+        assert!(r.load_int4 >= r.infer_int4);
+        assert!(r.load_int8 >= r.infer_int8);
+        assert!(r.load_f32 >= r.infer_f32);
+        // Fine-tune range ordered; echoes present.
+        assert!(r.finetune_hi >= r.finetune_lo);
+        assert_eq!(r.load_fraction, LOAD_FRACTION);
+        assert_eq!(r.finetune_tokens_lo, FINETUNE_TOKENS_LO);
+        assert_eq!(r.finetune_tokens_hi, FINETUNE_TOKENS_HI);
     }
 }
