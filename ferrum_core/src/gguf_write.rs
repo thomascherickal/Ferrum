@@ -8,8 +8,9 @@
 use crate::error::{InferError, Result};
 use crate::gguf::{
     Gguf, MetaValue, DEFAULT_ALIGNMENT, GGML_F16, GGML_F32, GGML_Q4_0, GGML_Q4_1, GGML_Q4_K,
-    GGML_Q5_K, GGML_Q6_K, GGML_Q8_0, GGML_Q8_1, GGUF_MAGIC, QK, QK_K, VT_ARRAY, VT_BOOL, VT_F32,
-    VT_F64, VT_I16, VT_I32, VT_I64, VT_I8, VT_STRING, VT_U16, VT_U32, VT_U64, VT_U8,
+    GGML_Q5_K, GGML_Q6_K, GGML_Q8_0, GGML_Q8_1, GGUF_MAGIC, Q4_K_BLOCK, Q5_K_BLOCK, Q6_K_BLOCK, QK,
+    QK_K, VT_ARRAY, VT_BOOL, VT_F32, VT_F64, VT_I16, VT_I32, VT_I64, VT_I8, VT_STRING, VT_U16,
+    VT_U32, VT_U64, VT_U8,
 };
 use crate::layer::Linear;
 use crate::llm::LlamaModel;
@@ -47,7 +48,6 @@ impl GgufQuant {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn ggml_type(self) -> u32 {
         match self {
             Self::F32 => GGML_F32,
@@ -63,7 +63,6 @@ impl GgufQuant {
     }
 
     /// The GGUF `general.file_type` enum id closest to this target (metadata hint).
-    #[allow(dead_code)]
     pub(crate) fn file_type(self) -> u32 {
         match self {
             Self::F32 => 0,
@@ -78,7 +77,6 @@ impl GgufQuant {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn is_kquant(self) -> bool {
         matches!(self, Self::Q4K | Self::Q5K | Self::Q6K)
     }
@@ -140,7 +138,6 @@ pub fn f32_to_f16(value: f32) -> u16 {
 
 /// Encode a whole tensor's f32 values into GGUF on-disk bytes for `ggml_type`.
 /// Quantized types require the length to be a multiple of their block size.
-#[allow(dead_code)] // consumed by later tasks
 pub(crate) fn encode_tensor(data: &[f32], ggml_type: u32) -> Result<Vec<u8>> {
     let n = data.len();
     let need_mult = |m: usize| -> Result<()> {
@@ -190,7 +187,6 @@ pub(crate) fn encode_tensor(data: &[f32], ggml_type: u32) -> Result<Vec<u8>> {
     })
 }
 
-#[allow(dead_code)] // consumed by later tasks
 fn enc_f32(data: &[f32]) -> Vec<u8> {
     let mut o = Vec::with_capacity(data.len() * 4);
     for &x in data {
@@ -199,7 +195,6 @@ fn enc_f32(data: &[f32]) -> Vec<u8> {
     o
 }
 
-#[allow(dead_code)] // consumed by later tasks
 fn enc_f16(data: &[f32]) -> Vec<u8> {
     let mut o = Vec::with_capacity(data.len() * 2);
     for &x in data {
@@ -210,7 +205,6 @@ fn enc_f16(data: &[f32]) -> Vec<u8> {
 
 /// Q8_0: per 32-element block, `d = amax/127` (f16), then 32 × i8 with
 /// `q = round(x/d)`. Decode is `d * q`.
-#[allow(dead_code)] // consumed by later tasks
 fn enc_q8_0(data: &[f32]) -> Vec<u8> {
     let mut o = Vec::with_capacity(data.len() / QK * (2 + QK));
     for blk in data.chunks_exact(QK) {
@@ -228,7 +222,6 @@ fn enc_q8_0(data: &[f32]) -> Vec<u8> {
 
 /// Q8_1: like Q8_0 plus a per-block sum `s = d * Σq` (f16). The reader ignores
 /// `s` on decode, but ggml stores it, so we compute it faithfully.
-#[allow(dead_code)] // consumed by later tasks
 fn enc_q8_1(data: &[f32]) -> Vec<u8> {
     let mut o = Vec::with_capacity(data.len() / QK * (2 + 2 + QK));
     for blk in data.chunks_exact(QK) {
@@ -254,7 +247,6 @@ fn enc_q8_1(data: &[f32]) -> Vec<u8> {
 /// Q4_0: per 32-element block, `d = max/-8` where `max` is the value of largest
 /// magnitude; `q = round(x/d)+8` clamped to 0..15. Elements `j` and `j+16` share
 /// byte `j` (low/high nibble). Decode is `d * (q - 8)`.
-#[allow(dead_code)] // consumed by later tasks
 fn enc_q4_0(data: &[f32]) -> Vec<u8> {
     let half = QK / 2;
     let mut o = Vec::with_capacity(data.len() / QK * (2 + half));
@@ -282,7 +274,6 @@ fn enc_q4_0(data: &[f32]) -> Vec<u8> {
 
 /// Q4_1: per 32-element block, `d = (max-min)/15`, `q = round((x-min)/d)` in
 /// 0..15, storing `d` and `min` (both f16). Decode is `d * q + min`.
-#[allow(dead_code)] // consumed by later tasks
 fn enc_q4_1(data: &[f32]) -> Vec<u8> {
     let half = QK / 2;
     let mut o = Vec::with_capacity(data.len() / QK * (2 + 2 + half));
@@ -306,21 +297,8 @@ fn enc_q4_1(data: &[f32]) -> Vec<u8> {
     o
 }
 
-/// Q4_K super-block length in encoded bytes.
-#[allow(dead_code)] // consumed by later tasks
-const Q4_K_BLOCK_LEN: usize = 2 + 2 + 12 + QK_K / 2; // 144
-
-/// Q5_K super-block length in encoded bytes.
-#[allow(dead_code)] // consumed by later tasks
-const Q5_K_BLOCK_LEN: usize = 2 + 2 + 12 + QK_K / 8 + QK_K / 2; // 176
-
-/// Q6_K super-block length in encoded bytes.
-#[allow(dead_code)] // consumed by later tasks
-const Q6_K_BLOCK_LEN: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2; // 210
-
 /// Pack 8 six-bit sub-block scales and mins into the 12-byte layout that
 /// [`crate::gguf::get_scale_min_k4`] reads back. Exact inverse of that function.
-#[allow(dead_code)] // consumed by later tasks
 fn put_scale_min_k4(sc: &[u8; 8], m: &[u8; 8]) -> [u8; 12] {
     let mut q = [0u8; 12];
     for j in 0..4 {
@@ -338,9 +316,8 @@ fn put_scale_min_k4(sc: &[u8; 8], m: &[u8; 8]) -> [u8; 12] {
 /// Q4_K: per 256-element super-block, 8 sub-blocks of 32. Each sub-block gets an
 /// affine (scale, min) chosen to cover its [lo, hi]; those reals are then
 /// quantized to 6-bit via super-block `d`/`dmin`. Decode: `d*sc_s*q - dmin*m_s`.
-#[allow(dead_code)] // consumed by later tasks
 fn enc_q4_k(data: &[f32]) -> Vec<u8> {
-    let mut o = Vec::with_capacity(data.len() / QK_K * Q4_K_BLOCK_LEN);
+    let mut o = Vec::with_capacity(data.len() / QK_K * Q4_K_BLOCK);
     for sblk in data.chunks_exact(QK_K) {
         // 1. Per sub-block real scale/min covering [lo, hi], with min >= 0.
         let mut scale_r = [0.0f32; 8];
@@ -409,9 +386,8 @@ fn enc_q4_k(data: &[f32]) -> Vec<u8> {
 /// Q5_K: like Q4_K but 5-bit quants (`qv ∈ 0..31`). The low nibble is packed as
 /// in Q4_K; the 5th bit rides in `qh` (bit `s` of `qh[l]`). Decode:
 /// `d*sc_s*qv - dmin*m_s`.
-#[allow(dead_code)] // consumed by later tasks
 fn enc_q5_k(data: &[f32]) -> Vec<u8> {
-    let mut o = Vec::with_capacity(data.len() / QK_K * Q5_K_BLOCK_LEN);
+    let mut o = Vec::with_capacity(data.len() / QK_K * Q5_K_BLOCK);
     for sblk in data.chunks_exact(QK_K) {
         let mut scale_r = [0.0f32; 8];
         let mut min_r = [0.0f32; 8];
@@ -481,9 +457,8 @@ fn enc_q5_k(data: &[f32]) -> Vec<u8> {
 /// Q6_K: per 256-element super-block, 16 groups of 16 with signed 6-bit quants
 /// (`q ∈ -32..31`) and an `i8` scale per group, all multiplied by a super-block
 /// `d` (f16). Decode: `d * scale_g * q`.
-#[allow(dead_code)] // consumed by later tasks
 fn enc_q6_k(data: &[f32]) -> Vec<u8> {
-    let mut o = Vec::with_capacity(data.len() / QK_K * Q6_K_BLOCK_LEN);
+    let mut o = Vec::with_capacity(data.len() / QK_K * Q6_K_BLOCK);
     for sblk in data.chunks_exact(QK_K) {
         // 1. Per 16-element group, a real scale mapping amax → q = 31.
         let mut gscale = [0.0f32; 16];
@@ -550,7 +525,6 @@ fn enc_q6_k(data: &[f32]) -> Vec<u8> {
 /// stay F32. 2-D matrices take `quant`, unless their block axis is not divisible
 /// by the block size, in which case they fall back to F16. Returns
 /// `(ggml_type, fell_back)`.
-#[allow(dead_code)] // consumed by later tasks
 pub(crate) fn plan_tensor_type(is_2d: bool, block_axis: usize, quant: GgufQuant) -> (u32, bool) {
     if !is_2d {
         return (GGML_F32, false);
@@ -675,7 +649,6 @@ impl GgufBuilder {
         o
     }
 
-    #[allow(dead_code)]
     pub fn write(self, path: &str) -> crate::error::Result<()> {
         let bytes = self.into_bytes();
         std::fs::write(path, bytes).map_err(InferError::from)
