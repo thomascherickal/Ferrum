@@ -1017,7 +1017,6 @@ pub struct ExportParams {
     pub resume: Option<String>,
     /// Bypass the RAM guard.
     pub force: bool,
-    #[allow(dead_code)] // wired to the export_gguf command in the next commit
     pub verbose: bool,
 }
 
@@ -1062,7 +1061,6 @@ fn ggml_type_name(t: u32) -> String {
 /// The testable core of the Export tab: everything `export_gguf` does except
 /// event emission. `progress` receives one human-readable line per phase
 /// (prefixes: "opening", "loading", "applying", "encoding").
-#[allow(dead_code)] // wired to the export_gguf command in the next commit
 pub(crate) fn do_export(p: &ExportParams, progress: &dyn Fn(&str)) -> Result<ExportResult, String> {
     if p.out_path.trim().is_empty() {
         return Err("please provide an output path (.gguf)".into());
@@ -1128,6 +1126,24 @@ pub(crate) fn do_export(p: &ExportParams, progress: &dyn Fn(&str)) -> Result<Exp
         seconds: t0.elapsed().as_secs_f64(),
         tensor_summary,
     })
+}
+
+/// Export a llama/qwen2 GGUF (optionally with a fine-tune checkpoint applied)
+/// to a new GGUF at the requested quantization. Phase progress streams as
+/// `export-progress` events (see [`do_export`] for the phases).
+#[tauri::command]
+pub async fn export_gguf(app: AppHandle, params: ExportParams) -> Result<ExportResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        ferrum_core::set_verbose(params.verbose);
+        let emit = |m: &str| {
+            let _ = app.emit("export-progress", m.to_string());
+        };
+        let r = do_export(&params, &emit);
+        ferrum_core::set_verbose(false);
+        r
+    })
+    .await
+    .map_err(|e| format!("task error: {e}"))?
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

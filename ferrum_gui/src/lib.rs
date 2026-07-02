@@ -62,6 +62,7 @@ pub fn run() {
             commands::gguf_info,
             commands::run_gguf,
             commands::finetune_gguf,
+            commands::export_gguf,
             commands::run_terminal,
             commands::term_cwd,
             commands::system_stats,
