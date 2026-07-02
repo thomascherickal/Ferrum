@@ -74,8 +74,11 @@ The tabs, left to right:
 | **Evaluate** | Score a model's quality on held-out text (perplexity). |
 | **Models** | Inspect / reload a saved `.bin` model file. |
 | **GGUF** | Import and run an external Llama/Qwen GGUF checkpoint. |
+| **Fine-tune** | Train an imported GGUF on your text via a `.flck` checkpoint. |
+| **Export** | Write a loaded (or fine-tuned) GGUF back out at a chosen quantization. |
 | **Tabular (CLI)** | Train a spreadsheet/CSV model via `train_cli`. |
 | **System** | A fuller view of CPU and memory load. |
+| **Capable** | View this engine's architecture and training options. |
 | **Terminal** (docked) | A real shell *and* the engine's live `--verbose` log. |
 
 A friendly design touch: every form gives **clear, plain-language error messages**
@@ -167,6 +170,23 @@ trained.
 > CPU, with tens of seconds to digest a long prompt. Only `llama`/`qwen2`
 > architectures load; `Q2_K`/`Q3_K`/`IQ*` files are refused with a clear message.
 > This mirrors the `slm_cli run-gguf` command exactly.
+
+### Step 7 — Export: write a GGUF back out
+
+The **Export** tab re-quantizes a loaded (or fine-tuned) Llama/Qwen GGUF to a new
+format and saves it, runnable in llama.cpp, ollama, or LM Studio.
+
+1. Go to the **Export** tab. **Browse…** to the source `.gguf` and click
+   **Inspect** to confirm the architecture is exportable (llama/qwen2).
+2. Pick an **Output type** — `q8_0` is a good default; `f16`/`f32` are
+   lossless; the k-quants are smallest. Re-quantizing an already-quantized
+   file is lossy.
+3. To export a fine-tune, point **Fine-tune checkpoint** at the `.flck` the
+   Fine-tune tab produced.
+4. **Save as…** the output path and click **Export**. The status line follows
+   the phases (opening → loading → writing), and the result shows a per-type
+   tensor summary — any matrix that fell back to f16 shows up there.
+5. The written file runs unchanged in llama.cpp, ollama, or LM Studio.
 
 ---
 

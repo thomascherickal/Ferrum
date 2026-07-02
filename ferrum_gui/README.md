@@ -19,12 +19,13 @@ perplexity evaluation, model inspection, **GGUF import & run**, the tabular
 | 1 | Download datasets from the internet and clean them | **Datasets** | `download_text`, `clean_text`, `save_corpus` (cleaning is `ferrum_core::clean_corpus`) |
 | 2 | Clear error messages on bad input | every form (inline `.err` + toast); backend re-validates and returns readable strings | all |
 | 3 | Live terminal with `--verbose`, plus a real shell | docked **Terminal** at the bottom (always visible) | `run_terminal`, `term_cwd`, `engine-log`/`term-output` events |
-| 4 | A tab for every piece of functionality | Datasets / Train / Generate / Evaluate / Models / **GGUF** / Tabular / System | — |
+| 4 | A tab for every piece of functionality | Datasets / Train / Generate / Evaluate / Models / **GGUF** / Fine-tune / **Export** / Tabular / System / **Capable** | — |
 | 5 | Evaluation shown in a table | **Evaluate** | `evaluate_slm` |
 | 6 | Train, test, reload, load-from-disk, run with streaming | **Train**, **Generate** (stream), **Models** (reload/inspect) | `train_slm`, `generate_slm`, `model_info` |
 | 7 | Import & run external Llama/Qwen GGUFs | **GGUF** (file picker, prompt, quant select, inspect + run) | `gguf_info`, `run_gguf` |
-| 8 | Monitor system load | **System** tab + the top-bar mini gauges | `system_stats` (sysinfo) |
-| 9 | Cross-platform via Tauri | one codebase; see **Platform support** | — |
+| 8 | Export / re-quantize a GGUF | **Export** (source, output type, checkpoint overlay, save-as) | `export_gguf` |
+| 9 | Monitor system load | **System** tab + the top-bar mini gauges | `system_stats` (sysinfo) |
+| 10 | Cross-platform via Tauri | one codebase; see **Platform support** | — |
 
 The three SLM training paths (`train_transformer` multi-threaded, `train_embedded`,
 one-hot `train`) are all selectable in **Train**. The **GGUF** tab calls
@@ -80,7 +81,7 @@ rather than break:
 | Feature | Linux / macOS / Windows | Android / iOS | Web |
 |--------|:----------------------:|:-------------:|:---:|
 | Datasets, Train, Generate, Evaluate, Models | ✅ | ✅ | ❌¹ |
-| GGUF import & run | ✅ | ✅² | ❌¹ |
+| GGUF import, run & export | ✅ | ✅² | ❌¹ |
 | Dataset download (HTTP) | ✅ | ✅ | ❌¹ |
 | Interactive **shell** terminal | ✅ | ⛔ (no shell on mobile) | ⛔ |
 | Verbose engine log in terminal | ✅ | ✅ | ❌¹ |

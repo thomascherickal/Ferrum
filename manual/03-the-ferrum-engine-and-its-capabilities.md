@@ -158,7 +158,7 @@ What's honest about it:
 
 Use it from the command line (`train_transformer run-gguf model.gguf "prompt"
 --quant int4`, `train_transformer export-gguf in.gguf out.gguf --quant q8_0`)
-or the GUI's **GGUF** tab (import/run only for now).
+or the GUI's **GGUF** and **Export** tabs.
 
 ---
 

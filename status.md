@@ -83,8 +83,9 @@ passes (0 failures, 0 warnings).
   `--weight_decay` / `--dropout` / `--stream` / `--threads`.
 - `train_cli` → tabular MLP trainer with CSV auto-detection.
 - `tabular_wasm` → `wasm-bindgen` browser bindings.
-- `ferrum_gui` → Tauri 2 desktop/mobile app; a tab per task plus a **GGUF** panel
-  (`gguf_info` / `run_gguf`). The Rust backend type-checks; the windowed build
+- `ferrum_gui` → Tauri 2 desktop/mobile app; a tab per task plus **GGUF** (import/run),
+  **Fine-tune**, and **Export** panels
+  (`gguf_info` / `run_gguf` / `finetune_gguf` / `export_gguf`). The Rust backend type-checks; the windowed build
   needs the system WebView libraries.
 
 ### Tests
