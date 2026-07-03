@@ -11,18 +11,19 @@ then docs, then verify/review/finish.
 
 ## F2 — Sampling knobs on the GGUF run path
 
-`llm.rs::generate` (llm.rs:518) takes `&SamplingParams` (re-exported from slm.rs, which already
-defines temperature/top_k/top_p/repetition_penalty) but implements temperature-only sampling.
-
-- The complete sampler already exists: `sample_with_params(logits, params, recent, rng)` at slm.rs:2058, `pub(crate)`, documented bit-identical to a plain temperature draw at default params. llm.rs::generate calls it instead of its temperature-only pick, passing the decoded-so-far ids (prompt tail + generated) as `recent`. No second implementation.
+**Correction found while planning:** `llm.rs::generate` (llm.rs:518) already calls the full
+sampler `sample_with_params(logits, params, recent, rng)` (slm.rs:2058) with `recent` = prompt +
+generated ids — the engine honors all four knobs today. Only the surfaces don't: both CLI
+(main.rs:690) and GUI (commands.rs:770) construct `SamplingParams::with_temperature(temp)`,
+discarding the other three. F2 is therefore pure plumbing plus fixing the stale
+"Greedy/temperature generation" doc comment.
 - CLI `run-gguf`: `--top-k N`, `--top-p F`, `--rep F` flags. GUI: three inputs on the GGUF tab → `GgufRunParams { top_k, top_p, rep_penalty }` (serde camelCase) → decode loop.
 - Defaults 0 / 1.0 / 1.0 = exactly current behavior.
 
-**Tests:** top_k=1 equals argmax on random logits; top_p ≈ 0 keeps only the head token;
-constructed logits where a repeated token wins without penalty and loses with rep=1.5;
-fixed-seed generation with default params equals pre-change output captured before the swap
-(backcompat pin — if llm.rs's current numerics legitimately differ from `sample_with_params`
-at defaults, stop and escalate to the controller rather than adjusting the test).
+**Tests:** the sampler itself is already covered in slm.rs; F2 adds a generate-level test on a
+tiny model proving non-default knobs reach the sampler (top_k=1 makes generation deterministic
+across two different seeds), plus CLI/GUI mapping tests (flag/param values land in
+`SamplingParams` fields; defaults produce `SamplingParams::default()`-equivalent values).
 
 ## F1 — Chat templates for instruct GGUFs
 
@@ -78,7 +79,7 @@ ctx, len == ctx); empty/1-token input errors cleanly.
 
 New `ferrum_core/src/gguf_stream_write.rs`:
 
-- `pub fn stream_export(source: &str, out: &str, quant: GgufQuant, checkpoint: Option<&Path>) -> Result<ExportSummary>`.
+- `pub fn stream_export(source: &str, out: &str, quant: GgufQuant, checkpoint: Option<&str>) -> Result<ExportSummary>` (paths are `&str` crate-wide).
 - Pass 1: walk the source tensor table (existing streamed reader mode), compute each output tensor's ggml type via the **same per-tensor policy function** used by `llama_gguf_bytes` (factor that policy out of gguf_write.rs — one source of truth), derive sizes/offsets, write header + KVs + tensor table.
 - Pass 2: per tensor — read raw, dequant to f32 (existing), overlay the checkpoint's weights for that tensor if given, encode to target type (existing encoders), write, 32-byte-align. Atomic temp-file + rename like the current writer.
 - Checkpoint overlay without loading it whole: FLCK v1 (llm_train.rs:1384) is shape header + qat + step + rng, then **three flat f32 blobs — weights, Adam m, Adam v — in canonical `param_data_ref` order**. Validate the shape header against the GGUF config, compute the weights-section file offset, and for each streamed tensor derive its span in canonical order and read only that slice; Adam m/v are never read. Any order-mapping mistake is caught by the byte-identity oracle below.
