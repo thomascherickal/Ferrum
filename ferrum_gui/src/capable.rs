@@ -579,12 +579,34 @@ mod tests {
     }
 
     #[test]
+    fn inference_range_stays_ordered_when_load_cap_binds() {
+        // Huge bandwidth + 1 GB free: every precision's inference bound
+        // collapses to its load ceiling, and int4 > int8 > f32 must survive.
+        let r = assemble_report(
+            "cpu".into(),
+            8,
+            8,
+            2_000_000_000,
+            1_000_000_000,
+            100e9,
+            10.0,
+        );
+        let cap = |bpp: f64| LOAD_FRACTION * 1_000_000_000.0 / bpp;
+        assert!((r.infer_int4 - cap(BPP_INT4)).abs() < 1.0);
+        assert!((r.infer_int8 - cap(BPP_INT8)).abs() < 1.0);
+        assert!((r.infer_f32 - cap(BPP_F32)).abs() < 1.0);
+        assert!(r.infer_int4 > r.infer_int8 && r.infer_int8 > r.infer_f32);
+    }
+
+    #[test]
     fn report_keeps_backcompat_fields_and_range_order() {
         let r = assemble_report("cpu".into(), 8, 4, 16_000_000_000, 8_000_000_000, 8e9, 10.0);
         // Legacy fields alive and still ordered.
         assert!(r.infer_int4 > r.infer_int8 && r.infer_int8 > r.infer_f32);
         assert!(r.train_chinchilla > 0.0 && r.train_fixed1b > 0.0 && r.test_eval > 0.0);
-        // A model you can decode always fits: load ≥ infer per precision.
+        // With free RAM known, a model you can decode always fits: load ≥ infer
+        // per precision. (Unknown RAM breaks this: load displays 0 → "—" while
+        // infer keeps its bandwidth bound.)
         assert!(r.load_int4 >= r.infer_int4);
         assert!(r.load_int8 >= r.infer_int8);
         assert!(r.load_f32 >= r.infer_f32);

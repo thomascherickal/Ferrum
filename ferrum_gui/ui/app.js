@@ -465,11 +465,16 @@ function checkGgufBudget(paramCount) {
 // which fires its "close" event — the single resolution point).
 function confirmGgufWarning(paramCount, crossed) {
   return new Promise((resolve) => {
+    // Keyed on the load-check label in checkGgufBudget: crossing that line
+    // means "may not fit in RAM", which is a different risk than "slow".
+    const footer = crossed.some((c) => c.includes("fits in RAM"))
+      ? "You can still proceed — but this exceeds the fits-in-RAM ceiling: expect heavy swapping or a failed load."
+      : "You can still proceed — expect slower than the targets above.";
     $("ggWarnBody").innerHTML =
       `<p>This model has <strong>${fmtParams(paramCount)}</strong> parameters, which exceeds
        the estimated limits of this machine:</p><ul>` +
       crossed.map((c) => `<li>${c}</li>`).join("") +
-      `</ul><p class="muted">You can still proceed — expect slower than the targets above.</p>`;
+      `</ul><p class="muted">${footer}</p>`;
     const dlg = $("ggWarnDialog");
     let proceed = false; // default for Esc / backdrop dismissal
     const onProceed = () => { proceed = true; dlg.close(); };
@@ -800,7 +805,7 @@ function renderCapReport(r) {
         ${row("Load", rng(r.loadF32, r.loadInt4),
               `f32 → int4 (int8: ${fmtParams(r.loadInt8)}); fits in ${Math.round(r.loadFraction * 100)}% of free RAM`)}
         ${row("Train (scratch)", rng(trainLo, trainHi),
-              `Chinchilla ${r.chinchillaRatio}× → fixed ${fmtParams(r.fixedTrainTokens)} tokens; < ${r.trainHours} h, RAM-capped @16 B/param`)}
+              `Chinchilla ${r.chinchillaRatio}× vs fixed ${fmtParams(r.fixedTrainTokens)}-token corpus; < ${r.trainHours} h, RAM-capped @16 B/param`)}
         ${row("Fine-tune", rng(r.finetuneLo, r.finetuneHi),
               `${fmtParams(r.finetuneTokensLo)} → ${fmtParams(r.finetuneTokensHi)} token corpus; < ${r.trainHours} h, RAM-capped @16 B/param`)}
         ${row("Inference", rng(r.inferF32, r.inferInt4),
