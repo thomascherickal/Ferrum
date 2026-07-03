@@ -54,6 +54,7 @@
 pub mod verbose;
 
 pub mod activation;
+pub mod chat_format;
 pub mod csv;
 pub mod dataset;
 pub mod error;
@@ -78,6 +79,7 @@ pub mod train;
 pub mod train_transformer;
 
 pub use activation::Activation;
+pub use chat_format::ChatFormat;
 pub use csv::{
     fit_normalizer_with_target, train_val_split, CsvDataset, ModelMetadata, Normalizer, TaskType,
 };

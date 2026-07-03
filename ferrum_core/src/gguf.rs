@@ -1441,7 +1441,7 @@ mod tests {
                 &[1, 2],
                 6,
                 &crate::llm::SamplingParams::with_temperature(0.8),
-                None,
+                &[],
                 &mut crate::rng::Rng::new(1),
             )
             .unwrap();

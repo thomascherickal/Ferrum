@@ -207,6 +207,11 @@ impl GgufTokenizer {
         self.eos.map(|x| x as usize)
     }
 
+    /// Exact-piece vocabulary lookup (used to map chat special tokens to ids).
+    pub fn token_id(&self, piece: &str) -> Option<usize> {
+        self.token_to_id.get(piece).map(|&id| id as usize)
+    }
+
     /// Encode text to token IDs. BPE is exact (given the approximate
     /// pre-tokenizer); SPM is a greedy longest-match approximation with byte
     /// fallback. See the module docs.
@@ -414,6 +419,7 @@ fn pretokenize(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat_format::{encode_segments, Segment};
 
     // ── In-memory GGUF builders (reuse the writer pattern from gguf.rs tests) ──
 
@@ -548,6 +554,27 @@ mod tests {
         let tk = GgufTokenizer::from_gguf(&g).unwrap();
         let input = "abc abc abc abc abc";
         assert_eq!(tk.decode(&tk.encode(input)), input, "BPE round-trip");
+    }
+
+    #[test]
+    fn encode_segments_atomic_special_vs_multi_id_fallback() {
+        // `<|im_start|>` is a real vocab entry (an atomic special token); "h"/"i"
+        // are ordinary single-char BPE pieces with no merges between them.
+        let toks = ["<|im_start|>", "h", "i"];
+        let mut kvs = Vec::new();
+        kv_str(&mut kvs, "tokenizer.ggml.model", "gpt2");
+        kv_str_array(&mut kvs, "tokenizer.ggml.tokens", &toks);
+        let g = tok_gguf(&kvs, 2);
+        let tk = GgufTokenizer::from_gguf(&g).unwrap();
+
+        // In-vocab special → exactly one id (not shredded by BPE).
+        assert_eq!(
+            encode_segments(&tk, &[Segment::Special("<|im_start|>")]),
+            vec![0]
+        );
+        // A "special" string absent from the vocab falls back to plain-text
+        // encoding — degraded (2 ids for "hi") but still functional.
+        assert_eq!(encode_segments(&tk, &[Segment::Special("hi")]), vec![1, 2]);
     }
 
     #[test]

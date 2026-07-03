@@ -276,14 +276,15 @@ fn gguf_finetune_checkpoint_resume_pipeline() {
     // 5. The resumed model generates in-vocab, deterministic tokens.
     let params = SamplingParams::with_temperature(0.8);
     let prompt = [1usize, 2, 3];
+    let stops: Vec<usize> = Some(9).into_iter().collect();
     let out = tr2
         .model
-        .generate(&prompt, 8, &params, Some(9), &mut Rng::new(7))
+        .generate(&prompt, 8, &params, &stops, &mut Rng::new(7))
         .unwrap();
     assert!(out.iter().all(|&t| t < tr2.model.cfg.vocab_size));
     let again = tr2
         .model
-        .generate(&prompt, 8, &params, Some(9), &mut Rng::new(7))
+        .generate(&prompt, 8, &params, &stops, &mut Rng::new(7))
         .unwrap();
     assert_eq!(
         out, again,

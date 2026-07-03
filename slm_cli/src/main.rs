@@ -225,6 +225,7 @@ fn print_usage() {
          \x20 --max N      --temp F  --gen-seed N\n\
          \x20 --top-k N    --top-p F  --rep F  (sampling knobs; 0/1.0/1.0 = off)\n\
          \x20 --ids \"1 2 3\"  (raw prompt token IDs; required if the file has no tokenizer)\n\
+         \x20 --raw          (disable automatic chat-template formatting for instruct GGUFs)\n\
          \x20 --force        (load even if the memory estimate exceeds available RAM)\n\
          \x20 --resume ckpt.flck  (overlay fine-tuned weights; forces f32 load)\n\
          \x20 NOTE: only F32/F16/Q8_0/Q8_1/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K GGUFs; on CPU\n\
@@ -578,7 +579,7 @@ fn cmd_run_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.positional.is_empty() {
         return Err("usage: train_transformer run-gguf <model.gguf> [prompt] \
                     [--quant int4|int8|f32] [--max N] [--temp F] \
-                    [--top-k N] [--top-p F] [--rep F] [--ids \"1 2 3\"]"
+                    [--top-k N] [--top-p F] [--rep F] [--ids \"1 2 3\"] [--raw]"
             .into());
     }
     let path = &args.positional[0];
@@ -667,17 +668,37 @@ fn cmd_run_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         println!("  applied fine-tuned checkpoint {ckpt}");
     }
 
-    // Build the prompt token IDs (explicit --ids win; else encode the text).
+    // Build the prompt token IDs (explicit --ids win; else encode the text,
+    // auto-wrapping instruct prompts in their chat template unless --raw).
+    let mut fmt = None;
     let prompt_ids: Vec<usize> = if let Some(ids) = args.flags.get("ids") {
         ids.split_whitespace()
             .filter_map(|s| s.parse().ok())
             .collect()
     } else if let Some(t) = &tok {
+        fmt = if args.has("raw") {
+            None
+        } else {
+            ferrum_core::chat_format::detect(
+                g.meta("tokenizer.chat_template").and_then(|v| v.as_str()),
+                g.architecture(),
+                |p| tok.as_ref().and_then(|t| t.token_id(p)).is_some(),
+            )
+        };
         let mut ids = Vec::new();
         if let Some(bos) = t.bos() {
             ids.push(bos);
         }
-        ids.extend(t.encode(&prompt_text));
+        match fmt {
+            Some(f) => {
+                println!("  chat format = {f:?} (pass --raw to disable)");
+                ids.extend(ferrum_core::chat_format::encode_segments(
+                    t,
+                    &ferrum_core::chat_format::render(f, &prompt_text),
+                ));
+            }
+            None => ids.extend(t.encode(&prompt_text)),
+        }
         ids
     } else {
         return Err(
@@ -691,7 +712,19 @@ fn cmd_run_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let max_new: usize = args.get("max", 64);
     let temp: f32 = args.get("temp", 0.8);
     let gen_seed: u64 = args.get("gen-seed", time_seed());
-    let eos = tok.as_ref().and_then(GgufTokenizer::eos);
+    let mut stops: Vec<usize> = tok
+        .as_ref()
+        .and_then(GgufTokenizer::eos)
+        .into_iter()
+        .collect();
+    if let Some(f) = fmt {
+        if let Some(id) = tok
+            .as_ref()
+            .and_then(|t| t.token_id(ferrum_core::chat_format::stop_token(f)))
+        {
+            stops.push(id);
+        }
+    }
     let params = SamplingParams {
         temperature: temp,
         top_k: args.get("top-k", 0usize),
@@ -705,7 +738,7 @@ fn cmd_run_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         prompt_ids.len()
     );
     let t1 = Instant::now();
-    let out_ids = model.generate(&prompt_ids, max_new, &params, eos, &mut rng)?;
+    let out_ids = model.generate(&prompt_ids, max_new, &params, &stops, &mut rng)?;
     let dt = t1.elapsed().as_secs_f32();
 
     println!("\n── output ──");
@@ -919,11 +952,11 @@ fn cmd_finetune_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             prompt
         };
         let params = SamplingParams::with_temperature(args.get("temp", 0.8));
-        let eos = tok.eos();
+        let stops: Vec<usize> = tok.eos().into_iter().collect();
         let mut grng = Rng::new(time_seed());
         let out = tr
             .model
-            .generate(&prompt, args.get("max", 48), &params, eos, &mut grng)?;
+            .generate(&prompt, args.get("max", 48), &params, &stops, &mut grng)?;
         println!("\n── sample ──\n{}\n────────────", tok.decode(&out));
     }
     Ok(())

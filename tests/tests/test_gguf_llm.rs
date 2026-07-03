@@ -259,15 +259,16 @@ fn gguf_run_pipeline_end_to_end() {
 
     // 5. Generate (the CLI's exact call) and decode.
     let params = SamplingParams::with_temperature(0.8);
+    let stops: Vec<usize> = tok.eos().into_iter().collect();
     let out = model
-        .generate(&prompt, 8, &params, tok.eos(), &mut Rng::new(7))
+        .generate(&prompt, 8, &params, &stops, &mut Rng::new(7))
         .unwrap();
     assert!(out.iter().all(|&t| t < model.cfg.vocab_size));
     let _text = tok.decode(&out); // must not panic on any produced ids
 
     // Deterministic for a fixed seed.
     let again = model
-        .generate(&prompt, 8, &params, tok.eos(), &mut Rng::new(7))
+        .generate(&prompt, 8, &params, &stops, &mut Rng::new(7))
         .unwrap();
     assert_eq!(out, again);
 

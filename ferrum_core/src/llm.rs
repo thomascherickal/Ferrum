@@ -513,16 +513,16 @@ impl LlamaModel {
     }
 
     /// Primes the cache with `prompt`, then samples up to `max_new` tokens
-    /// (stopping at `eos` if given) using the full [`SamplingParams`] sampler —
-    /// repetition penalty, temperature, top-k, and top-p (see
-    /// [`sample_with_params`]). Returns the newly generated token IDs
-    /// (excluding the prompt).
+    /// (stopping once a token in `stops` is produced) using the full
+    /// [`SamplingParams`] sampler — repetition penalty, temperature, top-k, and
+    /// top-p (see [`sample_with_params`]). Returns the newly generated token
+    /// IDs (excluding the prompt).
     pub fn generate(
         &self,
         prompt: &[usize],
         max_new: usize,
         params: &SamplingParams,
-        eos: Option<usize>,
+        stops: &[usize],
         rng: &mut Rng,
     ) -> Result<Vec<usize>> {
         if prompt.is_empty() {
@@ -538,7 +538,7 @@ impl LlamaModel {
         for _ in 0..max_new {
             let next = sample_with_params(&logits, params, &recent, rng);
             out.push(next);
-            if Some(next) == eos {
+            if stops.contains(&next) {
                 break;
             }
             recent.push(next);
@@ -844,10 +844,10 @@ mod tests {
         let model = tiny_model();
         let params = SamplingParams::with_temperature(0.8);
         let a = model
-            .generate(&[1, 2, 3], 10, &params, None, &mut Rng::new(7))
+            .generate(&[1, 2, 3], 10, &params, &[], &mut Rng::new(7))
             .unwrap();
         let b = model
-            .generate(&[1, 2, 3], 10, &params, None, &mut Rng::new(7))
+            .generate(&[1, 2, 3], 10, &params, &[], &mut Rng::new(7))
             .unwrap();
         assert_eq!(a, b, "generation must be deterministic for a fixed seed");
         assert_eq!(a.len(), 10);
@@ -856,10 +856,10 @@ mod tests {
         // Greedy with an eos that will be hit stops early (temperature→0 ≈ argmax).
         let greedy = SamplingParams::with_temperature(0.01);
         let first = model
-            .generate(&[1, 2, 3], 1, &greedy, None, &mut Rng::new(1))
+            .generate(&[1, 2, 3], 1, &greedy, &[], &mut Rng::new(1))
             .unwrap()[0];
         let stopped = model
-            .generate(&[1, 2, 3], 10, &greedy, Some(first), &mut Rng::new(1))
+            .generate(&[1, 2, 3], 10, &greedy, &[first], &mut Rng::new(1))
             .unwrap();
         assert_eq!(
             stopped,
@@ -880,10 +880,10 @@ mod tests {
             repetition_penalty: 1.0,
         };
         let a = m
-            .generate(&[1, 2], 8, &params, None, &mut Rng::new(7))
+            .generate(&[1, 2], 8, &params, &[], &mut Rng::new(7))
             .unwrap();
         let b = m
-            .generate(&[1, 2], 8, &params, None, &mut Rng::new(999))
+            .generate(&[1, 2], 8, &params, &[], &mut Rng::new(999))
             .unwrap();
         assert_eq!(a, b);
     }
@@ -940,7 +940,7 @@ mod tests {
     fn generate_rejects_empty_prompt() {
         let model = tiny_model();
         let p = SamplingParams::with_temperature(1.0);
-        assert!(model.generate(&[], 4, &p, None, &mut Rng::new(1)).is_err());
+        assert!(model.generate(&[], 4, &p, &[], &mut Rng::new(1)).is_err());
     }
 
     #[test]

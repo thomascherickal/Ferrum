@@ -699,6 +699,9 @@ pub struct GgufRunParams {
     /// Down-weight already-seen tokens (`1.0` disables).
     #[serde(default = "one_f32")]
     pub rep_penalty: f32,
+    /// Disable automatic chat-template formatting for instruct GGUFs.
+    #[serde(default)]
+    pub raw: bool,
 }
 
 #[derive(Serialize)]
@@ -766,17 +769,33 @@ fn gguf_run_inner(p: GgufRunParams) -> Result<GgufRunResult, String> {
         model = tr.model;
     }
 
+    let mut fmt = None;
     let prompt_ids: Vec<usize> = if let Some(ids) = p.ids.as_ref().filter(|s| !s.trim().is_empty())
     {
         ids.split_whitespace()
             .filter_map(|s| s.parse().ok())
             .collect()
     } else if let Some(t) = &tok {
+        fmt = if p.raw {
+            None
+        } else {
+            ferrum_core::chat_format::detect(
+                g.meta("tokenizer.chat_template").and_then(|v| v.as_str()),
+                g.architecture(),
+                |piece| tok.as_ref().and_then(|t| t.token_id(piece)).is_some(),
+            )
+        };
         let mut v = Vec::new();
         if let Some(bos) = t.bos() {
             v.push(bos);
         }
-        v.extend(t.encode(&p.prompt));
+        match fmt {
+            Some(f) => v.extend(ferrum_core::chat_format::encode_segments(
+                t,
+                &ferrum_core::chat_format::render(f, &p.prompt),
+            )),
+            None => v.extend(t.encode(&p.prompt)),
+        }
         v
     } else {
         return Err("this GGUF has no tokenizer; enter space-separated token IDs instead".into());
@@ -792,10 +811,22 @@ fn gguf_run_inner(p: GgufRunParams) -> Result<GgufRunResult, String> {
         top_p: p.top_p,
         repetition_penalty: p.rep_penalty,
     };
-    let eos = tok.as_ref().and_then(GgufTokenizer::eos);
+    let mut stops: Vec<usize> = tok
+        .as_ref()
+        .and_then(GgufTokenizer::eos)
+        .into_iter()
+        .collect();
+    if let Some(f) = fmt {
+        if let Some(id) = tok
+            .as_ref()
+            .and_then(|t| t.token_id(ferrum_core::chat_format::stop_token(f)))
+        {
+            stops.push(id);
+        }
+    }
     let t0 = std::time::Instant::now();
     let out = model
-        .generate(&prompt_ids, p.max_new, &params, eos, &mut rng)
+        .generate(&prompt_ids, p.max_new, &params, &stops, &mut rng)
         .map_err(|e| format!("generation failed: {e}"))?;
     let seconds = t0.elapsed().as_secs_f32();
 

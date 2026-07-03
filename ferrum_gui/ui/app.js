@@ -539,6 +539,7 @@ $("ggRun").addEventListener("click", async () => {
       ids: ids === "" ? null : ids,
       force: $("ggForce").checked,
       resume: resume === "" ? null : resume,
+      raw: !$("ggChatFmt").checked,
     };
     if (!params.prompt.trim() && !params.ids) throw new Error("Enter a prompt (or token IDs)");
   } catch (e) { setErr("errGguf", String(e)); return; }
