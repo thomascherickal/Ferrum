@@ -85,6 +85,9 @@ impl Args {
             // run-gguf options.
             "quant",
             "max",
+            "top-k",
+            "top-p",
+            "rep",
             "ids",
             // finetune-gguf options.
             "seq",
@@ -220,6 +223,7 @@ fn print_usage() {
          RUN-GGUF options (import & run a llama/qwen2 GGUF checkpoint):\n\
          \x20 --quant int4|int8|f32  (in-memory precision; default int4)\n\
          \x20 --max N      --temp F  --gen-seed N\n\
+         \x20 --top-k N    --top-p F  --rep F  (sampling knobs; 0/1.0/1.0 = off)\n\
          \x20 --ids \"1 2 3\"  (raw prompt token IDs; required if the file has no tokenizer)\n\
          \x20 --force        (load even if the memory estimate exceeds available RAM)\n\
          \x20 --resume ckpt.flck  (overlay fine-tuned weights; forces f32 load)\n\
@@ -573,7 +577,8 @@ fn cmd_run_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     if args.positional.is_empty() {
         return Err("usage: train_transformer run-gguf <model.gguf> [prompt] \
-                    [--quant int4|int8|f32] [--max N] [--temp F] [--ids \"1 2 3\"]"
+                    [--quant int4|int8|f32] [--max N] [--temp F] \
+                    [--top-k N] [--top-p F] [--rep F] [--ids \"1 2 3\"]"
             .into());
     }
     let path = &args.positional[0];
@@ -687,7 +692,12 @@ fn cmd_run_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let temp: f32 = args.get("temp", 0.8);
     let gen_seed: u64 = args.get("gen-seed", time_seed());
     let eos = tok.as_ref().and_then(GgufTokenizer::eos);
-    let params = SamplingParams::with_temperature(temp);
+    let params = SamplingParams {
+        temperature: temp,
+        top_k: args.get("top-k", 0usize),
+        top_p: args.get("top-p", 1.0f32),
+        repetition_penalty: args.get("rep", 1.0f32),
+    };
     let mut rng = Rng::new(gen_seed);
 
     println!(

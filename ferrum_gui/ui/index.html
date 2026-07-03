@@ -284,6 +284,9 @@
         </label>
         <label>Max new tokens <input type="number" id="ggMax" value="64" min="1" /></label>
         <label>Temperature <input type="number" id="ggTemp" value="0.8" step="0.05" min="0.01" /></label>
+        <label>Top-k (0 = off) <input type="number" id="ggTopK" value="0" min="0" step="1" /></label>
+        <label>Top-p (1.0 = off) <input type="number" id="ggTopP" value="1.0" min="0" max="1" step="0.05" /></label>
+        <label>Repetition penalty (1.0 = off) <input type="number" id="ggRep" value="1.0" min="0" step="0.05" /></label>
         <label>Gen seed (blank=random) <input type="number" id="ggSeed" placeholder="random" /></label>
       </div>
       <label>Token IDs (only if the file has no tokenizer)

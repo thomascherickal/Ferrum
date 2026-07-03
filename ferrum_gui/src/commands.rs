@@ -670,6 +670,10 @@ pub async fn gguf_info(path: String) -> Result<GgufInfo, String> {
     .map_err(|e| format!("task error: {e}"))?
 }
 
+fn one_f32() -> f32 {
+    1.0
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GgufRunParams {
@@ -686,6 +690,15 @@ pub struct GgufRunParams {
     /// Optional fine-tune checkpoint (`.flck`) to overlay on the base model.
     /// When set, the model is loaded f32 (a checkpoint holds f32 weights).
     pub resume: Option<String>,
+    /// Keep only the `k` highest-probability tokens (`0` disables).
+    #[serde(default)]
+    pub top_k: usize,
+    /// Nucleus sampling threshold (`1.0` disables).
+    #[serde(default = "one_f32")]
+    pub top_p: f32,
+    /// Down-weight already-seen tokens (`1.0` disables).
+    #[serde(default = "one_f32")]
+    pub rep_penalty: f32,
 }
 
 #[derive(Serialize)]
@@ -709,6 +722,12 @@ pub async fn run_gguf(params: GgufRunParams) -> Result<GgufRunResult, String> {
 fn gguf_run_inner(p: GgufRunParams) -> Result<GgufRunResult, String> {
     if !(p.temp.is_finite() && p.temp > 0.0) {
         return Err("temperature must be a positive number".into());
+    }
+    if !(p.top_p.is_finite() && p.top_p > 0.0 && p.top_p <= 1.0) {
+        return Err("top-p must be a number in (0.0, 1.0]".into());
+    }
+    if !(p.rep_penalty.is_finite() && p.rep_penalty > 0.0) {
+        return Err("repetition penalty must be a positive number".into());
     }
     // A fine-tune checkpoint holds f32 weights, so applying one forces f32.
     let resume = p.resume.as_ref().filter(|s| !s.trim().is_empty()).cloned();
@@ -767,7 +786,12 @@ fn gguf_run_inner(p: GgufRunParams) -> Result<GgufRunResult, String> {
     }
 
     let mut rng = Rng::new(p.gen_seed.unwrap_or_else(time_seed));
-    let params = SamplingParams::with_temperature(p.temp);
+    let params = SamplingParams {
+        temperature: p.temp,
+        top_k: p.top_k,
+        top_p: p.top_p,
+        repetition_penalty: p.rep_penalty,
+    };
     let eos = tok.as_ref().and_then(GgufTokenizer::eos);
     let t0 = std::time::Instant::now();
     let out = model
@@ -1360,6 +1384,17 @@ mod tests {
     fn file_name_extracts_basename() {
         assert_eq!(file_name("/a/b/model.bin"), "model.bin");
         assert_eq!(file_name("model.bin"), "model.bin");
+    }
+
+    // ── GGUF run params (F2: sampling knobs) ─────────────────────────────────
+
+    #[test]
+    fn gguf_run_params_sampling_defaults_off() {
+        let p: GgufRunParams = serde_json::from_str(
+            r#"{"modelPath":"m","prompt":"p","quant":"int4","maxNew":8,"temp":0.8,"force":false}"#,
+        )
+        .unwrap();
+        assert_eq!((p.top_k, p.top_p, p.rep_penalty), (0, 1.0, 1.0));
     }
 
     #[test]

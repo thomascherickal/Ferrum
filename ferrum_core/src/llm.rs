@@ -512,9 +512,11 @@ impl LlamaModel {
         self.lm_head.forward(&normed)
     }
 
-    /// Greedy/temperature generation. Primes the cache with `prompt`, then
-    /// samples up to `max_new` tokens (stopping at `eos` if given). Returns the
-    /// newly generated token IDs (excluding the prompt).
+    /// Primes the cache with `prompt`, then samples up to `max_new` tokens
+    /// (stopping at `eos` if given) using the full [`SamplingParams`] sampler —
+    /// repetition penalty, temperature, top-k, and top-p (see
+    /// [`sample_with_params`]). Returns the newly generated token IDs
+    /// (excluding the prompt).
     pub fn generate(
         &self,
         prompt: &[usize],
@@ -864,6 +866,26 @@ mod tests {
             vec![first],
             "should stop at eos on the first token"
         );
+    }
+
+    #[test]
+    fn generate_topk1_is_greedy_regardless_of_seed() {
+        // top_k = 1 collapses sampling to argmax, so two different seeds must
+        // produce identical output — proof the knob reaches the sampler.
+        let m = tiny_model();
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 1,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+        };
+        let a = m
+            .generate(&[1, 2], 8, &params, None, &mut Rng::new(7))
+            .unwrap();
+        let b = m
+            .generate(&[1, 2], 8, &params, None, &mut Rng::new(999))
+            .unwrap();
+        assert_eq!(a, b);
     }
 
     #[test]
