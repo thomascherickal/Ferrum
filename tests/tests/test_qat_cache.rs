@@ -29,6 +29,7 @@ fn tiny_config() -> TransformerConfig {
         vocab_size: 0, // character-level baseline
         weight_decay: 0.0,
         dropout: 0.0,
+        ..TransformerConfig::default()
     }
 }
 
@@ -329,4 +330,135 @@ fn quantized_save_outputs_stay_close_to_in_memory_model() {
         );
     }
     let _ = std::fs::remove_file(&path);
+}
+
+// ── Training pipeline: stride, token budget, checkpoint/resume, tokenizer reuse ──
+
+/// Optimizer steps recorded in a training checkpoint.
+fn ckpt_steps(path: &std::path::Path) -> u64 {
+    let (net, _) =
+        ferrum_core::TransformerNet::load_checkpoint(&std::fs::read(path).unwrap()).unwrap();
+    net.step_count()
+}
+
+#[test]
+fn stride_sets_steps_per_epoch() {
+    // CORPUS is 135 chars → 135 tokens, T=8: stride 1 has 127 windows (16
+    // steps at batch 8); stride T has (135-9)/8+1 = 16 windows (2 steps).
+    for (stride, expected) in [(1usize, 16u64), (0, 2), (8, 2)] {
+        let ck = temp_model_path(&format!("stride{stride}"));
+        let cfg = TransformerConfig {
+            epochs: 1,
+            window_stride: stride,
+            checkpoint_path: ck.to_str().unwrap().into(),
+            ..tiny_config()
+        };
+        GenerativeSLM::train_transformer_config(CORPUS, &cfg, &mut Rng::new(1), |_, _| {}).unwrap();
+        assert_eq!(ckpt_steps(&ck), expected, "stride {stride}");
+        let _ = std::fs::remove_file(&ck);
+    }
+}
+
+#[test]
+fn token_budget_stops_mid_epoch_and_ignores_epochs() {
+    // 200 tokens / (batch 8 × T 8) = 4 steps (ceil), across epoch boundaries
+    // (2 steps/epoch at stride T) and regardless of `epochs`.
+    let ck = temp_model_path("budget");
+    let mut epochs_seen = 0;
+    let cfg = TransformerConfig {
+        epochs: 1000,
+        max_tokens: 200,
+        checkpoint_path: ck.to_str().unwrap().into(),
+        ..tiny_config()
+    };
+    GenerativeSLM::train_transformer_config(CORPUS, &cfg, &mut Rng::new(2), |_, _| {
+        epochs_seen += 1
+    })
+    .unwrap();
+    assert_eq!(ckpt_steps(&ck), 4);
+    assert_eq!(epochs_seen, 2);
+    let _ = std::fs::remove_file(&ck);
+}
+
+#[test]
+fn resume_continues_from_checkpoint_to_the_budget() {
+    let ck = temp_model_path("resume");
+    let ck_s = ck.to_str().unwrap().to_string();
+    let half = TransformerConfig {
+        max_tokens: 3 * 64, // 3 steps
+        checkpoint_path: ck_s.clone(),
+        checkpoint_every: 1,
+        ..tiny_config()
+    };
+    GenerativeSLM::train_transformer_config(CORPUS, &half, &mut Rng::new(3), |_, _| {}).unwrap();
+    assert_eq!(ckpt_steps(&ck), 3);
+
+    // Resuming with a 7-step budget runs only the remaining 4 steps.
+    let full = TransformerConfig {
+        max_tokens: 7 * 64,
+        resume: true,
+        ..half.clone()
+    };
+    let mut losses = 0;
+    let slm = GenerativeSLM::train_transformer_config(CORPUS, &full, &mut Rng::new(99), |_, _| {
+        losses += 1
+    })
+    .unwrap();
+    assert_eq!(ckpt_steps(&ck), 7);
+    assert_eq!(losses, 2, "4 remaining steps = 2 epochs of 2 steps");
+    assert!(slm.generate("the quic", 5, 0.7, &mut Rng::new(1)).is_ok());
+
+    // A checkpoint from a different vocabulary is refused, not silently used.
+    let bpe = TransformerConfig {
+        vocab_size: 300,
+        ..full
+    };
+    assert!(
+        GenerativeSLM::train_transformer_config(BPE_CORPUS, &bpe, &mut Rng::new(4), |_, _| {})
+            .is_err()
+    );
+    let _ = std::fs::remove_file(&ck);
+}
+
+#[test]
+fn tokenizer_file_is_written_once_then_reused() {
+    let tok = temp_model_path("tok");
+    let cfg = TransformerConfig {
+        epochs: 1,
+        tokenizer_path: tok.to_str().unwrap().into(),
+        ..tiny_bpe_config()
+    };
+    let a = GenerativeSLM::train_transformer_config(BPE_CORPUS, &cfg, &mut Rng::new(5), |_, _| {})
+        .unwrap();
+    let saved = std::fs::read_to_string(&tok).unwrap();
+    assert_eq!(saved, a.meta.tokenizer_state);
+
+    // Second run on different text reuses the saved merges instead of retraining.
+    let b = GenerativeSLM::train_transformer_config(
+        &BPE_CORPUS.to_uppercase(),
+        &cfg,
+        &mut Rng::new(6),
+        |_, _| {},
+    )
+    .unwrap();
+    assert_eq!(b.meta.tokenizer_state, saved);
+    let _ = std::fs::remove_file(&tok);
+}
+
+#[test]
+fn tied_unquantized_cosine_config_trains() {
+    let cfg = TransformerConfig {
+        epochs: 4,
+        qat: false,
+        weight_tying: true,
+        cosine_lr: true,
+        warmup_steps: 2,
+        grad_clip: 1.0,
+        ..tiny_config()
+    };
+    let slm = GenerativeSLM::train_transformer_config(CORPUS, &cfg, &mut Rng::new(7), |_, l| {
+        assert!(l.is_finite())
+    })
+    .unwrap();
+    assert!(slm.generate("the quic", 5, 0.7, &mut Rng::new(1)).is_ok());
 }

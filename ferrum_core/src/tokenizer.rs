@@ -14,7 +14,8 @@
 //! assert_eq!(tok.decode(&ids), "lowest");
 //! ```
 use crate::error::{InferError, Result};
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 
 /// Number of base tokens (one per byte value).
 const BASE_VOCAB: usize = 256;
@@ -120,33 +121,48 @@ impl ByteBpeTokenizer {
             )));
         }
         let mut tok = Self::byte_level();
-        // Pre-tokenized chunks as independent id sequences (no cross-chunk merges).
-        let mut chunks: Vec<Vec<u32>> = pretokenize(corpus)
-            .iter()
-            .map(|c| c.bytes().map(u32::from).collect())
+        // Pre-tokenized chunks never merge across each other, so identical
+        // chunks behave identically: train on each distinct chunk once,
+        // weighted by its frequency.
+        let mut freq: HashMap<&str, i64> = HashMap::new();
+        for c in pretokenize(corpus) {
+            *freq.entry(c).or_insert(0) += 1;
+        }
+        let mut words: Vec<(Vec<u32>, i64)> = freq
+            .into_iter()
+            .map(|(c, f)| (c.bytes().map(u32::from).collect(), f))
             .collect();
         vprintln!(
-            "[tokenizer::train] corpus={} bytes, {} chunks, target vocab={}",
+            "[tokenizer::train] corpus={} bytes, {} distinct chunks, target vocab={}",
             corpus.len(),
-            chunks.len(),
+            words.len(),
             vocab_size
         );
 
-        while tok.vocab.len() < vocab_size {
-            // Count adjacent pairs within each chunk.
-            let mut counts: HashMap<(u32, u32), usize> = HashMap::new();
-            for chunk in &chunks {
-                for w in chunk.windows(2) {
-                    *counts.entry((w[0], w[1])).or_insert(0) += 1;
-                }
+        // Pair counts are computed once, then updated incrementally per merge
+        // (only the words containing the merged pair change), instead of
+        // recounting the whole corpus on every merge.
+        let mut counts: HashMap<(u32, u32), i64> = HashMap::new();
+        let mut where_: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+        for (wi, (ids, f)) in words.iter().enumerate() {
+            for w in ids.windows(2) {
+                *counts.entry((w[0], w[1])).or_insert(0) += f;
+                where_.entry((w[0], w[1])).or_default().push(wi);
             }
-            // Most frequent pair; ties broken by smallest pair so training is
-            // deterministic regardless of HashMap iteration order.
-            let best = counts
-                .iter()
-                .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
-                .map(|(&pair, &count)| (pair, count));
-            let Some((pair, count)) = best else { break };
+        }
+        // Max-heap on (count, smallest pair) with lazy invalidation: an entry is
+        // live only while it still matches `counts`. Ties break to the smallest
+        // pair, so training is deterministic regardless of HashMap order.
+        let mut heap: BinaryHeap<(i64, Reverse<(u32, u32)>)> =
+            counts.iter().map(|(&p, &c)| (c, Reverse(p))).collect();
+
+        while tok.vocab.len() < vocab_size {
+            let Some((count, Reverse(pair))) = heap.pop() else {
+                break;
+            };
+            if counts.get(&pair) != Some(&count) {
+                continue; // stale entry
+            }
             if count < 2 {
                 break;
             }
@@ -166,8 +182,39 @@ impl ByteBpeTokenizer {
             );
             tok.vocab.push(merged);
             tok.merges.push(pair);
-            for chunk in &mut chunks {
-                *chunk = merge_pair(chunk, pair, new_id);
+
+            let mut touched: HashMap<(u32, u32), i64> = HashMap::new();
+            let mut wis = where_.remove(&pair).unwrap_or_default();
+            wis.sort_unstable();
+            wis.dedup();
+            for wi in wis {
+                let (ids, f) = &mut words[wi];
+                if !ids.windows(2).any(|w| (w[0], w[1]) == pair) {
+                    continue; // stale index entry
+                }
+                for w in ids.windows(2) {
+                    *touched.entry((w[0], w[1])).or_insert(0) -= *f;
+                }
+                *ids = merge_pair(ids, pair, new_id);
+                for w in ids.windows(2) {
+                    *touched.entry((w[0], w[1])).or_insert(0) += *f;
+                    // Only pairs involving the new token are new to this word.
+                    if w[0] == new_id || w[1] == new_id {
+                        where_.entry((w[0], w[1])).or_default().push(wi);
+                    }
+                }
+            }
+            for (p, delta) in touched {
+                if delta == 0 {
+                    continue;
+                }
+                let c = counts.entry(p).or_insert(0);
+                *c += delta;
+                if *c > 0 {
+                    heap.push((*c, Reverse(p)));
+                } else {
+                    counts.remove(&p);
+                }
             }
         }
         tok.rebuild_ranks();
@@ -427,6 +474,52 @@ mod tests {
     #[test]
     fn vocab_below_256_errors() {
         assert!(ByteBpeTokenizer::train(CORPUS, 100).is_err());
+    }
+
+    /// The pre-incremental trainer (full recount per merge), kept as an oracle.
+    fn naive_merges(corpus: &str, vocab_size: usize) -> Vec<(u32, u32)> {
+        let mut chunks: Vec<Vec<u32>> = pretokenize(corpus)
+            .iter()
+            .map(|c| c.bytes().map(u32::from).collect())
+            .collect();
+        let mut merges = Vec::new();
+        while BASE_VOCAB + merges.len() < vocab_size {
+            let mut counts: HashMap<(u32, u32), usize> = HashMap::new();
+            for chunk in &chunks {
+                for w in chunk.windows(2) {
+                    *counts.entry((w[0], w[1])).or_insert(0) += 1;
+                }
+            }
+            let Some((pair, count)) = counts
+                .iter()
+                .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+                .map(|(&p, &c)| (p, c))
+            else {
+                break;
+            };
+            if count < 2 {
+                break;
+            }
+            let new_id = (BASE_VOCAB + merges.len()) as u32;
+            merges.push(pair);
+            for chunk in &mut chunks {
+                *chunk = merge_pair(chunk, pair, new_id);
+            }
+        }
+        merges
+    }
+
+    #[test]
+    fn incremental_training_matches_naive_oracle() {
+        // Repeats, overlapping runs ("aaaa"), ties, and multibyte text.
+        let corpus = format!(
+            "{CORPUS} aaaa aaa abab ababab mississippi banana bandana 🌸🌸 мир мира \n\t {}",
+            "the cat sat on the mat with the hat ".repeat(7)
+        );
+        for vocab in [256, 270, 300, 400] {
+            let fast = ByteBpeTokenizer::train(&corpus, vocab).unwrap();
+            assert_eq!(fast.merges, naive_merges(&corpus, vocab), "vocab {vocab}");
+        }
     }
 
     #[test]

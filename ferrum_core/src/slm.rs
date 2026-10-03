@@ -9,7 +9,7 @@ use crate::rng::Rng;
 use crate::tensor::Tensor;
 use crate::tokenizer::ByteBpeTokenizer;
 use crate::train::{train_epoch, Net};
-use crate::train_transformer::{train_transformer_epoch_threaded, TransformerNet};
+use crate::train_transformer::{train_transformer_steps, TransformerNet};
 use crate::verbose;
 use std::collections::HashSet;
 
@@ -45,6 +45,37 @@ pub struct TransformerConfig {
     /// FFN-hidden dropout probability used during training (T7), in `[0, 1)`.
     /// `0.0` disables it; inference is always dropout-free.
     pub dropout: f32,
+    /// Tokens between training-window starts. `0` = `context_len`
+    /// (non-overlapping: one epoch sees each token once). `1` = the legacy
+    /// fully-overlapping window, where an epoch costs ≈`context_len`× more.
+    pub window_stride: usize,
+    /// Training budget in tokens (`steps × batch_size × context_len`). `0`
+    /// trains for `epochs`; otherwise `epochs` is ignored and training stops
+    /// once the budget is spent, mid-epoch if need be.
+    pub max_tokens: u64,
+    /// Int8 quantization-aware training.
+    pub qat: bool,
+    /// Global-norm gradient clipping threshold; `0.0` disables it.
+    pub grad_clip: f32,
+    /// Linear warmup then cosine decay to 0 over the whole run (`false` =
+    /// fixed `lr`).
+    pub cosine_lr: bool,
+    /// Warmup steps for `cosine_lr`.
+    pub warmup_steps: u64,
+    /// Tie the LM head to the token embedding (saves `vocab × embed` params).
+    pub weight_tying: bool,
+    /// BPE tokenizer file: loaded when it exists, otherwise trained and
+    /// written there, so later runs skip tokenizer training. Empty = train in
+    /// memory every run. Ignored for character-level (`vocab_size == 0`).
+    pub tokenizer_path: String,
+    /// Training-checkpoint file (weights + Adam state + RNG). Empty disables.
+    pub checkpoint_path: String,
+    /// Checkpoint every this many optimizer steps (and always at the end);
+    /// `0` = only at the end.
+    pub checkpoint_every: u64,
+    /// Resume from `checkpoint_path` when it exists. The checkpoint fixes the
+    /// architecture; its vocab and context must match this run's.
+    pub resume: bool,
 }
 
 impl Default for TransformerConfig {
@@ -61,6 +92,17 @@ impl Default for TransformerConfig {
             vocab_size: 512,
             weight_decay: 0.0,
             dropout: 0.0,
+            window_stride: 0,
+            max_tokens: 0,
+            qat: true,
+            grad_clip: 0.0,
+            cosine_lr: false,
+            warmup_steps: 0,
+            weight_tying: false,
+            tokenizer_path: String::new(),
+            checkpoint_path: String::new(),
+            checkpoint_every: 0,
+            resume: false,
         }
     }
 }
@@ -463,8 +505,7 @@ impl GenerativeSLM {
         F: FnMut(usize, f32),
     {
         // `threads = 1` is the serial path, bit-for-bit identical to before.
-        Self::train_transformer_inner(
-            corpus,
+        let cfg = legacy_config(
             context_len,
             embed_dim,
             num_heads,
@@ -474,12 +515,8 @@ impl GenerativeSLM {
             lr,
             batch_size,
             vocab_size,
-            0.0,
-            0.0,
-            1,
-            rng,
-            progress_callback,
-        )
+        );
+        Self::train_transformer_inner(corpus, &cfg, 1, rng, progress_callback)
     }
 
     /// Data-parallel [`GenerativeSLM::train_transformer_with_callback`]:
@@ -515,8 +552,7 @@ impl GenerativeSLM {
         } else {
             threads
         };
-        Self::train_transformer_inner(
-            corpus,
+        let cfg = legacy_config(
             context_len,
             embed_dim,
             num_heads,
@@ -526,29 +562,14 @@ impl GenerativeSLM {
             lr,
             batch_size,
             vocab_size,
-            0.0,
-            0.0,
-            threads,
-            rng,
-            progress_callback,
-        )
+        );
+        Self::train_transformer_inner(corpus, &cfg, threads, rng, progress_callback)
     }
 
     /// Shared implementation behind the serial and threaded transformer trainers.
-    #[allow(clippy::too_many_arguments)]
     fn train_transformer_inner<F>(
         corpus: &str,
-        context_len: usize,
-        embed_dim: usize,
-        num_heads: usize,
-        num_blocks: usize,
-        hidden_dim: usize,
-        epochs: usize,
-        lr: f32,
-        batch_size: usize,
-        vocab_size: usize,
-        weight_decay: f32,
-        dropout: f32,
+        cfg: &TransformerConfig,
         threads: usize,
         rng: &mut Rng,
         mut progress_callback: F,
@@ -556,52 +577,23 @@ impl GenerativeSLM {
     where
         F: FnMut(usize, f32),
     {
-        let tc = tokenize_for_lm(corpus, context_len, vocab_size)?;
-        let model_vocab = tc.vocab_size;
-        vprintln!("[slm::train_transformer] corpus={} chars, vocab={}, bpe={}, ctx={}, dim={}, heads={}, blocks={}, hidden={}, threads={}",
-            tc.tokens.len(), model_vocab, !tc.tokenizer_state.is_empty(),
-            context_len, embed_dim, num_heads, num_blocks, hidden_dim, threads);
-
-        let mut net = TransformerNet::new(
-            model_vocab,
-            context_len,
-            embed_dim,
-            num_heads,
-            hidden_dim,
-            num_blocks,
-            rng,
-        )?;
-        net.set_qat(true);
-        net.set_weight_decay(weight_decay);
-        net.set_dropout(dropout);
-        vprintln!("[slm::train_transformer] {} params, Adam lr={}, wd={}, dropout={}, QAT=int8, threads={}",
-            net.num_params(), lr, weight_decay, dropout, threads);
-
-        let adam = Adam::new(lr);
-        for ep in 1..=epochs {
-            let loss = train_transformer_epoch_threaded(
-                &mut net, &tc.tokens, batch_size, &adam, rng, threads,
-            )?;
-            vprintln!(
-                "[slm::train_transformer] epoch {}/{}: loss={:.6}",
-                ep,
-                epochs,
-                loss
-            );
+        let tc = tokenize_for_lm_cfg(corpus, cfg)?;
+        vprintln!("[slm::train_transformer] corpus={} tokens, vocab={}, bpe={}, ctx={}, dim={}, heads={}, blocks={}, hidden={}, threads={}",
+            tc.tokens.len(), tc.vocab_size, !tc.tokenizer_state.is_empty(),
+            cfg.context_len, cfg.embed_dim, cfg.num_heads, cfg.num_blocks, cfg.hidden_dim, threads);
+        let mut net = prepare_net(cfg, tc.vocab_size, rng)?;
+        run_training(&mut net, &tc.tokens, cfg, threads, rng, |_, ep, loss| {
             progress_callback(ep, loss);
-        }
-
-        Self::build_transformer_slm(&net, &tc, context_len)
+            Ok(true)
+        })?;
+        Self::build_transformer_slm(&net, &tc)
     }
 
     /// Construct an inference [`GenerativeSLM`] from a trained transformer net
     /// and its tokenization (shared by the plain and validation-aware trainers).
-    fn build_transformer_slm(
-        net: &TransformerNet,
-        tc: &LmTokens,
-        context_len: usize,
-    ) -> Result<Self> {
+    fn build_transformer_slm(net: &TransformerNet, tc: &LmTokens) -> Result<Self> {
         let model_vocab = tc.vocab_size;
+        let context_len = net.context_len();
         let model = net.to_inference()?;
         let meta = ModelMetadata {
             dataset_name: "GenerativeSLM Transformer".into(),
@@ -792,23 +784,7 @@ impl GenerativeSLM {
     where
         F: FnMut(usize, f32),
     {
-        Self::train_transformer_inner(
-            corpus,
-            cfg.context_len,
-            cfg.embed_dim,
-            cfg.num_heads,
-            cfg.num_blocks,
-            cfg.hidden_dim,
-            cfg.epochs,
-            cfg.lr,
-            cfg.batch_size,
-            cfg.vocab_size,
-            cfg.weight_decay,
-            cfg.dropout,
-            1,
-            rng,
-            progress_callback,
-        )
+        Self::train_transformer_inner(corpus, cfg, 1, rng, progress_callback)
     }
 
     /// Data-parallel [`GenerativeSLM::train_transformer_config`]: trains with
@@ -830,23 +806,7 @@ impl GenerativeSLM {
         } else {
             threads
         };
-        Self::train_transformer_inner(
-            corpus,
-            cfg.context_len,
-            cfg.embed_dim,
-            cfg.num_heads,
-            cfg.num_blocks,
-            cfg.hidden_dim,
-            cfg.epochs,
-            cfg.lr,
-            cfg.batch_size,
-            cfg.vocab_size,
-            cfg.weight_decay,
-            cfg.dropout,
-            threads,
-            rng,
-            progress_callback,
-        )
+        Self::train_transformer_inner(corpus, cfg, threads, rng, progress_callback)
     }
 
     /// Train a transformer SLM with an internal validation split, early stopping
@@ -895,69 +855,54 @@ impl GenerativeSLM {
         let train_text: String = chars[..split].iter().collect();
         let val_text: String = chars[split..].iter().collect();
 
-        let tc = tokenize_for_lm(&train_text, cfg.context_len, cfg.vocab_size)?;
-        let model_vocab = tc.vocab_size;
+        let tc = tokenize_for_lm_cfg(&train_text, cfg)?;
         vprintln!(
             "[slm::train_validated] train={} chars, val={} chars, vocab={}, patience={}",
             train_text.chars().count(),
             val_text.chars().count(),
-            model_vocab,
+            tc.vocab_size,
             val.patience
         );
 
-        let mut net = TransformerNet::new(
-            model_vocab,
-            cfg.context_len,
-            cfg.embed_dim,
-            cfg.num_heads,
-            cfg.hidden_dim,
-            cfg.num_blocks,
-            rng,
-        )?;
-        net.set_qat(true);
-        net.set_weight_decay(cfg.weight_decay);
-        net.set_dropout(cfg.dropout);
-        let adam = Adam::new(cfg.lr);
-
+        let mut net = prepare_net(cfg, tc.vocab_size, rng)?;
         let mut best: Option<Self> = None;
         let mut best_ce = f32::INFINITY;
         let mut stale = 0usize;
 
-        for ep in 1..=cfg.epochs {
-            let train_loss = train_transformer_epoch_threaded(
-                &mut net,
-                &tc.tokens,
-                cfg.batch_size,
-                &adam,
-                rng,
-                threads,
-            )?;
+        run_training(
+            &mut net,
+            &tc.tokens,
+            cfg,
+            threads,
+            rng,
+            |net, ep, train_loss| {
+                // Score the in-progress model on the held-out split.
+                let candidate = Self::build_transformer_slm(net, &tc)?;
+                let eval = candidate.evaluate(&val_text)?;
 
-            // Score the in-progress model on the held-out split.
-            let candidate = Self::build_transformer_slm(&net, &tc, cfg.context_len)?;
-            let eval = candidate.evaluate(&val_text)?;
+                let is_best = eval.cross_entropy < best_ce;
+                if is_best {
+                    best_ce = eval.cross_entropy;
+                    best = Some(candidate);
+                    stale = 0;
+                } else {
+                    stale += 1;
+                }
 
-            let is_best = eval.cross_entropy < best_ce;
-            if is_best {
-                best_ce = eval.cross_entropy;
-                best = Some(candidate);
-                stale = 0;
-            } else {
-                stale += 1;
-            }
+                progress_callback(&ValidationProgress {
+                    epoch: ep,
+                    train_loss,
+                    val: eval,
+                    is_best,
+                });
 
-            progress_callback(&ValidationProgress {
-                epoch: ep,
-                train_loss,
-                val: eval,
-                is_best,
-            });
-
-            if val.patience > 0 && stale >= val.patience {
-                vprintln!("[slm::train_validated] early stop at epoch {ep} (no val improvement for {} epochs)", stale);
-                break;
-            }
-        }
+                if val.patience > 0 && stale >= val.patience {
+                    vprintln!("[slm::train_validated] early stop at epoch {ep} (no val improvement for {} epochs)", stale);
+                    return Ok(false);
+                }
+                Ok(true)
+            },
+        )?;
 
         // `best` is always set: epoch 1 improves on +inf.
         best.ok_or_else(|| InferError::DimMismatch("training ran zero epochs".into()))
@@ -1813,6 +1758,197 @@ struct LmTokens {
     tokenizer_state: String,
 }
 
+/// [`TransformerConfig`] for the positional (legacy) training API: stride 1,
+/// so those entry points keep their original per-epoch semantics.
+#[allow(clippy::too_many_arguments)]
+fn legacy_config(
+    context_len: usize,
+    embed_dim: usize,
+    num_heads: usize,
+    num_blocks: usize,
+    hidden_dim: usize,
+    epochs: usize,
+    lr: f32,
+    batch_size: usize,
+    vocab_size: usize,
+) -> TransformerConfig {
+    TransformerConfig {
+        context_len,
+        embed_dim,
+        num_heads,
+        num_blocks,
+        hidden_dim,
+        epochs,
+        lr,
+        batch_size,
+        vocab_size,
+        window_stride: 1,
+        ..TransformerConfig::default()
+    }
+}
+
+/// [`tokenize_for_lm`], reusing (or creating) `cfg.tokenizer_path` for BPE.
+fn tokenize_for_lm_cfg(corpus: &str, cfg: &TransformerConfig) -> Result<LmTokens> {
+    let path = std::path::Path::new(&cfg.tokenizer_path);
+    if cfg.vocab_size == 0 || cfg.tokenizer_path.is_empty() {
+        return tokenize_for_lm(corpus, cfg.context_len, cfg.vocab_size);
+    }
+    let tok = if path.exists() {
+        vprintln!("[slm::tokenize] reusing tokenizer {}", path.display());
+        ByteBpeTokenizer::from_state(&std::fs::read_to_string(path)?)?
+    } else {
+        let tok = ByteBpeTokenizer::train(corpus, cfg.vocab_size)?;
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, tok.encode_state())?;
+        tok
+    };
+    lm_tokens_from_bpe(&tok, corpus, cfg.context_len)
+}
+
+/// A fresh (or checkpoint-resumed) training net configured from `cfg`.
+fn prepare_net(cfg: &TransformerConfig, vocab: usize, rng: &mut Rng) -> Result<TransformerNet> {
+    let ckpt = std::path::Path::new(&cfg.checkpoint_path);
+    let mut net = if cfg.resume && !cfg.checkpoint_path.is_empty() && ckpt.exists() {
+        let (net, ckpt_rng) = TransformerNet::load_checkpoint(&std::fs::read(ckpt)?)?;
+        if net.vocab_size() != vocab || net.context_len() != cfg.context_len {
+            return Err(InferError::DimMismatch(format!(
+                "checkpoint has vocab {} / context {}, this run needs vocab {vocab} / context {}",
+                net.vocab_size(),
+                net.context_len(),
+                cfg.context_len
+            )));
+        }
+        *rng = ckpt_rng;
+        vprintln!(
+            "[slm::train] resumed {} at step {}",
+            ckpt.display(),
+            net.step_count()
+        );
+        net
+    } else {
+        TransformerNet::new(
+            vocab,
+            cfg.context_len,
+            cfg.embed_dim,
+            cfg.num_heads,
+            cfg.hidden_dim,
+            cfg.num_blocks,
+            rng,
+        )?
+    };
+    net.set_qat(cfg.qat);
+    net.set_weight_decay(cfg.weight_decay);
+    net.set_dropout(cfg.dropout);
+    net.set_weight_tying(cfg.weight_tying);
+    net.set_grad_clip((cfg.grad_clip > 0.0).then_some(cfg.grad_clip));
+    net.set_window_stride(if cfg.window_stride == 0 {
+        cfg.context_len
+    } else {
+        cfg.window_stride
+    });
+    vprintln!(
+        "[slm::train] {} params, lr={}, wd={}, dropout={}, qat={}, stride={}, tied={}",
+        net.num_params(),
+        cfg.lr,
+        cfg.weight_decay,
+        cfg.dropout,
+        cfg.qat,
+        net.window_stride(),
+        cfg.weight_tying
+    );
+    Ok(net)
+}
+
+/// Write a training checkpoint atomically (temp file + rename), so a crash
+/// mid-write never leaves a truncated checkpoint behind.
+fn write_checkpoint(path: &str, net: &TransformerNet, rng: &Rng) -> Result<()> {
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, net.save_checkpoint(rng))?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// The training loop shared by every config-driven trainer: runs `cfg.epochs`
+/// epochs, or until `cfg.max_tokens` is spent, checkpointing as configured.
+/// `on_epoch(net, epoch, mean_loss)` runs after each (possibly partial) epoch
+/// and returns `false` to stop early.
+fn run_training<F>(
+    net: &mut TransformerNet,
+    tokens: &[usize],
+    cfg: &TransformerConfig,
+    threads: usize,
+    rng: &mut Rng,
+    mut on_epoch: F,
+) -> Result<()>
+where
+    F: FnMut(&TransformerNet, usize, f32) -> Result<bool>,
+{
+    let t = net.context_len();
+    let batch = cfg.batch_size.max(1);
+    let windows = tokens.len().saturating_sub(t + 1) / net.window_stride() + 1;
+    let steps_per_epoch = windows.div_ceil(batch).max(1) as u64;
+    let budgeted = cfg.max_tokens > 0;
+    let total_steps = if budgeted {
+        cfg.max_tokens.div_ceil((batch * t) as u64)
+    } else {
+        cfg.epochs as u64 * steps_per_epoch
+    };
+    if cfg.cosine_lr {
+        net.set_lr_schedule(Some(crate::optim::LrSchedule::warmup_cosine(
+            cfg.lr,
+            cfg.warmup_steps,
+            total_steps,
+        )));
+    }
+    let adam = Adam::new(cfg.lr);
+    let ckpt = &cfg.checkpoint_path;
+    let every = cfg.checkpoint_every;
+    let mut on_step = |n: &TransformerNet, r: &Rng| -> Result<()> {
+        if !ckpt.is_empty() && every > 0 && n.step_count().is_multiple_of(every) {
+            write_checkpoint(ckpt, n, r)?;
+        }
+        Ok(())
+    };
+    // ponytail: a resumed run restarts its partially-done epoch with a fresh
+    // shuffle; exact mid-epoch replay would need the permutation in the checkpoint.
+    let mut ep = (net.step_count() / steps_per_epoch) as usize;
+    loop {
+        let remaining = total_steps.saturating_sub(net.step_count());
+        if (budgeted && remaining == 0) || (!budgeted && ep >= cfg.epochs) {
+            break;
+        }
+        ep += 1;
+        let max_steps = if budgeted {
+            remaining as usize
+        } else {
+            usize::MAX
+        };
+        let loss = train_transformer_steps(
+            net,
+            tokens,
+            batch,
+            &adam,
+            rng,
+            threads,
+            max_steps,
+            &mut on_step,
+        )?;
+        vprintln!(
+            "[slm::train] epoch {ep}: step {}/{total_steps}, loss={loss:.6}",
+            net.step_count()
+        );
+        if !on_epoch(net, ep, loss)? {
+            break;
+        }
+    }
+    if !ckpt.is_empty() {
+        write_checkpoint(ckpt, net, rng)?;
+    }
+    Ok(())
+}
+
 /// Tokenize `corpus` for the transformer / embedded language-model paths.
 ///
 /// `vocab_size == 0` selects character-level tokenization (the sorted corpus
@@ -1833,6 +1969,14 @@ fn tokenize_for_lm(corpus: &str, context_len: usize, vocab_size: usize) -> Resul
         });
     }
     let tok = ByteBpeTokenizer::train(corpus, vocab_size)?;
+    lm_tokens_from_bpe(&tok, corpus, context_len)
+}
+
+fn lm_tokens_from_bpe(
+    tok: &ByteBpeTokenizer,
+    corpus: &str,
+    context_len: usize,
+) -> Result<LmTokens> {
     let tokens = tok.encode(corpus);
     if tokens.len() < context_len + 1 {
         return Err(InferError::DimMismatch(
@@ -1840,8 +1984,7 @@ fn tokenize_for_lm(corpus: &str, context_len: usize, vocab_size: usize) -> Resul
         ));
     }
     vprintln!(
-        "[slm::tokenize_for_lm] BPE: target vocab={}, actual vocab={}, {} tokens",
-        vocab_size,
+        "[slm::tokenize_for_lm] BPE: vocab={}, {} tokens",
         tok.vocab_size(),
         tokens.len()
     );
@@ -2439,6 +2582,7 @@ mod tests {
             vocab_size: 0,
             weight_decay: 0.0,
             dropout: 0.0,
+            ..TransformerConfig::default()
         }
     }
 

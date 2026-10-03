@@ -10,6 +10,7 @@ use crate::AppState;
 use ferrum_core::{
     clean_corpus, corpus_stats, validate_for_training, Adam, CleanOptions, GenerativeSLM, Gguf,
     GgufTokenizer, LlamaTrainer, LrSchedule, QKind, Rng, SamplingParams, TaskType,
+    TransformerConfig, ValidationConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read};
@@ -192,6 +193,43 @@ pub struct TrainParams {
     pub seed: u64,
     pub threads: usize,
     pub verbose: bool,
+    /// Transformer pipeline options (see [`TransformerConfig`]); absent fields
+    /// take the config defaults.
+    #[serde(default)]
+    pub window_stride: usize,
+    #[serde(default)]
+    pub max_tokens: u64,
+    #[serde(default)]
+    pub weight_decay: f32,
+    #[serde(default)]
+    pub dropout: f32,
+    #[serde(default)]
+    pub grad_clip: f32,
+    #[serde(default)]
+    pub cosine_lr: bool,
+    #[serde(default)]
+    pub warmup_steps: u64,
+    #[serde(default)]
+    pub weight_tying: bool,
+    #[serde(default = "default_true")]
+    pub qat: bool,
+    #[serde(default)]
+    pub tokenizer_path: String,
+    #[serde(default)]
+    pub checkpoint_path: String,
+    #[serde(default)]
+    pub checkpoint_every: u64,
+    #[serde(default)]
+    pub resume: bool,
+    /// Held-out validation fraction (`0` = off); best epoch is kept.
+    #[serde(default)]
+    pub val_fraction: f32,
+    #[serde(default)]
+    pub patience: usize,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Serialize, Clone)]
@@ -225,7 +263,7 @@ fn train_inner(app: AppHandle, p: TrainParams) -> Result<TrainResult, String> {
     if p.context_len == 0 {
         return Err("context length must be ≥ 1".into());
     }
-    if p.epochs == 0 {
+    if p.epochs == 0 && p.max_tokens == 0 {
         return Err("epochs must be ≥ 1".into());
     }
     if p.batch_size == 0 {
@@ -251,7 +289,8 @@ fn train_inner(app: AppHandle, p: TrainParams) -> Result<TrainResult, String> {
     let last_loss = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let last_cb = last_loss.clone();
     let app_cb = app.clone();
-    let total = p.epochs;
+    // A token budget has no known epoch count: `total` is null then.
+    let total = (p.max_tokens == 0).then_some(p.epochs);
     let progress = move |epoch: usize, loss: f32| {
         last_cb.store(loss.to_bits(), std::sync::atomic::Ordering::Relaxed);
         let _ = app_cb.emit(
@@ -280,21 +319,48 @@ fn train_inner(app: AppHandle, p: TrainParams) -> Result<TrainResult, String> {
                 ferrum_core::set_verbose(false);
                 return Err("vocab must be 0 (character-level) or ≥ 256 (byte-level BPE)".into());
             }
-            GenerativeSLM::train_transformer_threaded_with_callback(
-                &corpus,
-                p.context_len,
-                p.embed_dim,
-                p.num_heads,
-                p.num_blocks,
-                p.hidden_dim,
-                p.epochs,
-                p.lr,
-                p.batch_size,
-                p.vocab_size,
-                p.threads,
-                &mut rng,
-                progress,
-            )
+            let cfg = TransformerConfig {
+                context_len: p.context_len,
+                embed_dim: p.embed_dim,
+                num_heads: p.num_heads,
+                num_blocks: p.num_blocks,
+                hidden_dim: p.hidden_dim,
+                epochs: p.epochs,
+                lr: p.lr,
+                batch_size: p.batch_size,
+                vocab_size: p.vocab_size,
+                weight_decay: p.weight_decay,
+                dropout: p.dropout,
+                window_stride: p.window_stride,
+                max_tokens: p.max_tokens,
+                qat: p.qat,
+                grad_clip: p.grad_clip,
+                cosine_lr: p.cosine_lr,
+                warmup_steps: p.warmup_steps,
+                weight_tying: p.weight_tying,
+                tokenizer_path: p.tokenizer_path.trim().to_string(),
+                checkpoint_path: p.checkpoint_path.trim().to_string(),
+                checkpoint_every: p.checkpoint_every,
+                resume: p.resume,
+            };
+            if p.val_fraction > 0.0 {
+                let val = ValidationConfig {
+                    val_fraction: p.val_fraction,
+                    patience: p.patience,
+                };
+                GenerativeSLM::train_transformer_config_validated(
+                    &corpus,
+                    &cfg,
+                    p.threads,
+                    &val,
+                    &mut rng,
+                    |v| progress(v.epoch, v.train_loss),
+                )
+            } else {
+                GenerativeSLM::train_transformer_config_threaded(
+                    &corpus, &cfg, p.threads, &mut rng, progress,
+                )
+            }
         }
         "embedded" => {
             if p.vocab_size != 0 && p.vocab_size < 256 {

@@ -313,7 +313,24 @@ $("trStart").addEventListener("click", async () => {
       seed: Math.max(0, int("trSeed") || 0),
       threads: Math.max(0, int("trThreads") || 0),
       verbose: $("trVerbose").checked,
+      windowStride: Math.max(0, int("trStride") || 0),
+      maxTokens: Math.max(0, Math.floor(Number($("trTokens").value) || 0)),
+      weightDecay: Math.max(0, num("trWd") || 0),
+      dropout: Math.max(0, num("trDropout") || 0),
+      gradClip: Math.max(0, num("trClip") || 0),
+      warmupSteps: Math.max(0, int("trWarmup") || 0),
+      cosineLr: $("trCosine").checked,
+      weightTying: $("trTie").checked,
+      qat: $("trQat").checked,
+      tokenizerPath: $("trTokenizer").value.trim(),
+      checkpointPath: $("trCkpt").value.trim(),
+      checkpointEvery: Math.max(0, int("trCkptEvery") || 0),
+      resume: $("trResume").checked,
+      valFraction: Math.max(0, num("trVal") || 0),
+      patience: Math.max(0, int("trPatience") || 0),
     };
+    if (params.resume && !params.checkpointPath)
+      throw new Error("Resume needs a checkpoint file");
     // Client-side guards mirroring the backend, for instant feedback.
     if (method === "transformer") {
       if (params.embedDim % params.numHeads !== 0)
@@ -845,9 +862,9 @@ async function wireEvents() {
   await listen("term-output", (e) => termLine(e.payload.line, e.payload.stream === "stderr" ? "stderr" : ""));
   await listen("train-progress", (e) => {
     const p = e.payload;
-    const pct = Math.round((p.epoch / p.total) * 100);
-    $("trBar").style.width = pct + "%";
-    $("trStatus").textContent = `epoch ${p.epoch}/${p.total} — loss ${p.loss.toFixed(6)}`;
+    // total is null under a token budget (epoch count unknown up front).
+    if (p.total) $("trBar").style.width = Math.round((p.epoch / p.total) * 100) + "%";
+    $("trStatus").textContent = `epoch ${p.epoch}${p.total ? "/" + p.total : ""} — loss ${p.loss.toFixed(6)}`;
     lossHistory.push(p.loss);
     if (lossHistory.length > 1000) lossHistory.shift();
     drawChart();

@@ -567,6 +567,11 @@ pub struct TransformerNet {
     /// FFN-hidden dropout probability used during training forward passes (T7).
     /// `0.0` (default) disables it; inference is always dropout-free.
     dropout: f32,
+    /// Distance in tokens between consecutive training-window starts. `1`
+    /// (default) is the legacy fully-overlapping sliding window, where one epoch
+    /// trains on every token about `context_len` times; `context_len` gives
+    /// non-overlapping windows, so one epoch sees each token once.
+    window_stride: usize,
 }
 
 impl TransformerNet {
@@ -613,6 +618,7 @@ impl TransformerNet {
             tie_weights: false,
             weight_decay: 0.0,
             dropout: 0.0,
+            window_stride: 1,
         })
     }
 
@@ -682,6 +688,43 @@ impl TransformerNet {
     }
     pub fn dropout(&self) -> f32 {
         self.dropout
+    }
+
+    /// Set the training-window stride (clamped to `1..=context_len`); see the
+    /// field docs. Larger strides make an epoch proportionally cheaper.
+    pub fn set_window_stride(&mut self, stride: usize) {
+        self.window_stride = stride.clamp(1, self.context_len);
+    }
+    pub fn window_stride(&self) -> usize {
+        self.window_stride
+    }
+
+    /// Training-window start positions for one epoch over `n_tokens`, in a
+    /// fresh random order. With stride > 1 the grid gets a random phase each
+    /// epoch, so window boundaries differ across epochs. Stride 1 draws exactly
+    /// as before (one shuffle), keeping existing runs reproducible.
+    fn epoch_window_starts(&self, n_tokens: usize, rng: &mut Rng) -> Result<Vec<usize>> {
+        let t = self.context_len;
+        if n_tokens < t + 1 {
+            return Err(InferError::DimMismatch(format!(
+                "need at least context_len+1 = {} tokens, got {}",
+                t + 1,
+                n_tokens
+            )));
+        }
+        let last = n_tokens - t - 1; // largest valid start
+        let s = self.window_stride;
+        let phase = if s > 1 {
+            (rng.next_u64() % s as u64) as usize % (last + 1)
+        } else {
+            0
+        };
+        let count = (last - phase) / s + 1;
+        Ok(rng
+            .shuffled_indices(count)
+            .into_iter()
+            .map(|i| phase + i * s)
+            .collect())
     }
 
     /// Enable or disable weight tying between the token embedding and the LM
@@ -1343,21 +1386,64 @@ pub fn train_transformer_epoch(
     adam: &Adam,
     rng: &mut Rng,
 ) -> Result<f32> {
+    train_transformer_steps(
+        net,
+        tokens,
+        batch_size,
+        adam,
+        rng,
+        1,
+        usize::MAX,
+        &mut |_, _| Ok(()),
+    )
+}
+
+/// Callback run after every optimizer step of [`train_transformer_steps`],
+/// with the updated net and the RNG (e.g. to write a checkpoint).
+pub type StepHook<'a> = dyn FnMut(&TransformerNet, &Rng) -> Result<()> + 'a;
+
+/// One epoch (see [`train_transformer_epoch_threaded`]) that stops after at
+/// most `max_steps` optimizer steps and calls `on_step` after each one, so a
+/// driver can enforce a token/step budget mid-epoch and checkpoint as it goes.
+/// Returns the mean loss over the steps actually run.
+#[allow(clippy::too_many_arguments)]
+pub fn train_transformer_steps(
+    net: &mut TransformerNet,
+    tokens: &[usize],
+    batch_size: usize,
+    adam: &Adam,
+    rng: &mut Rng,
+    threads: usize,
+    max_steps: usize,
+    on_step: &mut StepHook,
+) -> Result<f32> {
+    // One shard (or a single-sequence batch, or wasm32) is the serial path.
+    #[cfg(not(target_arch = "wasm32"))]
+    if threads.max(1).min(batch_size.max(1)) > 1 {
+        return epoch_sharded(
+            net, tokens, batch_size, adam, rng, threads, max_steps, on_step,
+        );
+    }
+    let _ = threads;
+    epoch_serial(net, tokens, batch_size, adam, rng, max_steps, on_step)
+}
+
+fn epoch_serial(
+    net: &mut TransformerNet,
+    tokens: &[usize],
+    batch_size: usize,
+    adam: &Adam,
+    rng: &mut Rng,
+    max_steps: usize,
+    on_step: &mut StepHook,
+) -> Result<f32> {
     use crate::loss::softmax_cross_entropy;
     let t = net.context_len();
-    if tokens.len() < t + 1 {
-        return Err(InferError::DimMismatch(format!(
-            "need at least context_len+1 = {} tokens, got {}",
-            t + 1,
-            tokens.len()
-        )));
-    }
-    let num_windows = tokens.len() - t;
-    let steps = num_windows.div_ceil(batch_size);
-    // Shuffle a permutation of every window once per epoch and draw minibatches
-    // without replacement (T4), so an "epoch" covers the whole corpus exactly
-    // once instead of ≈63% in expectation under sampling with replacement.
-    let perm = rng.shuffled_indices(num_windows);
+    // Shuffle the epoch's windows once and draw minibatches without
+    // replacement (T4), so an epoch visits every window exactly once.
+    let perm = net.epoch_window_starts(tokens.len(), rng)?;
+    let num_windows = perm.len();
+    let steps = num_windows.div_ceil(batch_size).min(max_steps);
     let mut total = 0.0f32;
     for step in 0..steps {
         let batch = &perm[step * batch_size..((step + 1) * batch_size).min(num_windows)];
@@ -1395,9 +1481,10 @@ pub fn train_transformer_epoch(
             net.clip_grad_norm(max_norm);
         }
         net.step(adam)?;
+        on_step(net, rng)?;
         total += loss;
     }
-    let avg = total / steps as f32;
+    let avg = total / steps.max(1) as f32;
     if verbose::is_verbose() {
         vprintln!(
             "[train_transformer::epoch] steps={}, mean loss={:.6}",
@@ -1437,34 +1524,39 @@ pub fn train_transformer_epoch_threaded(
     rng: &mut Rng,
     threads: usize,
 ) -> Result<f32> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = threads;
-        train_transformer_epoch(net, tokens, batch_size, adam, rng)
-    }
+    train_transformer_steps(
+        net,
+        tokens,
+        batch_size,
+        adam,
+        rng,
+        threads,
+        usize::MAX,
+        &mut |_, _| Ok(()),
+    )
+}
 
-    #[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
+fn epoch_sharded(
+    net: &mut TransformerNet,
+    tokens: &[usize],
+    batch_size: usize,
+    adam: &Adam,
+    rng: &mut Rng,
+    threads: usize,
+    max_steps: usize,
+    on_step: &mut StepHook,
+) -> Result<f32> {
     {
         use crate::loss::softmax_cross_entropy;
         let nshards = threads.max(1).min(batch_size.max(1));
-        // One shard (or a single-sequence batch) is exactly the serial path.
-        if nshards <= 1 {
-            return train_transformer_epoch(net, tokens, batch_size, adam, rng);
-        }
-
         let t = net.context_len();
-        if tokens.len() < t + 1 {
-            return Err(InferError::DimMismatch(format!(
-                "need at least context_len+1 = {} tokens, got {}",
-                t + 1,
-                tokens.len()
-            )));
-        }
-        let num_windows = tokens.len() - t;
-        let steps = num_windows.div_ceil(batch_size);
         // Same per-epoch shuffle as the serial path (T4): identical RNG use, so
         // a fixed seed gives the same minibatches regardless of thread count.
-        let perm = rng.shuffled_indices(num_windows);
+        let perm = net.epoch_window_starts(tokens.len(), rng)?;
+        let num_windows = perm.len();
+        let steps = num_windows.div_ceil(batch_size).min(max_steps);
         let mut total = 0.0f32;
 
         for step in 0..steps {
@@ -1567,10 +1659,11 @@ pub fn train_transformer_epoch_threaded(
                 net.clip_grad_norm(max_norm);
             }
             net.step(adam)?;
+            on_step(net, rng)?;
             total += step_loss;
         }
 
-        let avg = total / steps as f32;
+        let avg = total / steps.max(1) as f32;
         if verbose::is_verbose() {
             vprintln!("[train_transformer::epoch_threaded] shards={nshards}, steps={steps}, mean loss={avg:.6}");
         }

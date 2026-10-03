@@ -115,6 +115,7 @@ pub use tensor::Tensor;
 pub use tokenizer::{ByteBpeTokenizer, TOK_BOS, TOK_EOS, TOK_PAD, TOK_UNK};
 pub use train::{accuracy, train_epoch, EmbedT, Net};
 pub use train_transformer::{
-    train_transformer_epoch, train_transformer_epoch_threaded, TransformerNet,
+    train_transformer_epoch, train_transformer_epoch_threaded, train_transformer_steps, StepHook,
+    TransformerNet,
 };
 pub use verbose::{clear_log_sink, is_verbose, log_line, set_log_sink, set_verbose};

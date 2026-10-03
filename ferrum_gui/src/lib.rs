@@ -8,7 +8,7 @@
 //! | event           | payload                              | source                |
 //! |-----------------|--------------------------------------|-----------------------|
 //! | `engine-log`    | `String` (one diagnostic line)       | `--verbose` sink      |
-//! | `train-progress`| `{ epoch, total, loss }`             | training callback     |
+//! | `train-progress`| `{ epoch, total, loss }` (total null under a token budget) | training callback |
 //! | `train-done`    | [`commands::TrainResult`]            | training completion   |
 //! | `finetune-progress` | `{ epoch, total, loss, ppl }`    | GGUF fine-tune epoch  |
 //! | `finetune-done` | [`commands::FinetuneResult`]         | GGUF fine-tune done   |

@@ -33,6 +33,12 @@
 //!   --vocab   <N>   BPE vocab size (0 = char-level)(default 512)
 //!   --seed    <N>   RNG seed                       (default 1337)
 //!   --threads <N>   data-parallel worker threads   (default 0 = auto)
+//!   --stride  <N>   window stride (0 = context)    (default 0)
+//!   --tokens  <N>   token budget, overrides epochs (default 0 = off)
+//!   --cosine / --warmup <N>  warmup + cosine LR decay
+//!   --clip <F>  --tie  --no-qat  --tokenizer <path>
+//!   --checkpoint <path>  --checkpoint-every <N>  --resume <path>
+//!   --val <F>  --patience <N>   validation split + early stopping
 //!   --force         retrain even if the model file exists
 //!   --sample        print a short sample after training
 //!   --verbose | -v  print all engine internals
@@ -46,7 +52,7 @@
 //!   --stream     print the completion live as it is generated
 //! ```
 
-use ferrum_core::{GenerativeSLM, Rng, TaskType, TransformerConfig};
+use ferrum_core::{GenerativeSLM, Rng, TaskType, TransformerConfig, ValidationConfig};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Minimal flag parser over a positional/`--flag value` argument vector.
@@ -94,6 +100,14 @@ impl Args {
             "warmup",
             "clip",
             "resume",
+            // train pipeline options.
+            "stride",
+            "tokens",
+            "tokenizer",
+            "checkpoint",
+            "checkpoint-every",
+            "val",
+            "patience",
         ];
         let mut i = 0;
         while i < raw.len() {
@@ -146,6 +160,24 @@ impl Args {
             vocab_size: self.get("vocab", d.vocab_size),
             weight_decay: self.get("weight_decay", d.weight_decay),
             dropout: self.get("dropout", d.dropout),
+            window_stride: self.get("stride", d.window_stride),
+            // f64 so budgets like `5e7` parse.
+            max_tokens: self.get("tokens", 0.0f64) as u64,
+            qat: !self.has("no-qat"),
+            grad_clip: self.get("clip", d.grad_clip),
+            cosine_lr: self.has("cosine"),
+            warmup_steps: self.get("warmup", d.warmup_steps),
+            weight_tying: self.has("tie"),
+            tokenizer_path: self.get("tokenizer", d.tokenizer_path),
+            // `--resume ckpt` resumes from and keeps writing to that file.
+            checkpoint_path: self
+                .flags
+                .get("resume")
+                .or_else(|| self.flags.get("checkpoint"))
+                .cloned()
+                .unwrap_or_default(),
+            checkpoint_every: self.get("checkpoint-every", d.checkpoint_every),
+            resume: self.flags.contains_key("resume"),
         }
     }
 }
@@ -214,6 +246,14 @@ fn print_usage() {
          \x20 --context N  --embed N  --heads N  --blocks N  --hidden N\n\
          \x20 --epochs N   --lr F     --batch N  --vocab N  --seed N\n\
          \x20 --weight_decay F  --dropout F   (AdamW decay + FFN dropout; default 0)\n\
+         \x20 --stride N   (window stride; 0 = context [default], 1 = legacy overlap)\n\
+         \x20 --tokens N   (token budget, e.g. 5e7; overrides --epochs)\n\
+         \x20 --cosine  --warmup N   (warmup + cosine LR decay)   --clip F (grad clip)\n\
+         \x20 --tie   (tie LM head to embedding)   --no-qat   (plain fp32 training)\n\
+         \x20 --tokenizer tok.bpe  (reuse this BPE tokenizer; trained + saved if missing)\n\
+         \x20 --checkpoint ck.fckp  --checkpoint-every N   (save training state)\n\
+         \x20 --resume ck.fckp      (continue an interrupted run from its checkpoint)\n\
+         \x20 --val F  --patience N (hold out fraction F; keep best epoch; early stop)\n\
          \x20 --threads N  --force    --sample   --verbose|-v\n\
          \x20 (--vocab 0 = character-level; >=256 = byte-level BPE, default 512)\n\
          \x20 (--threads 0 = auto-detect cores [default]; 1 = serial training)\n\n\
@@ -243,7 +283,10 @@ fn print_usage() {
          If <model.bin> already exists, train/run load the saved weights from\n\
          disk instead of retraining. Pass --force to retrain from scratch.\n\n\
          EXAMPLES:\n\
-         \x20 train_transformer train corpus.txt model.bin --epochs 200\n\
+         \x20 train_transformer train corpus.txt model.bin --epochs 20\n\
+         \x20 train_transformer train big.txt model.bin --context 128 --embed 128 --heads 4\n\
+         \x20     --blocks 4 --hidden 512 --lr 0.003 --tokens 5e7 --cosine --warmup 200\n\
+         \x20     --clip 1 --tie --tokenizer tok.bpe --checkpoint run.fckp --checkpoint-every 500\n\
          \x20 train_transformer run   corpus.txt model.bin \"Once upon a time\" --chars 300\n\
          \x20 train_transformer generate model.bin \"Once upon a time\" --temp 0.7"
     );
@@ -297,20 +340,68 @@ fn train_and_save(
         threads
     };
     println!("  Threads : {resolved_threads} (data-parallel minibatch training)");
+    if cfg.max_tokens > 0 {
+        println!("  Budget  : {} tokens (overrides --epochs)", cfg.max_tokens);
+    }
+    if cfg.resume {
+        println!("  Resume  : {}", cfg.checkpoint_path);
+    }
     println!("╚══════════════════════════════════════════════════════════╝\n");
 
     let t0 = Instant::now();
     let epochs = cfg.epochs;
+    let budgeted = cfg.max_tokens > 0;
     let report_every = (epochs / 20).max(1);
-    let progress = |ep: usize, loss: f32| {
-        if ep == 1 || ep.is_multiple_of(report_every) || ep == epochs {
-            println!("  epoch {ep:>5}/{epochs}   loss = {loss:.6}");
+    // Budgeted runs have no known epoch count: report at most every 5 s.
+    let mut last_report: Option<Instant> = None;
+    let mut report = |ep: usize, line: String| {
+        let due = if budgeted {
+            last_report.is_none_or(|t| t.elapsed().as_secs() >= 5)
+        } else {
+            ep == 1 || ep.is_multiple_of(report_every) || ep == epochs
+        };
+        if due {
+            last_report = Some(Instant::now());
+            println!("{line}");
         }
     };
+    let total = if budgeted {
+        String::new()
+    } else {
+        format!("/{epochs}")
+    };
 
-    let slm = GenerativeSLM::train_transformer_config_threaded(
-        corpus, &cfg, threads, &mut rng, progress,
-    )?;
+    let slm = if args.flags.contains_key("val") {
+        let val = ValidationConfig {
+            val_fraction: args.get("val", 0.1),
+            patience: args.get("patience", 0),
+        };
+        GenerativeSLM::train_transformer_config_validated(
+            corpus,
+            &cfg,
+            threads,
+            &val,
+            &mut rng,
+            |p| {
+                let best = if p.is_best { "  *best" } else { "" };
+                report(
+                    p.epoch,
+                    format!(
+                        "  epoch {:>5}{total}   loss = {:.6}   val ppl = {:.3}{best}",
+                        p.epoch, p.train_loss, p.val.perplexity
+                    ),
+                );
+            },
+        )?
+    } else {
+        GenerativeSLM::train_transformer_config_threaded(
+            corpus,
+            &cfg,
+            threads,
+            &mut rng,
+            |ep, loss| report(ep, format!("  epoch {ep:>5}{total}   loss = {loss:.6}")),
+        )?
+    };
 
     println!("\nTrained in {:.2}s.", t0.elapsed().as_secs_f32());
     let vocab_kind = if slm.meta.tokenizer_state.is_empty() {

@@ -176,6 +176,23 @@
         <label data-fields="transformer embedded">Vocab (0/≥256) <input type="number" id="trVocab" value="512" min="0" /></label>
         <label data-fields="transformer">Threads (0=auto) <input type="number" id="trThreads" value="0" min="0" /></label>
         <label data-fields="transformer embedded onehot">Seed <input type="number" id="trSeed" value="1337" min="0" /></label>
+        <label data-fields="transformer" title="Tokens between training windows. 0 = context length (each token once per epoch); 1 = legacy full overlap (≈context× slower epochs)">Stride (0=ctx) <input type="number" id="trStride" value="0" min="0" /></label>
+        <label data-fields="transformer" title="Stop after this many training tokens (e.g. 5e7); overrides Epochs. 0 = use Epochs">Token budget (0=off) <input type="text" id="trTokens" value="0" /></label>
+        <label data-fields="transformer">Weight decay <input type="number" id="trWd" value="0" step="0.01" min="0" /></label>
+        <label data-fields="transformer">Dropout <input type="number" id="trDropout" value="0" step="0.05" min="0" max="0.95" /></label>
+        <label data-fields="transformer" title="Global gradient-norm clip; 0 = off">Grad clip (0=off) <input type="number" id="trClip" value="0" step="0.1" min="0" /></label>
+        <label data-fields="transformer" title="Linear warmup steps for the cosine schedule">Warmup steps <input type="number" id="trWarmup" value="0" min="0" /></label>
+        <label data-fields="transformer" title="Hold out this fraction of the corpus; keeps the best epoch by validation loss. 0 = off">Val fraction (0=off) <input type="number" id="trVal" value="0" step="0.05" min="0" max="0.5" /></label>
+        <label data-fields="transformer" title="Stop after this many epochs without validation improvement; 0 = never">Patience <input type="number" id="trPatience" value="0" min="0" /></label>
+        <label data-fields="transformer" title="Reuse this BPE tokenizer file; trained and saved there if missing">Tokenizer file <input type="text" id="trTokenizer" placeholder="optional, e.g. tok.bpe" /></label>
+        <label data-fields="transformer" title="Training checkpoint (weights + optimizer state)">Checkpoint file <input type="text" id="trCkpt" placeholder="optional, e.g. run.fckp" /></label>
+        <label data-fields="transformer" title="Save the checkpoint every N optimizer steps (and at the end); 0 = only at the end">Checkpoint every <input type="number" id="trCkptEvery" value="0" min="0" /></label>
+      </div>
+      <div class="row" data-fields="transformer">
+        <label class="chk"><input type="checkbox" id="trCosine" /> Cosine LR (with warmup)</label>
+        <label class="chk"><input type="checkbox" id="trTie" /> Tie embedding + head</label>
+        <label class="chk"><input type="checkbox" id="trQat" checked /> Int8 QAT</label>
+        <label class="chk"><input type="checkbox" id="trResume" /> Resume from checkpoint</label>
       </div>
       <label class="chk"><input type="checkbox" id="trVerbose" /> Verbose (stream engine internals to the terminal)</label>
       <span class="err" id="errTrain"></span>
