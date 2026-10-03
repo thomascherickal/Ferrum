@@ -32,7 +32,7 @@ overview, see [ReadMe.md](ReadMe.md).
 | **Build** | `cargo build --workspace` clean; `ferrum_gui` builds separately and clean |
 | **Tests** | **418 passed, 0 failed** (360 `ferrum_core` unit, 52 integration, 3 `slm_wasm`, 3 doc-tests). **39** `ferrum_gui` backend tests pass. The sibling **Ferrum-ML** project passes **78**. |
 | **Safety** | `#![forbid(unsafe_code)]`; zero external dependencies in `ferrum_core` |
-| **Working tree** | **Uncommitted**: the restructuring and pipeline fixes in §2, plus in-progress F8 work (Q2_K/Q3_K decoders, tests passing) in `gguf.rs`. Nothing below has been committed yet. |
+| **Commits** | `133cdfe` F8 (Q2_K/Q3_K) · `d7ecb3a` pipeline fixes · `ed672d0` restructuring · `6dcb629` docs; each one builds and passes its tests on its own |
 
 ---
 
@@ -145,7 +145,7 @@ a 1–3 day job.
 | Tokenizer | `tokenizer` | ✅ Byte-level BPE, **incremental trainer**, whitespace pre-tokenization, rank-based encode, special tokens |
 | Data tools | `dataset` | ✅ `clean_corpus`, `corpus_stats`, `validate_for_training` |
 | Model format | `meta`, `loader` | ✅ FINF v4/v5; per-vector f32/int8/int4; bounds-checked |
-| GGUF reader | `gguf` | ✅ F32/F16/Q8_0/Q8_1/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K; Q2_K/Q3_K in the working tree (F8); streamed `open`; IQ* rejected |
+| GGUF reader | `gguf` | ✅ F32/F16/Q8_0/Q8_1/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K; Q2_K/Q3_K (read-only); streamed `open`; IQ* rejected |
 | GGUF tokenizer | `gguf_tokenizer` | ✅ BPE exact; SPM decode exact, encode greedy |
 | Llama/Qwen runner | `llm` | ✅ RMSNorm, RoPE, GQA, SwiGLU; cached decode equals full forward |
 | Llama/Qwen fine-tuning | `llm_train` | ✅ Gradient-checked backprop, AdamW, schedules, QAT, dropout, `.flck` checkpoints, threaded epochs |
@@ -168,7 +168,6 @@ a 1–3 day job.
 | 🟡 | **Budgeted runs report progress per epoch.** On a huge corpus one epoch can take hours with no output; `--verbose` shows per-epoch steps. There is no tokens/s, ETA, or gradient-norm readout. |
 | 🟢 | Resume restarts the interrupted epoch with a fresh shuffle instead of replaying the exact remaining batches (marked `ponytail:` in `slm.rs`). |
 | 🟢 | Native `generate` on the CLI exposes temperature only; top-k, top-p, and repetition penalty are library-only (`generate_with`). |
-| 🟢 | Clippy and rustfmt flag the in-progress F8 code in `gguf.rs` (a `needless_range_loop` and test formatting). Fix before committing F8. |
 | 🟢 | GGUF import is lossy (dequantize and re-quantize to Ferrum's per-row grid) and not bit-exact to llama.cpp; RoPE type is hard-wired to `Norm` on import; no RoPE scaling. |
 
 ---
@@ -178,11 +177,11 @@ a 1–3 day job.
 ### 6.1 In flight: the eight-upgrades branch
 
 Designed and approved 2026-07-03. Done: **F2** (sampling knobs on the GGUF run
-path) and **F1** (chat templates).
+path), **F1** (chat templates), and **F8** (Q2_K/Q3_K read).
 
 | ID | Feature | State |
 |---|---|---|
-| F8 | Q2_K / Q3_K read support | Decoders and tests in the working tree; lint fixes needed before commit |
+| F8 | Q2_K / Q3_K read support | **Done** (`133cdfe`) |
 | F3 | `qwen3` architecture (per-head q/k RMSNorm, explicit head_dim) | Not started |
 | F7 | Perplexity evaluation for GGUF models (`eval-gguf`, Evaluate tab) | Not started |
 | F5 | Streamed GGUF export (two-pass, checkpoint overlay without loading it whole) | Not started |
@@ -280,7 +279,7 @@ These are directions, not commitments.
 
 ## 9. Metrics
 
-_From the working tree on 2026-10-03, excluding `target/`._
+_As of commit `6dcb629` (2026-10-03), excluding `target/`._
 
 | Metric | Value |
 |---|---:|
