@@ -46,6 +46,8 @@ pub(crate) const GGML_Q8_1: u32 = 9;
 // k-quant super-block formats (G-K). These dominate modern GGUF downloads:
 // `Q4_K_M` mixes Q4_K / Q5_K / Q6_K across tensors, so all three are needed to
 // load one real checkpoint.
+pub(crate) const GGML_Q2_K: u32 = 10;
+pub(crate) const GGML_Q3_K: u32 = 11;
 pub(crate) const GGML_Q4_K: u32 = 12;
 pub(crate) const GGML_Q5_K: u32 = 13;
 pub(crate) const GGML_Q6_K: u32 = 14;
@@ -53,6 +55,8 @@ pub(crate) const GGML_Q6_K: u32 = 14;
 pub(crate) const QK: usize = 32; // GGML block length for the legacy quant formats
 pub(crate) const QK_K: usize = 256; // super-block length for the k-quant formats
                                     // On-disk bytes per k-quant super-block of QK_K weights (must match ggml).
+pub(crate) const Q2_K_BLOCK: usize = 16 + QK_K / 4 + 2 + 2; // scales, 2-bit qs, d, dmin = 84
+pub(crate) const Q3_K_BLOCK: usize = QK_K / 8 + QK_K / 4 + 12 + 2; // hmask, qs, scales, d = 110
 pub(crate) const Q4_K_BLOCK: usize = 2 + 2 + 12 + QK_K / 2; // d, dmin, 6-bit scales, 4-bit qs = 144
 pub(crate) const Q5_K_BLOCK: usize = 2 + 2 + 12 + QK_K / 8 + QK_K / 2; // + qh high bits = 176
 pub(crate) const Q6_K_BLOCK: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2; // ql, qh, scales, d = 210
@@ -331,6 +335,8 @@ fn type_nbytes(ggml_type: u32, n: usize) -> Result<usize> {
         GGML_Q8_1 => mul(blocks()?, 2 + 2 + QK), // f16 d + f16 s + 32×i8
         GGML_Q4_0 => mul(blocks()?, 2 + QK / 2), // f16 d + 16 bytes
         GGML_Q4_1 => mul(blocks()?, 2 + 2 + QK / 2), // f16 d + f16 m + 16 bytes
+        GGML_Q2_K => mul(kblocks()?, Q2_K_BLOCK),
+        GGML_Q3_K => mul(kblocks()?, Q3_K_BLOCK),
         GGML_Q4_K => mul(kblocks()?, Q4_K_BLOCK),
         GGML_Q5_K => mul(kblocks()?, Q5_K_BLOCK),
         GGML_Q6_K => mul(kblocks()?, Q6_K_BLOCK),
@@ -544,7 +550,7 @@ impl Gguf {
     }
 
     /// Dequantize a tensor to row-major f32 (in GGML storage order). Handles the
-    /// legacy block formats and the common k-quant super-blocks (Q4_K/Q5_K/Q6_K).
+    /// legacy block formats and the common k-quant super-blocks (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K).
     pub fn dequantize(&self, t: &TensorInfo) -> Result<Vec<f32>> {
         let raw = self.tensor_bytes(t)?;
         let raw = raw.as_ref();
@@ -562,12 +568,14 @@ impl Gguf {
             GGML_Q8_1 => dequant_q8_1(raw, n),
             GGML_Q4_0 => dequant_q4_0(raw, n),
             GGML_Q4_1 => dequant_q4_1(raw, n),
+            GGML_Q2_K => dequant_q2_k(raw, n),
+            GGML_Q3_K => dequant_q3_k(raw, n),
             GGML_Q4_K => dequant_q4_k(raw, n),
             GGML_Q5_K => dequant_q5_k(raw, n),
             GGML_Q6_K => dequant_q6_k(raw, n),
             other => Err(fmt(&format!(
                 "GGUF tensor type {other} not yet supported for dequant \
-                 (Q2_K/Q3_K and the IQ* formats need their own decoders)"
+                 (the IQ* formats need their own decoders)"
             ))),
         }
     }
@@ -1010,6 +1018,85 @@ fn dequant_q6_k(raw: &[u8], n: usize) -> Result<Vec<f32>> {
                 out[oo + l + 96] = d * sc(is + 6) * q4 as f32;
             }
         }
+    }
+    Ok(out)
+}
+
+/// Q2_K super-block: 16 packed 4-bit (scale, min) pairs, 64 bytes of 2-bit
+/// quants, f16 d + f16 dmin. y = d·sc·q − dmin·m, in ggml's 128-element-half
+/// scan order (shift 0,2,4,6 over two 16-element runs per shift).
+fn dequant_q2_k(raw: &[u8], n: usize) -> Result<Vec<f32>> {
+    let mut out = Vec::with_capacity(n);
+    for block in raw.chunks_exact(Q2_K_BLOCK) {
+        let scales = &block[..16];
+        let qs = &block[16..16 + 64];
+        let d = f16_to_f32(u16::from_le_bytes([block[80], block[81]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([block[82], block[83]]));
+        let mut is = 0usize;
+        for half in 0..2 {
+            let q = &qs[32 * half..32 * half + 32];
+            for shift in [0u8, 2, 4, 6] {
+                for run in 0..2 {
+                    let sc = scales[is];
+                    is += 1;
+                    let dl = d * (sc & 0xF) as f32;
+                    let ml = dmin * (sc >> 4) as f32;
+                    for &ql in &q[16 * run..16 * run + 16] {
+                        out.push(dl * ((ql >> shift) & 3) as f32 - ml);
+                    }
+                }
+            }
+        }
+    }
+    out.truncate(n);
+    if out.len() != n {
+        return Err(fmt("Q2_K data shorter than expected"));
+    }
+    Ok(out)
+}
+
+/// Q3_K super-block: 32-byte high-bit mask, 64 bytes of 2-bit low quants,
+/// 12 bytes of packed 6-bit scales, f16 d. q = low2 | (¬hbit → −4 offset),
+/// y = d·(scale−32)·q, same scan order as Q2_K; the high-bit selector `m`
+/// doubles after each shift group.
+fn dequant_q3_k(raw: &[u8], n: usize) -> Result<Vec<f32>> {
+    let mut out = Vec::with_capacity(n);
+    for block in raw.chunks_exact(Q3_K_BLOCK) {
+        let hmask = &block[..32];
+        let qs = &block[32..32 + 64];
+        let sc = &block[96..96 + 12];
+        let d = f16_to_f32(u16::from_le_bytes([block[108], block[109]]));
+        // Unpack 16 six-bit scales from ggml's split encoding.
+        let mut scales = [0i8; 16];
+        for j in 0..8 {
+            scales[j] = (sc[j] & 0xF) as i8;
+            scales[j + 8] = (sc[j] >> 4) as i8;
+        }
+        for j in 0..16 {
+            let hi = (sc[8 + j / 4] >> (2 * (j % 4))) & 3;
+            scales[j] |= (hi << 4) as i8;
+        }
+        let mut is = 0usize;
+        let mut m: u8 = 1;
+        for half in 0..2 {
+            let q = &qs[32 * half..32 * half + 32];
+            for shift in [0u8, 2, 4, 6] {
+                for run in 0..2 {
+                    let dl = d * (scales[is] as i32 - 32) as f32;
+                    is += 1;
+                    for l in 16 * run..16 * run + 16 {
+                        let low = ((q[l] >> shift) & 3) as i32;
+                        let qv = low - if hmask[l] & m != 0 { 0 } else { 4 };
+                        out.push(dl * qv as f32);
+                    }
+                }
+                m <<= 1;
+            }
+        }
+    }
+    out.truncate(n);
+    if out.len() != n {
+        return Err(fmt("Q3_K data shorter than expected"));
     }
     Ok(out)
 }
@@ -1580,6 +1667,68 @@ mod tests {
         assert_eq!(type_nbytes(GGML_Q5_K, QK_K).unwrap(), Q5_K_BLOCK); // 176
         assert_eq!(type_nbytes(GGML_Q6_K, QK_K).unwrap(), Q6_K_BLOCK); // 210
         assert!(type_nbytes(GGML_Q4_K, 200).is_err()); // not a multiple of 256
+    }
+
+    #[test]
+    fn q2k_q3k_block_sizes() {
+        assert_eq!(type_nbytes(GGML_Q2_K, QK_K).unwrap(), Q2_K_BLOCK); // 84
+        assert_eq!(type_nbytes(GGML_Q3_K, QK_K).unwrap(), Q3_K_BLOCK); // 110
+        assert!(type_nbytes(GGML_Q2_K, 200).is_err());
+    }
+
+    #[test]
+    fn dequant_q2_k_scales_and_mins() {
+        // qs = 0x55 → every 2-bit q = 1. d = 1.0, dmin = 0.5 (f16-exact).
+        // scales[i] = i | ((15 - i) << 4) → y over group i = 1·i − 0.5·(15 − i).
+        let mut b = vec![0u8; Q2_K_BLOCK];
+        for (i, s) in b[..16].iter_mut().enumerate() {
+            *s = (i as u8) | (((15 - i) as u8) << 4);
+        }
+        for q in &mut b[16..80] {
+            *q = 0x55;
+        }
+        b[80..82].copy_from_slice(&f32_to_f16(1.0).to_le_bytes());
+        b[82..84].copy_from_slice(&f32_to_f16(0.5).to_le_bytes());
+        let y = dequant_q2_k(&b, 256).unwrap();
+        for (g, chunk) in y.chunks_exact(16).enumerate() {
+            let expect = 1.0 * g as f32 - 0.5 * (15 - g) as f32;
+            for v in chunk {
+                assert!((v - expect).abs() < 1e-3, "group {g}: {v} vs {expect}");
+            }
+        }
+    }
+
+    #[test]
+    fn dequant_q3_k_high_bit_offsets() {
+        // qs = 0x55 (low bits = 1). All 16 scales = 34 → dl = d·2. d = 1.0.
+        // hmask all 0xFF → q = 1 → y = 2. hmask all 0 → q = 1−4 = −3 → y = −6.
+        let mut b = vec![0u8; Q3_K_BLOCK];
+        for q in &mut b[32..96] {
+            *q = 0x55;
+        }
+        // scales all = 34 = 0b100010: low nibble 2 in bytes 0–7 (both nibbles),
+        // top bits 0b10 for every j in bytes 8–11 (0b10101010 = 0xAA).
+        for j in 0..8 {
+            b[96 + j] = 0x22;
+        }
+        for j in 8..12 {
+            b[96 + j] = 0xAA;
+        }
+        b[108..110].copy_from_slice(&f32_to_f16(1.0).to_le_bytes());
+        for h in &mut b[..32] {
+            *h = 0xFF;
+        }
+        let y = dequant_q3_k(&b, 256).unwrap();
+        for v in &y {
+            assert!((v - 2.0).abs() < 1e-3, "set-bit case: {v}");
+        }
+        for h in &mut b[..32] {
+            *h = 0;
+        }
+        let y = dequant_q3_k(&b, 256).unwrap();
+        for v in &y {
+            assert!((v + 6.0).abs() < 1e-3, "clear-bit case: {v}");
+        }
     }
 
     #[test]
