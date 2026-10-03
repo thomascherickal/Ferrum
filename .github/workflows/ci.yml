@@ -51,9 +51,6 @@ jobs:
           node --check ferrum_gui/ui/app.js
           node --check ferrum_gui/ui/stream.js
           node --check ferrum_gui/ui/stream.test.js
-          # engine.js is an ES module; node ignores --input-type for file args,
-          # so check it via stdin in module mode.
-          node --input-type=module --check < web/shared/engine.js
 
   deny:
     name: cargo-deny (advisories, licenses, sources)
@@ -88,9 +85,9 @@ jobs:
       # X2: the WASM target uses the KV cache and is excluded from the workspace
       # build, so verify it compiles for wasm32 on every change.
       - name: Build WASM bindings
-        run: cargo build -p tabular_wasm --target wasm32-unknown-unknown --release
+        run: cargo build -p slm_wasm --target wasm32-unknown-unknown --release
       - name: Clippy (wasm32)
-        run: cargo clippy -p tabular_wasm --target wasm32-unknown-unknown -- -D warnings
+        run: cargo clippy -p slm_wasm --target wasm32-unknown-unknown -- -D warnings
 
   gui:
     name: Build & test (ferrum_gui, Tauri)

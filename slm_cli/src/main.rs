@@ -269,7 +269,7 @@ fn print_usage() {
          \x20 --force        (load even if the memory estimate exceeds available RAM)\n\
          \x20 --resume ckpt.flck  (overlay fine-tuned weights; forces f32 load)\n\
          \x20 NOTE: only F32/F16/Q8_0/Q8_1/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K GGUFs; on CPU\n\
-         \x20 a 1B model decodes at only a few tokens/sec (see ferrum_review.md §4).\n\n\
+         \x20 a 1B model decodes at only a few tokens/sec (see Manual.md §13).\n\n\
          FINETUNE-GGUF options (AdamW fine-tune an imported GGUF; f32 masters):\n\
          \x20 --epochs N  --lr F  --batch N  --seq N   (window length; capped at ctx)\n\
          \x20 --warmup N  --clip F  --weight_decay F  --dropout F   (schedule/regularization)\n\

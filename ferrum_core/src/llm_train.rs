@@ -32,7 +32,7 @@
 //!
 //! Scope/reality check: this makes the architecture *trainable* and is exercised
 //! on small models. It does **not** make training a 1B model on a CPU feasible —
-//! that stays bounded by compute and RAM (see `ferrum_review.md §4.3`). It adds
+//! that stays bounded by compute and RAM (see Manual.md §13.5). It adds
 //! the missing capability (gradients + a real optimizer), not a claim about scale.
 
 use crate::error::{InferError, Result};

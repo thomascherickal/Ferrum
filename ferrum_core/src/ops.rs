@@ -9,7 +9,7 @@ use std::sync::Arc;
 /// Cache-tiling panel sizes for [`matmul_block`]. A `KC × NC` panel of `B`
 /// (256×256 f32 = 256 KB) is reused across every row of the current block before
 /// the next panel is streamed, which removes the ~2× "cache cliff" the untiled
-/// i-k-j kernel hit once `B` overflowed cache at ≥2048² (see `benchmarks.md §4a`).
+/// i-k-j kernel hit once `B` overflowed cache at ≥2048² (see Manual.md §13.3).
 const KC: usize = 256;
 const NC: usize = 256;
 
@@ -154,7 +154,7 @@ pub fn linear_forward(input: &Tensor, weight: &Tensor, bias: &[f32]) -> Result<T
 /// each weight row is a contiguous `i8` slice (autovectorises cleanly); for int4
 /// the row is walked **one byte → two adjacent outputs**, branch-free, with the
 /// odd endpoints peeled out so the hot middle loop vectorises too (see the
-/// `qaccum_cols` rewrite in `benchmarks.md §4d` — this is what closes the old
+/// `qaccum_cols` rewrite in Manual.md §13.4 — this is what closes the old
 /// int4-slower-than-int8 gap).
 fn qaccum_cols(a_row: &[f32], w: &QWeight, j0: usize, j1: usize, out: &mut [f32]) {
     let k = a_row.len();

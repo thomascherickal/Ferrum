@@ -22,13 +22,12 @@
 //! loader     ──► FINF v4/v5 binary format (save / load, int8 quantized)
 //! quant      ──► int8 fake-quantization for QAT and serialization
 //! tokenizer  ──► ByteBpeTokenizer (byte-level BPE; char-level fallback)
-//! csv        ──► CsvDataset, Normalizer, ModelMetadata
-//! train      ──► Net (trainable MLP), train_epoch, accuracy
+//! meta       ──► ModelMetadata, Normalizer, TaskType
 //! train_transformer ──► TransformerNet, train_transformer_epoch
 //! loss       ──► softmax_cross_entropy, mse
 //! optim      ──► Sgd (with optional momentum), Adam
 //! rng        ──► seeded xorshift64* PRNG (deterministic)
-//! slm        ──► GenerativeSLM: train / train_embedded / train_transformer (int8 QAT, BPE) / generate
+//! slm        ──► GenerativeSLM: train_transformer (int8 QAT, BPE) / generate / evaluate
 //! ```
 //!
 //! ## Quick start — Transformer inference
@@ -55,7 +54,6 @@ pub mod verbose;
 
 pub mod activation;
 pub mod chat_format;
-pub mod csv;
 pub mod dataset;
 pub mod error;
 pub mod gguf;
@@ -66,6 +64,7 @@ pub mod llm;
 pub mod llm_train;
 pub mod loader;
 pub mod loss;
+pub mod meta;
 pub mod model;
 pub mod ops;
 pub mod optim;
@@ -75,14 +74,10 @@ pub mod rng;
 pub mod slm;
 pub mod tensor;
 pub mod tokenizer;
-pub mod train;
 pub mod train_transformer;
 
 pub use activation::Activation;
 pub use chat_format::ChatFormat;
-pub use csv::{
-    fit_normalizer_with_target, train_val_split, CsvDataset, ModelMetadata, Normalizer, TaskType,
-};
 pub use dataset::{clean_corpus, corpus_stats, validate_for_training, CleanOptions, CorpusStats};
 pub use error::{InferError, Result};
 pub use gguf::{f16_to_f32, Gguf, MetaValue, TensorInfo};
@@ -101,6 +96,7 @@ pub use loader::{
     to_bytes_quantized_int4,
 };
 pub use loss::{mse, softmax_cross_entropy};
+pub use meta::{ModelMetadata, Normalizer, TaskType};
 pub use model::Sequential;
 pub use ops::argmax_rows;
 pub use optim::{clip_grad_norm, Adam, LrDecay, LrSchedule, Sgd};
@@ -113,7 +109,6 @@ pub use slm::{
 };
 pub use tensor::Tensor;
 pub use tokenizer::{ByteBpeTokenizer, TOK_BOS, TOK_EOS, TOK_PAD, TOK_UNK};
-pub use train::{accuracy, train_epoch, EmbedT, Net};
 pub use train_transformer::{
     train_transformer_epoch, train_transformer_epoch_threaded, train_transformer_steps, StepHook,
     TransformerNet,

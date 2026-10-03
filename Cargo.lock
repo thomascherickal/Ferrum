@@ -261,18 +261,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "syn"
-version = "2.0.117"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e665b8803e7b1d2a727f4023456bbbbe74da67099c585258af0ad9c5013b9b99"
-dependencies = [
- "proc-macro2",
- "quote",
- "unicode-ident",
-]
-
-[[package]]
-name = "tabular_wasm"
+name = "slm_wasm"
 version = "0.3.0"
 dependencies = [
  "ferrum_core",
@@ -281,10 +270,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "train_cli"
-version = "0.3.0"
+name = "syn"
+version = "2.0.117"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e665b8803e7b1d2a727f4023456bbbbe74da67099c585258af0ad9c5013b9b99"
 dependencies = [
- "ferrum_core",
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
 ]
 
 [[package]]

@@ -1,8 +1,8 @@
 //! Machine-capability estimator: micro-benchmarks the host and derives
 //! parameter ranges for four capabilities — load (fits in RAM), train (<24h),
 //! fine-tune (<24h), and inference (>=3 tok/s) — plus a 24h eval bound.
-//! See docs/superpowers/specs/2026-06-23-capable-module-design.md and
-//! docs/superpowers/specs/2026-07-02-capable-ranges-design.md.
+//! Design specs (archived in ../Ferrum-Junk/docs-archive/docs/superpowers/specs/):
+//! 2026-06-23-capable-module-design.md and 2026-07-02-capable-ranges-design.md.
 
 use crate::AppState;
 use serde::Serialize;
@@ -30,7 +30,7 @@ pub const EVAL_TOKENS: f64 = 1e7;
 pub const CHINCHILLA_RATIO: f64 = 20.0;
 
 /// Fraction of raw stream bandwidth that weight-streaming (m=1 GEMV) decode
-/// actually achieves. Calibrated against benchmarks.md (~7 tok/s @ 1B int4):
+/// actually achieves. Calibrated against Manual.md §13.4 (~7 tok/s @ 1B int4):
 /// decode reaches only a portion of peak stream bandwidth.
 pub const DECODE_EFFICIENCY: f64 = 0.35;
 /// Fraction of aggregate peak GEMM throughput a real training step sustains
@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn infer_bound_anchor_is_plausible() {
-        // benchmarks.md: ~1B params at int4 decodes ~7 tok/s. At 3 tok/s the
+        // Manual.md §13.4: ~1B params at int4 decodes ~7 tok/s. At 3 tok/s the
         // ceiling should sit above 1B and below ~10B for a typical ~8 GB/s CPU.
         let n = infer_max_params(8e9, BPP_INT4);
         assert!(n > 1e9 && n < 1e10, "anchor implausible: {n}");

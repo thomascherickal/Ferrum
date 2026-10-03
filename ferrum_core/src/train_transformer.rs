@@ -1843,8 +1843,8 @@ mod tests {
 
     #[test]
     fn qat_model_survives_int8_export_with_small_drift() {
-        use crate::csv::{ModelMetadata, Normalizer, TaskType};
         use crate::loader::{from_bytes, to_bytes_quantized};
+        use crate::meta::{ModelMetadata, Normalizer, TaskType};
         let mut rng = Rng::new(13);
         let mut net = TransformerNet::new(4, 4, 8, 2, 16, 1, &mut rng).unwrap();
         net.set_qat(true);
@@ -1903,8 +1903,8 @@ mod tests {
 
     #[test]
     fn exported_model_roundtrips_finf() {
-        use crate::csv::{ModelMetadata, Normalizer, TaskType};
         use crate::loader::{from_bytes, to_bytes};
+        use crate::meta::{ModelMetadata, Normalizer, TaskType};
         let mut rng = Rng::new(33);
         let net = TransformerNet::new(6, 4, 8, 2, 12, 1, &mut rng).unwrap();
         let model = net.to_inference().unwrap();

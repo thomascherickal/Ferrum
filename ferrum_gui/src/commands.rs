@@ -13,10 +13,10 @@ use ferrum_core::{
     TransformerConfig, ValidationConfig,
 };
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Small helpers
@@ -35,12 +35,6 @@ fn file_name(path: &str) -> String {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string())
-}
-
-/// True on platforms where spawning an OS shell / reading the process table is
-/// not possible (mobile + the web preview).
-fn is_sandboxed() -> bool {
-    cfg!(any(target_os = "android", target_os = "ios"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -170,13 +164,13 @@ pub fn read_text_file(path: String, max_bytes: Option<usize>) -> Result<String, 
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. Training (requirement #6) — transformer / embedded / one-hot
+// 2. Training (requirement #6) — transformer
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrainParams {
-    /// "transformer" | "embedded" | "onehot"
+    /// Always "transformer" (the only training method).
     pub method: String,
     pub corpus_path: String,
     pub model_path: String,
@@ -187,7 +181,6 @@ pub struct TrainParams {
     pub hidden_dim: usize,
     pub epochs: usize,
     pub lr: f32,
-    pub momentum: f32,
     pub batch_size: usize,
     pub vocab_size: usize,
     pub seed: u64,
@@ -246,7 +239,7 @@ pub struct TrainResult {
     pub bytes: u64,
 }
 
-/// Train an SLM in-process (any of the three engine paths), streaming
+/// Train a transformer SLM in-process, streaming
 /// `train-progress` events and (if `verbose`) `engine-log` lines, then save it.
 #[tauri::command]
 pub async fn train_slm(app: AppHandle, params: TrainParams) -> Result<TrainResult, String> {
@@ -362,36 +355,6 @@ fn train_inner(app: AppHandle, p: TrainParams) -> Result<TrainResult, String> {
                 )
             }
         }
-        "embedded" => {
-            if p.vocab_size != 0 && p.vocab_size < 256 {
-                ferrum_core::set_verbose(false);
-                return Err("vocab must be 0 (character-level) or ≥ 256 (byte-level BPE)".into());
-            }
-            GenerativeSLM::train_embedded_with_callback(
-                &corpus,
-                p.context_len,
-                p.embed_dim,
-                p.hidden_dim,
-                p.epochs,
-                p.lr,
-                p.momentum,
-                p.batch_size,
-                p.vocab_size,
-                &mut rng,
-                progress,
-            )
-        }
-        "onehot" => GenerativeSLM::train_with_callback(
-            &corpus,
-            p.context_len,
-            p.hidden_dim,
-            p.epochs,
-            p.lr,
-            p.momentum,
-            p.batch_size,
-            &mut rng,
-            progress,
-        ),
         other => {
             ferrum_core::set_verbose(false);
             return Err(format!("unknown training method: {other}"));
@@ -1279,124 +1242,6 @@ pub async fn export_gguf(app: AppHandle, params: ExportParams) -> Result<ExportR
     })
     .await
     .map_err(|e| format!("task error: {e}"))?
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 6. Interactive terminal (requirement #3)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Run one shell command in the studio's working directory, streaming stdout and
-/// stderr as `term-output` events. `cd` is handled internally so it persists
-/// between calls (a minimal interactive shell). Returns the exit code.
-#[tauri::command]
-pub async fn run_terminal(app: AppHandle, command: String) -> Result<i32, String> {
-    if is_sandboxed() {
-        return Err("the interactive shell is not available on this platform".into());
-    }
-    tauri::async_runtime::spawn_blocking(move || term_inner(app, command))
-        .await
-        .map_err(|e| format!("task error: {e}"))?
-}
-
-fn term_inner(app: AppHandle, command: String) -> Result<i32, String> {
-    let state = app.state::<AppState>();
-    let cmd = command.trim().to_string();
-    if cmd.is_empty() {
-        return Ok(0);
-    }
-
-    // Built-in `cd` so the working directory persists across commands.
-    if cmd == "cd" || cmd.starts_with("cd ") {
-        let target = cmd[2..].trim();
-        let mut cwd = state.cwd.lock().unwrap();
-        let candidate = if target.is_empty() {
-            std::env::var("HOME")
-                .or_else(|_| std::env::var("USERPROFILE"))
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| cwd.clone())
-        } else {
-            let p = Path::new(target);
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                cwd.join(p)
-            }
-        };
-        match std::fs::canonicalize(&candidate) {
-            Ok(c) if c.is_dir() => {
-                *cwd = c;
-                Ok(0)
-            }
-            _ => {
-                let _ = app.emit(
-                    "term-output",
-                    serde_json::json!({ "line": format!("cd: no such directory: {target}"), "stream": "stderr" }),
-                );
-                Ok(1)
-            }
-        }
-    } else {
-        let cwd = state.cwd.lock().unwrap().clone();
-        run_shell(&app, &cmd, &cwd)
-    }
-}
-
-fn run_shell(app: &AppHandle, cmd: &str, cwd: &Path) -> Result<i32, String> {
-    use std::process::{Command, Stdio};
-
-    let mut command = if cfg!(target_os = "windows") {
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(cmd);
-        c
-    } else {
-        let mut c = Command::new("sh");
-        c.arg("-c").arg(cmd);
-        c
-    };
-
-    let mut child = command
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("failed to start shell: {e}"))?;
-
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-
-    let a_out = app.clone();
-    let h_out = std::thread::spawn(move || {
-        if let Some(out) = stdout {
-            for line in BufReader::new(out).lines().map_while(Result::ok) {
-                let _ = a_out.emit(
-                    "term-output",
-                    serde_json::json!({ "line": line, "stream": "stdout" }),
-                );
-            }
-        }
-    });
-    let a_err = app.clone();
-    let h_err = std::thread::spawn(move || {
-        if let Some(err) = stderr {
-            for line in BufReader::new(err).lines().map_while(Result::ok) {
-                let _ = a_err.emit(
-                    "term-output",
-                    serde_json::json!({ "line": line, "stream": "stderr" }),
-                );
-            }
-        }
-    });
-
-    let _ = h_out.join();
-    let _ = h_err.join();
-    let status = child.wait().map_err(|e| format!("wait failed: {e}"))?;
-    Ok(status.code().unwrap_or(-1))
-}
-
-/// Current working directory of the embedded shell (for the prompt).
-#[tauri::command]
-pub fn term_cwd(state: State<'_, AppState>) -> String {
-    state.cwd.lock().unwrap().display().to_string()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

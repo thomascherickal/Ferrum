@@ -2,7 +2,7 @@
 //! training and inference. Std-only and `harness = false`, so it pulls in **no**
 //! external dependency (no Criterion): it just times [`ferrum_core::ops::matmul`]
 //! with [`std::time::Instant`], matching the measured-on-this-project style of
-//! `benchmarks.md`.
+//! Manual.md §13 (Performance and benchmarks).
 //!
 //! Run:
 //!   cargo bench --bench gemm

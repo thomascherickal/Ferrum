@@ -21,24 +21,8 @@ name = "test_slm"
 path = "tests/test_slm.rs"
 
 [[test]]
-name = "test_train"
-path = "tests/test_train.rs"
-
-[[test]]
-name = "test_csv"
-path = "tests/test_csv.rs"
-
-[[test]]
-name = "test_regression"
-path = "tests/test_regression.rs"
-
-[[test]]
 name = "test_qat_cache"
 path = "tests/test_qat_cache.rs"
-
-[[test]]
-name = "integration"
-path = "tests/integration.rs"
 
 [[test]]
 name = "test_gguf_llm"

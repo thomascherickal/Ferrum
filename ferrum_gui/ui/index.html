@@ -31,7 +31,6 @@
     <button class="tab" data-tab="gguf">GGUF</button>
     <button class="tab" data-tab="finetune">Fine-tune</button>
     <button class="tab" data-tab="export">Export</button>
-    <button class="tab" data-tab="tabular">Tabular (CLI)</button>
     <button class="tab" data-tab="system">System</button>
     <button class="tab" data-tab="capable">Capable</button>
   </nav>
@@ -144,16 +143,7 @@
 
     <!-- ── Train ─────────────────────────────────────────────────────────── -->
     <section class="panel" id="panel-train">
-      <h2>Train an SLM</h2>
-      <div class="row">
-        <label>Method
-          <select id="trMethod">
-            <option value="transformer">Causal Transformer (Adam, multi-threaded)</option>
-            <option value="embedded">Embedding + MLP (SGD)</option>
-            <option value="onehot">One-hot MLP (baseline)</option>
-          </select>
-        </label>
-      </div>
+      <h2>Train a transformer SLM</h2>
       <div class="row">
         <label>Corpus <input type="text" id="trCorpus" placeholder="/path/to/corpus.txt" /></label>
         <button class="ghost browse" data-target="trCorpus">Browse…</button>
@@ -164,31 +154,30 @@
       </div>
 
       <div class="grid">
-        <label data-fields="transformer embedded onehot">Context <input type="number" id="trContext" value="16" min="1" /></label>
-        <label data-fields="transformer embedded">Embed dim <input type="number" id="trEmbed" value="32" min="1" /></label>
-        <label data-fields="transformer">Heads <input type="number" id="trHeads" value="4" min="1" /></label>
-        <label data-fields="transformer">Blocks <input type="number" id="trBlocks" value="2" min="1" /></label>
-        <label data-fields="transformer embedded onehot">Hidden <input type="number" id="trHidden" value="64" min="1" /></label>
-        <label data-fields="transformer embedded onehot">Epochs <input type="number" id="trEpochs" value="100" min="1" /></label>
-        <label data-fields="transformer embedded onehot">LR <input type="number" id="trLr" value="0.01" step="0.001" min="0" /></label>
-        <label data-fields="embedded onehot">Momentum <input type="number" id="trMomentum" value="0.9" step="0.05" min="0" /></label>
-        <label data-fields="transformer embedded onehot">Batch <input type="number" id="trBatch" value="16" min="1" /></label>
-        <label data-fields="transformer embedded">Vocab (0/≥256) <input type="number" id="trVocab" value="512" min="0" /></label>
-        <label data-fields="transformer">Threads (0=auto) <input type="number" id="trThreads" value="0" min="0" /></label>
-        <label data-fields="transformer embedded onehot">Seed <input type="number" id="trSeed" value="1337" min="0" /></label>
-        <label data-fields="transformer" title="Tokens between training windows. 0 = context length (each token once per epoch); 1 = legacy full overlap (≈context× slower epochs)">Stride (0=ctx) <input type="number" id="trStride" value="0" min="0" /></label>
-        <label data-fields="transformer" title="Stop after this many training tokens (e.g. 5e7); overrides Epochs. 0 = use Epochs">Token budget (0=off) <input type="text" id="trTokens" value="0" /></label>
-        <label data-fields="transformer">Weight decay <input type="number" id="trWd" value="0" step="0.01" min="0" /></label>
-        <label data-fields="transformer">Dropout <input type="number" id="trDropout" value="0" step="0.05" min="0" max="0.95" /></label>
-        <label data-fields="transformer" title="Global gradient-norm clip; 0 = off">Grad clip (0=off) <input type="number" id="trClip" value="0" step="0.1" min="0" /></label>
-        <label data-fields="transformer" title="Linear warmup steps for the cosine schedule">Warmup steps <input type="number" id="trWarmup" value="0" min="0" /></label>
-        <label data-fields="transformer" title="Hold out this fraction of the corpus; keeps the best epoch by validation loss. 0 = off">Val fraction (0=off) <input type="number" id="trVal" value="0" step="0.05" min="0" max="0.5" /></label>
-        <label data-fields="transformer" title="Stop after this many epochs without validation improvement; 0 = never">Patience <input type="number" id="trPatience" value="0" min="0" /></label>
-        <label data-fields="transformer" title="Reuse this BPE tokenizer file; trained and saved there if missing">Tokenizer file <input type="text" id="trTokenizer" placeholder="optional, e.g. tok.bpe" /></label>
-        <label data-fields="transformer" title="Training checkpoint (weights + optimizer state)">Checkpoint file <input type="text" id="trCkpt" placeholder="optional, e.g. run.fckp" /></label>
-        <label data-fields="transformer" title="Save the checkpoint every N optimizer steps (and at the end); 0 = only at the end">Checkpoint every <input type="number" id="trCkptEvery" value="0" min="0" /></label>
+        <label>Context <input type="number" id="trContext" value="16" min="1" /></label>
+        <label>Embed dim <input type="number" id="trEmbed" value="32" min="1" /></label>
+        <label>Heads <input type="number" id="trHeads" value="4" min="1" /></label>
+        <label>Blocks <input type="number" id="trBlocks" value="2" min="1" /></label>
+        <label>Hidden <input type="number" id="trHidden" value="64" min="1" /></label>
+        <label>Epochs <input type="number" id="trEpochs" value="100" min="1" /></label>
+        <label>LR <input type="number" id="trLr" value="0.01" step="0.001" min="0" /></label>
+        <label>Batch <input type="number" id="trBatch" value="16" min="1" /></label>
+        <label>Vocab (0/≥256) <input type="number" id="trVocab" value="512" min="0" /></label>
+        <label>Threads (0=auto) <input type="number" id="trThreads" value="0" min="0" /></label>
+        <label>Seed <input type="number" id="trSeed" value="1337" min="0" /></label>
+        <label title="Tokens between training windows. 0 = context length (each token once per epoch); 1 = legacy full overlap (≈context× slower epochs)">Stride (0=ctx) <input type="number" id="trStride" value="0" min="0" /></label>
+        <label title="Stop after this many training tokens (e.g. 5e7); overrides Epochs. 0 = use Epochs">Token budget (0=off) <input type="text" id="trTokens" value="0" /></label>
+        <label>Weight decay <input type="number" id="trWd" value="0" step="0.01" min="0" /></label>
+        <label>Dropout <input type="number" id="trDropout" value="0" step="0.05" min="0" max="0.95" /></label>
+        <label title="Global gradient-norm clip; 0 = off">Grad clip (0=off) <input type="number" id="trClip" value="0" step="0.1" min="0" /></label>
+        <label title="Linear warmup steps for the cosine schedule">Warmup steps <input type="number" id="trWarmup" value="0" min="0" /></label>
+        <label title="Hold out this fraction of the corpus; keeps the best epoch by validation loss. 0 = off">Val fraction (0=off) <input type="number" id="trVal" value="0" step="0.05" min="0" max="0.5" /></label>
+        <label title="Stop after this many epochs without validation improvement; 0 = never">Patience <input type="number" id="trPatience" value="0" min="0" /></label>
+        <label title="Reuse this BPE tokenizer file; trained and saved there if missing">Tokenizer file <input type="text" id="trTokenizer" placeholder="optional, e.g. tok.bpe" /></label>
+        <label title="Training checkpoint (weights + optimizer state)">Checkpoint file <input type="text" id="trCkpt" placeholder="optional, e.g. run.fckp" /></label>
+        <label title="Save the checkpoint every N optimizer steps (and at the end); 0 = only at the end">Checkpoint every <input type="number" id="trCkptEvery" value="0" min="0" /></label>
       </div>
-      <div class="row" data-fields="transformer">
+      <div class="row">
         <label class="chk"><input type="checkbox" id="trCosine" /> Cosine LR (with warmup)</label>
         <label class="chk"><input type="checkbox" id="trTie" /> Tie embedding + head</label>
         <label class="chk"><input type="checkbox" id="trQat" checked /> Int8 QAT</label>
@@ -417,33 +406,6 @@
       <div id="exResult" class="result"></div>
     </section>
 
-    <!-- ── Tabular (train_cli) ───────────────────────────────────────────── -->
-    <section class="panel" id="panel-tabular">
-      <h2>Tabular MLP — <code>train_cli</code></h2>
-      <p class="hint">Trains a tabular classifier/regressor from any CSV via the
-        <code>train_cli</code> binary. Output streams into the terminal below.
-        Build it first with <code>cargo build -p train_cli --release</code>.</p>
-      <div class="row">
-        <label>train_cli binary <input type="text" id="tbBin" value="./target/release/train_cli" /></label>
-        <button class="ghost browse" data-target="tbBin">Browse…</button>
-      </div>
-      <div class="row">
-        <label>CSV <input type="text" id="tbCsv" placeholder="/path/to/data.csv" /></label>
-        <button class="ghost browse" data-target="tbCsv">Browse…</button>
-      </div>
-      <div class="row">
-        <label>Model output <input type="text" id="tbModel" placeholder="/path/to/tab_model.bin" /></label>
-        <button class="ghost browse-save" data-target="tbModel">Browse…</button>
-      </div>
-      <div class="grid">
-        <label>Dataset name <input type="text" id="tbName" value="Dataset" /></label>
-        <label>Hidden <input type="number" id="tbHidden" value="32" min="1" /></label>
-        <label>Epochs <input type="number" id="tbEpochs" value="500" min="1" /></label>
-      </div>
-      <span class="err" id="errTab"></span>
-      <button id="tbRun" class="primary">Run in terminal</button>
-    </section>
-
     <!-- ── System ────────────────────────────────────────────────────────── -->
     <section class="panel" id="panel-system">
       <h2>System monitor</h2>
@@ -493,16 +455,12 @@
   <!-- ── Docked terminal ──────────────────────────────────────────────────── -->
   <section id="terminal">
     <div class="term-head">
-      <span>Terminal — engine <code>--verbose</code> log &amp; shell</span>
+      <span>Engine log — <code>--verbose</code> output</span>
       <div class="term-actions">
         <button id="termClear" class="ghost small">Clear</button>
       </div>
     </div>
     <div id="termOut" class="term-out"></div>
-    <div class="term-input">
-      <span id="termPrompt" class="prompt">$</span>
-      <input type="text" id="termCmd" placeholder="type a shell command and press Enter…" autocomplete="off" spellcheck="false" />
-    </div>
   </section>
 
   <!-- ── Capability report dialog ─────────────────────────────────────────── -->

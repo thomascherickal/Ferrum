@@ -35,9 +35,9 @@
 //! LayerNorm parameters and embeddings stay f32 in memory (the embedding table
 //! is dequantized on load).
 use crate::activation::Activation;
-use crate::csv::{ModelMetadata, Normalizer};
 use crate::error::{InferError, Result};
 use crate::layer::{ActivationLayer, Embedding, Flatten, LayerNorm, Linear, TransformerBlock};
+use crate::meta::{ModelMetadata, Normalizer};
 use crate::model::Sequential;
 use crate::quant::{int8_scale, int8_scales_per_channel, QKind, QWeight, QUANT_MIN_LEN};
 
@@ -775,8 +775,8 @@ pub fn load(path: &str) -> Result<(Sequential, Normalizer, ModelMetadata)> {
 mod tests {
     use super::*;
     use crate::activation::Activation;
-    use crate::csv::TaskType;
     use crate::layer::ActivationLayer;
+    use crate::meta::TaskType;
     use crate::tensor::Tensor;
 
     fn make_bundle() -> (Sequential, Normalizer, ModelMetadata) {

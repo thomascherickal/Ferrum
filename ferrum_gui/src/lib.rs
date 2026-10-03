@@ -13,13 +13,11 @@
 //! | `finetune-progress` | `{ epoch, total, loss, ppl }`    | GGUF fine-tune epoch  |
 //! | `finetune-done` | [`commands::FinetuneResult`]         | GGUF fine-tune done   |
 //! | `gen-fragment`  | `String` (streamed text fragment)    | streaming generation  |
-//! | `term-output`   | `{ line, stream }`                   | interactive terminal  |
 
 mod capable;
 mod commands;
 mod datasets;
 
-use std::path::PathBuf;
 use std::sync::Mutex;
 use sysinfo::System;
 use tauri::Emitter;
@@ -28,19 +26,14 @@ use tauri::Emitter;
 pub struct AppState {
     /// Reused `sysinfo` handle so CPU usage deltas are meaningful between polls.
     pub sys: Mutex<System>,
-    /// Working directory for the embedded shell (so `cd` persists).
-    pub cwd: Mutex<PathBuf>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             sys: Mutex::new(System::new_all()),
-            cwd: Mutex::new(cwd),
         })
         .setup(|app| {
             // Mirror every ferrum_core `--verbose` line into the GUI terminal.
@@ -63,8 +56,6 @@ pub fn run() {
             commands::run_gguf,
             commands::finetune_gguf,
             commands::export_gguf,
-            commands::run_terminal,
-            commands::term_cwd,
             commands::system_stats,
             capable::capability_report,
             datasets::list_datasets,

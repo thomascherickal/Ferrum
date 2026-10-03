@@ -92,32 +92,6 @@ function termLine(text, cls = "") {
 }
 $("termClear").addEventListener("click", () => { termOut.innerHTML = ""; });
 
-let termBusy = false;
-async function refreshPrompt() {
-  if (!hasTauri) { $("termPrompt").textContent = "$"; return; }
-  try { $("termPrompt").textContent = (await invoke("term_cwd")) + " $"; } catch { $("termPrompt").textContent = "$"; }
-}
-async function runTerminal(cmd) {
-  if (!cmd.trim()) return;
-  termLine($("termPrompt").textContent + " " + cmd, "cmd");
-  if (!hasTauri) { termLine("(backend unavailable outside Tauri)", "stderr"); return; }
-  termBusy = true; $("termCmd").disabled = true;
-  try {
-    const code = await invoke("run_terminal", { command: cmd });
-    if (code !== 0) termLine(`[exit ${code}]`, "sys");
-  } catch (e) {
-    termLine(String(e), "stderr");
-  } finally {
-    termBusy = false; $("termCmd").disabled = false;
-    await refreshPrompt(); $("termCmd").focus();
-  }
-}
-$("termCmd").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !termBusy) {
-    const v = $("termCmd").value; $("termCmd").value = ""; runTerminal(v);
-  }
-});
-
 // ── Datasets ─────────────────────────────────────────────────────────────────
 let cleanedCorpus = "";
 
@@ -261,14 +235,6 @@ $("dsSave").addEventListener("click", async () => {
 });
 
 // ── Train ─────────────────────────────────────────────────────────────────────
-function applyMethodVisibility() {
-  const m = $("trMethod").value;
-  bySel("[data-fields]").forEach((el) => {
-    el.style.display = el.dataset.fields.split(" ").includes(m) ? "" : "none";
-  });
-}
-$("trMethod").addEventListener("change", applyMethodVisibility);
-applyMethodVisibility();
 
 let lossHistory = [];
 function drawChart() {
@@ -295,9 +261,8 @@ $("trStart").addEventListener("click", async () => {
   clearErr("errTrain");
   let params;
   try {
-    const method = $("trMethod").value;
     params = {
-      method,
+      method: "transformer",
       corpusPath: reqStr("trCorpus", "Corpus"),
       modelPath: reqStr("trModel", "Model output"),
       contextLen: reqInt("trContext", "Context"),
@@ -307,7 +272,6 @@ $("trStart").addEventListener("click", async () => {
       hiddenDim: reqInt("trHidden", "Hidden"),
       epochs: reqInt("trEpochs", "Epochs"),
       lr: reqNum("trLr", "Learning rate", 0),
-      momentum: Math.max(0, num("trMomentum") || 0),
       batchSize: reqInt("trBatch", "Batch"),
       vocabSize: Math.max(0, int("trVocab") || 0),
       seed: Math.max(0, int("trSeed") || 0),
@@ -332,13 +296,9 @@ $("trStart").addEventListener("click", async () => {
     if (params.resume && !params.checkpointPath)
       throw new Error("Resume needs a checkpoint file");
     // Client-side guards mirroring the backend, for instant feedback.
-    if (method === "transformer") {
-      if (params.embedDim % params.numHeads !== 0)
-        throw new Error(`Embed dim (${params.embedDim}) must be divisible by heads (${params.numHeads})`);
-      if (params.vocabSize !== 0 && params.vocabSize < 256)
-        throw new Error("Vocab must be 0 (char-level) or ≥ 256 (BPE)");
-    }
-    if (method === "embedded" && params.vocabSize !== 0 && params.vocabSize < 256)
+    if (params.embedDim % params.numHeads !== 0)
+      throw new Error(`Embed dim (${params.embedDim}) must be divisible by heads (${params.numHeads})`);
+    if (params.vocabSize !== 0 && params.vocabSize < 256)
       throw new Error("Vocab must be 0 (char-level) or ≥ 256 (BPE)");
   } catch (e) { setErr("errTrain", String(e)); return; }
 
@@ -728,25 +688,6 @@ $("exExport").addEventListener("click", async () => {
   } finally { $("exExport").disabled = false; }
 });
 
-// ── Tabular (train_cli via shell) ──────────────────────────────────────────────
-$("tbRun").addEventListener("click", async () => {
-  clearErr("errTab");
-  let cmd;
-  try {
-    const bin = reqStr("tbBin", "train_cli binary");
-    const csv = reqStr("tbCsv", "CSV");
-    const model = reqStr("tbModel", "Model output");
-    const name = reqStr("tbName", "Dataset name");
-    const hidden = reqInt("tbHidden", "Hidden");
-    const epochs = reqInt("tbEpochs", "Epochs");
-    const q = (s) => `"${s.replace(/"/g, '\\"')}"`;
-    cmd = `${q(bin)} ${q(csv)} ${q(model)} ${q(name)} ${hidden} ${epochs}`;
-  } catch (e) { setErr("errTab", String(e)); return; }
-  // Make sure the terminal is visible and run there (streams output).
-  toast("Running train_cli — see terminal", "info");
-  await runTerminal(cmd);
-});
-
 // ── System monitor ──────────────────────────────────────────────────────────
 let sysTimer = null;
 function fmtBytes(b) {
@@ -859,7 +800,6 @@ $("capCheck").addEventListener("click", async () => {
 // ── Backend event wiring ──────────────────────────────────────────────────────
 async function wireEvents() {
   await listen("engine-log", (e) => termLine(e.payload, "log"));
-  await listen("term-output", (e) => termLine(e.payload.line, e.payload.stream === "stderr" ? "stderr" : ""));
   await listen("train-progress", (e) => {
     const p = e.payload;
     // total is null under a token budget (epoch count unknown up front).
@@ -894,7 +834,6 @@ async function wireEvents() {
   $("connDot").classList.add("ok");
   $("connDot").title = "Backend connected";
   await wireEvents();
-  await refreshPrompt();
   restartMonitor();
   termLine("Ferrum SLM Studio ready. Verbose engine logs and shell output appear here.", "sys");
 })();

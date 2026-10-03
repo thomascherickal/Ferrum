@@ -1,5 +1,5 @@
 [package]
-name    = "tabular_wasm"
+name    = "slm_wasm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
