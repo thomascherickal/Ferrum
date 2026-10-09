@@ -15,7 +15,7 @@
 
 ## Global Constraints
 
-- Task order: GA, GB, then G1 (GPT-2 codec; rewritten once llama.cpp's exact keys are pinned), G2, G3, G4, G5 (compat tests).
+- Task order: GA, GB, GT, G1, G2, G3, G4; then Phase 0 Tasks 1–5; then G5 (needs Phase 0 Task 4's `generate_tokens`).
 - Supported size range: from **~0.1M params** (reference tiny config `--context 64 --embed 64 --heads 4 --blocks 2 --hidden 128 --vocab 512 --tie` = 103,936 params) to the 507,552-param reference and beyond. Tensors whose GGML row length is not a multiple of 32 are stored **F32** (exact), never F16.
 
 - Branch `feat/dataops-serve-eval`. No worktree: this runs before the parallel phases.
@@ -276,7 +276,202 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task G1: GGUF model codec behind the `loader` API
+### Task GT: GPT-2-compatible tokenizer (llama.cpp `gpt-2` pre-tokenizer, bytes-to-unicode vocab, EOS)
+
+**Files:**
+- Modify: `ferrum_core/Cargo.toml` (add `unicode-general-category = "1"`; check `cargo search unicode-general-category` for the current major version and pin it)
+- Modify: `ferrum_core/src/tokenizer.rs` (`pretokenize`, `TOK_EOS`, training always registers EOS, the GGUF vocab export/import)
+- Test: `ferrum_core/src/tokenizer.rs` tests
+
+**Interfaces:**
+- Produces:
+  ```rust
+  pub const TOK_EOS: &str = "<|endoftext|>";      // was "<eos>"; equals DOC_SEP (Phase 0 Task 3)
+  /// GPT-2 byte → unicode char mapping (llama.cpp unicode_byte_to_utf8_map / OpenAI bytes_to_unicode).
+  pub fn byte_to_unicode(b: u8) -> char;
+  impl ByteBpeTokenizer {
+      /// Training always reserves one id for TOK_EOS: merges are learned to vocab_size - 1, then EOS is added.
+      pub fn train(corpus: &str, vocab_size: usize) -> Result<Self>;
+      /// tokenizer.ggml.tokens: token i's bytes mapped through byte_to_unicode; specials by name.
+      pub fn gguf_tokens(&self) -> Vec<String>;
+      /// tokenizer.ggml.merges in rank order: "<left> <right>" in byte_to_unicode space.
+      pub fn gguf_merges(&self) -> Vec<String>;
+      /// tokenizer.ggml.token_type: 1 = normal, 3 = control (specials).
+      pub fn gguf_token_types(&self) -> Vec<i32>;
+      /// Rebuild from the three arrays (inverse of the above). Errors on a merge whose parts are not tokens.
+      pub fn from_gguf_vocab(tokens: &[String], merges: &[String], token_types: &[i32]) -> Result<Self>;
+  }
+  ```
+- `pretokenize(text)` becomes a port of llama.cpp b11521's `unicode_regex_split_custom_gpt2`, i.e. the regex `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)` (with the implicit `\s+` fallback the C++ splitter applies). It still returns a partition of `text`, so encode/decode round-trips. The reference source is at `/tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/tools/llama-src/llama.cpp-b11521/src/unicode.cpp:215` (splitter) and `:148` (byte map); read both before writing the port. `\p{L}` and `\p{N}` come from `unicode_general_category::get_general_category` (letter = Lu/Ll/Lt/Lm/Lo; number = Nd/Nl/No). `\s` is `char::is_whitespace`.
+
+- [ ] **Step 1: Failing tests**
+
+```rust
+    #[test]
+    fn pretokenize_matches_gpt2_regex() {
+        let cases: &[(&str, &[&str])] = &[
+            ("Hello world", &["Hello", " world"]),
+            ("I'm here, it's 2024!", &["I", "'m", " here", ",", " it", "'s", " ", "2024", "!"]),
+            ("a  b", &["a", " ", " b"]),
+            ("x\n\ny", &["x", "\n", "\n", "y"]),
+            ("end   ", &["end", "   "]),
+            ("naïve café", &["naïve", " café"]),
+            ("<|endoftext|>Once", &["<|", "endoftext", "|>", "Once"]),
+        ];
+        for (text, want) in cases {
+            let got = pretokenize(text);
+            assert_eq!(&got, want, "{text:?}");
+            assert_eq!(got.concat(), *text);
+        }
+    }
+```
+
+(The expected splits above follow the GPT-2 regex by hand. If the ported splitter disagrees on a case, check that case against llama.cpp: `/tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/tools/llama.cpp/llama-b11521/llama-tokenize -m /tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/gpt2gguf/gpt2-f32.gguf -p "<text>" --ids` gives GPT-2's ids. Decode them with the HF tokenizer in `/tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/venv` to see the pieces. Then fix whichever side is wrong; llama.cpp is the authority.)
+
+```rust
+    #[test]
+    fn byte_to_unicode_matches_gpt2() {
+        assert_eq!(byte_to_unicode(b'A'), 'A');
+        assert_eq!(byte_to_unicode(b' '), 'Ġ');
+        assert_eq!(byte_to_unicode(b'\n'), 'Ċ');
+        let all: std::collections::HashSet<char> = (0..=255u8).map(byte_to_unicode).collect();
+        assert_eq!(all.len(), 256);
+    }
+
+    #[test]
+    fn training_reserves_eos_and_gguf_vocab_roundtrips() {
+        let tok = ByteBpeTokenizer::train("the cat sat on the mat. the cat ran. ".repeat(20).as_str(), 300).unwrap();
+        assert_eq!(tok.vocab_size(), 300);
+        assert_eq!(tok.eos_id(), Some(299));
+        let (t, m, ty) = (tok.gguf_tokens(), tok.gguf_merges(), tok.gguf_token_types());
+        assert_eq!(t.len(), 300);
+        assert_eq!(t[b' ' as usize], "Ġ");
+        assert_eq!(t[299], "<|endoftext|>");
+        assert_eq!(ty[299], 3);
+        assert!(m.iter().all(|x| x.matches(' ').count() == 1));
+        let back = ByteBpeTokenizer::from_gguf_vocab(&t, &m, &ty).unwrap();
+        assert_eq!(back.encode_state(), tok.encode_state());
+        let text = "the cat sat. ünïcode 123";
+        assert_eq!(back.encode(text), tok.encode(text));
+    }
+```
+
+- [ ] **Step 2: Verify failure.** Expected: compile errors, plus a failure on the current whitespace-only `pretokenize`.
+
+- [ ] **Step 3: Implement** per the interface.
+  - `train` reserves the EOS id. Phase 0 Task 3's `train_with_docs` then only has to strip separators before training.
+  - Leave a `// ponytail:` note in `train` saying EOS is always reserved so every GGUF has a real `eos_token_id`.
+  - Update every test and caller that assumed `vocab_size` merges, or the `"<eos>"` name: `grep -rn "TOK_EOS\|<eos>\|vocab_size() - 256\|merges().len()" ferrum_core tests slm_cli slm_wasm ferrum_gui/src`.
+  - Tests that pinned exact token ids or counts from the old pre-tokenizer must be re-derived, and listed in the commit message.
+
+- [ ] **Step 4: Verify** — the full battery from Global Constraints.
+
+- [ ] **Step 5: Commit**
+
+```bash
+cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
+git add -A ferrum_core tests slm_cli slm_wasm ferrum_gui/src Cargo.lock
+git commit -m "feat!(tokenizer): llama.cpp gpt-2 pre-tokenizer, bytes-to-unicode GGUF vocab, EOS always reserved
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task G1: GGUF model codecs behind the `loader` API (GPT-2 for BPE transformers, generic for the rest)
+
+**Files:**
+- Modify: `ferrum_core/src/gguf.rs` (tolerate the generic layout; nothing new is needed for reading Q8_0/Q4_0/F16/F32, because `dequantize` covers them)
+- Modify: `ferrum_core/src/loader.rs` (new `to_gguf`, `from_gguf`, `gguf_quant`; FINF stays until G2)
+- Test: `ferrum_core/src/loader.rs` tests
+
+**Facts pinned from llama.cpp b11521** (research 2026-10-09; the toolchain ran a converted GPT-2 in llama.cpp, Ollama and LM Studio with identical greedy output):
+- **KV keys.** The loader is type-strict.
+  - `general.architecture` (str `"gpt2"`).
+  - UINT32: `gpt2.context_length`, `gpt2.embedding_length`, `gpt2.block_count`, `gpt2.feed_forward_length`, `gpt2.attention.head_count`.
+  - FLOAT32: `gpt2.attention.layer_norm_epsilon` = 1e-5.
+  - `tokenizer.ggml.model` = `"gpt2"`, `tokenizer.ggml.pre` = `"gpt-2"`.
+  - `tokenizer.ggml.tokens` [string], `tokenizer.ggml.merges` [string] (required), `tokenizer.ggml.token_type` [INT32].
+  - UINT32 `tokenizer.ggml.bos_token_id` and `tokenizer.ggml.eos_token_id`, both = the EOS id.
+  - BOOL `tokenizer.ggml.add_bos_token` = false and `tokenizer.ggml.add_eos_token` = false.
+  - UINT32 `general.file_type` (0 = all F32, 7 = mostly Q8_0, 2 = mostly Q4_0) and UINT32 `general.quantization_version` = 2.
+- **Tensors**, as GGML dims `[ne0, ne1]`:
+
+  | Tensor | dims |
+  |---|---|
+  | `token_embd.weight` | `[n_embd, n_vocab]` |
+  | `position_embd.weight` | `[n_embd, n_ctx]` |
+  | `blk.N.attn_norm.{weight,bias}` | `[n_embd]` |
+  | `blk.N.attn_qkv.weight` | `[n_embd, 3·n_embd]`, rows Q, then K, then V |
+  | `blk.N.attn_qkv.bias` | `[3·n_embd]`, Q\|K\|V |
+  | `blk.N.attn_output.{weight,bias}` | `[n_embd, n_embd]` / `[n_embd]` |
+  | `blk.N.ffn_norm.{weight,bias}` | `[n_embd]` |
+  | `blk.N.ffn_up.weight` | `[n_embd, n_ff]`, bias `[n_ff]` |
+  | `blk.N.ffn_down.weight` | `[n_ff, n_embd]`, bias `[n_embd]` |
+  | `output_norm.{weight,bias}` | `[n_embd]` |
+  | `output.weight` | `[n_embd, n_vocab]`, **omitted when tied**: llama.cpp falls back to `token_embd`, and the head has no bias |
+
+  A weight's `ne0` is its **input** dim. Ferrum's row-major `[in, out]` matrix is therefore written transposed: GGML row `o` holds column `o` of Ferrum's matrix.
+- **Quant types:**
+  - Q8_0 and Q4_0 need `ne0 % 32 == 0`; otherwise the tensor must be F32 (Ferrum's rule) or F16.
+  - 1-D tensors are always F32.
+  - Following llama-quantize's convention, `position_embd` stays F32 even when quantizing. **GB's QAT must not snap `position_embd`.** If GB snapped it, change GB's `fake_quantize_weights` in this task and say so in the commit message.
+  - `encode_tensor(data, ggml_type)` in `gguf_write.rs` encodes GGML-ordered data. Its Q8_0 path is GB's shared `q8_0_block`.
+- **Ferrum extras** go under the `ferrum.` namespace, which llama.cpp ignores:
+  - `ferrum.format` u32 = 1
+  - `ferrum.quant` str `f32` | `int8` | `int4`
+  - `ferrum.metadata` str (the `ModelMetadata` JSON minus the tokenizer state, which lives in `tokenizer.ggml.*`)
+  - `ferrum.normalizer` str
+
+**Interfaces:**
+- Produces:
+  ```rust
+  pub use QPrec; // F32 | Int8 (→ Q8_0) | Int4 (→ Q4_0)
+  pub fn to_gguf(model: &Sequential, norm: &Normalizer, meta: &ModelMetadata, prec: QPrec) -> Result<Vec<u8>>;
+  pub fn from_gguf(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata)>;
+  pub fn gguf_quant(bytes: &[u8]) -> Result<String>;
+  ```
+  - `to_gguf` picks the **GPT-2 codec** when the model is a BPE transformer SLM: `meta.task == TaskType::TransformerSLM`, non-empty `meta.tokenizer_state`, and layers `Embedding, TransformerBlock×N, LayerNorm, Linear, Softmax`. Anything else uses the **generic codec**: `general.architecture = "ferrum"`, the `ferrum.layer.{i}.*` keys and `l{i}.*` tensors from the layout table at the top of this plan, with the I8 encoding replaced by standard F32/Q8_0/Q4_0 under the same `ne0 % 32` rule and the same transposed `[in,out]` handling.
+  - `from_gguf` dispatches on `general.architecture`:
+    - `gpt2` builds `Embedding`, the blocks (via `TransformerBlock::from_parts`, splitting QKV), `LayerNorm`, the head `Linear` (zero bias; from `output.weight`, or the transposed `token_embd` when absent) and `Softmax`. All weights are dequantized to f32.
+    - The tokenizer comes from `ByteBpeTokenizer::from_gguf_vocab(tokens, merges, token_type)`. `ModelMetadata` is rebuilt from `ferrum.metadata` when present, otherwise from the `gpt2.*` keys, so a **foreign** GPT-2 GGUF (e.g. `/tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/gpt2gguf/gpt2-f32.gguf`) also loads.
+    - `ferrum` builds the generic layer list.
+    - Anything else returns `Err(Format("not a Ferrum-loadable model: architecture …"))`.
+  - `gguf_quant` reads `ferrum.quant`, falling back to `general.file_type`.
+
+- [ ] **Step 1: Failing tests**
+  - `f32_gguf_roundtrip_is_exact`: a GPT-2-codec model with a BPE tokenizer, built by training a tiny model as in the test below. It must round-trip `forward` bit-exactly, and the tokenizer state must survive.
+  - `qat_model_reloads_bit_identically_from_int8_gguf`: train a QAT model with **embed 64** (Q8_0-eligible), save it as Int8, reload, and require `evaluate()` to be equal.
+  - `int4_and_ineligible_dims`: an embed-48 model (no tensor eligible) saved as Int8 has every tensor F32 (check with `Gguf::parse` that the types are `GGML_F32`) and round-trips exactly. An embed-64 model saved as Int4 loads and its forward is within 0.1 of f32.
+  - `gpt2_layout_matches_llama_cpp`: parse a written file and assert the exact key and tensor names and dims above, including that `output.weight` is absent for a tied model and present for an untied one.
+  - `tabular_mlp_roundtrips_with_normalizer` (generic codec, as in the original G1 text below).
+  - `rejects_foreign_and_truncated_gguf`: a llama-architecture GGUF is rejected; every truncation point errors without panicking; `b"FINF…"` errors.
+  - `loads_foreign_gpt2_gguf`: if `/tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/gpt2gguf/gpt2-f32.gguf` exists, load it and check that `generate_tokens` (or a greedy argmax loop over `forward`) continues `"Hello, my name is"` with `" John. I'm a writer"`, which is what llama.cpp and HF produced. Skip with a printed note when the file is absent.
+
+  Use a 0.1M-class tiny config for speed: `--context 64 --embed 64 --heads 4 --blocks 2 --hidden 128 --vocab 512 --tie`.
+
+- [ ] **Step 2: Verify failure.**
+
+- [ ] **Step 3: Implement.**
+  - Write shared helpers `put_matrix(name, ferrum_row_major, rows_in, cols_out, prec)`, which transposes to GGML and picks the type by the `ne0` rule, and `put_rows(name, row_major, rows, ne0, prec)` for embeddings, which needs no transpose. Write matching `get_*` readers using `Gguf::dequantize` and transposing back.
+  - Both codecs use the same helpers.
+  - Map `meta`'s fields (`input_dim` = context, `output_dim` = vocab, etc.) to and from the `gpt2.*` keys.
+
+- [ ] **Step 4: Verify** — the full battery.
+
+- [ ] **Step 5: Commit**
+
+```bash
+cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
+git add -A ferrum_core
+git commit -m "feat(loader): GPT-2 GGUF codec (llama.cpp layout) + generic Ferrum GGUF codec
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+<details><summary>Superseded original G1 (custom I8 codec) — reference only for the generic codec's layer/tensor naming and the tabular test</summary>
+
+#### (superseded) Task G1 original text
 
 **Files:**
 - Modify: `ferrum_core/src/gguf.rs` (add `GGML_I8 = 24` to `type_nbytes` (1 byte per element); add `pub(crate) fn raw_tensor(&self, name: &str) -> Result<Vec<u8>>` built on the private `tensor_bytes`)
@@ -640,6 +835,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
+
+</details>
+
+---
+
 ### Task G2: Switch every model file to GGUF, convert committed models, delete FINF
 
 **Files:**
@@ -670,6 +870,8 @@ fn main() {
         let ver = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
         let (m, n, meta) = ferrum_core::loader::from_bytes(&bytes).unwrap();
         let prec = if ver == 5 { ferrum_core::loader::QPrec::Int8 } else { ferrum_core::loader::QPrec::F32 };
+        // Note: FINF SLMs were trained with ReLU and a head bias, so they cannot be converted faithfully after Task GA.
+        // Convert only non-transformer (tabular) models; old SLM .bin files are retrained, not converted.
         let out = path.trim_end_matches(".bin").to_string() + ".gguf";
         std::fs::write(&out, ferrum_core::loader::to_gguf(&m, &n, &meta, prec).unwrap()).unwrap();
         println!("{path} → {out}");
@@ -863,4 +1065,53 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 (cd ../Ferrum-ML && cargo test --release 2>&1 | grep -E "^test result|FAILED" && git add -A && git commit -m "chore: forbid unsafe_code in every crate
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>")
+```
+
+---
+
+### Task G5: Run Ferrum GGUFs in llama.cpp, Ollama, and LM Studio (compat tests) — execute after Phase 0 Task 4
+
+**Files:**
+- Create: `scripts/verify_runtimes.sh` (based on `/tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/gpt2gguf/verify.sh`; tool paths come from env vars `FERRUM_LLAMA_BIN` (the dir holding `llama-completion` and `llama-tokenize`), `FERRUM_OLLAMA` (the `ollama` binary), and `FERRUM_LMS` (default `~/.lmstudio/bin/lms`). Any tool that is not found is skipped with a message.)
+- Create: `tests/tests/test_runtime_compat.rs`
+
+**Pinned commands** (b11521, Ollama v0.40.2, LM Studio 0.4.18):
+- llama.cpp: `$FERRUM_LLAMA_BIN/llama-completion -m X.gguf -p "<prompt>" -n 16 --temp 0 -no-cnv --no-warmup </dev/null 2>/dev/null`
+- llama.cpp tokenizer: `$FERRUM_LLAMA_BIN/llama-tokenize -m X.gguf -p "<text>" --ids --log-disable`
+- Ollama:
+  - `OLLAMA_HOST=127.0.0.1:11545 OLLAMA_MODELS=<dir> $FERRUM_OLLAMA serve &`
+  - a Modelfile containing `FROM /abs/X.gguf`, then `ollama create NAME -f Modelfile`
+  - `curl -s http://127.0.0.1:11545/api/generate -d '{"model":"NAME","prompt":"<p>","raw":true,"stream":false,"options":{"temperature":0,"num_predict":16}}'`
+- LM Studio:
+  - `lms import -y -l --user-repo ferrum-test/x X.gguf`
+  - the key from `lms ls --json`, matched on `path`
+  - `lms load KEY --gpu off --identifier ID -y`, then `lms server start -p 1234`
+  - `POST /v1/completions` with `max_tokens` 17 (it returns N−1 visible tokens), `temperature` 0 and `repeat_penalty` 1.0
+  - unload and delete the import afterwards
+
+- [ ] **Step 1: Write the tests** (each one skips with `eprintln!("skip: …")` and returns when its tool or env var is missing)
+  - `tokenizer_matches_llama_cpp`: train a tiny BPE model (the 0.1M config) on a fixed small corpus and save it as F32 GGUF. For strings covering contractions, digits, punctuation runs, multiple spaces, newlines, non-ASCII and the literal `<|endoftext|>`, Ferrum's `encode_docs` ids must equal `llama-tokenize --ids` output.
+  - `llama_cpp_greedy_matches_ferrum_f32`: train the **0.1M-param** model (`--context 64 --embed 64 --heads 4 --blocks 2 --hidden 128 --vocab 512 --tie`, 103,936 params) for enough steps that its distribution is peaked (a repetitive corpus, e.g. 200 copies of a short story). Save it as F32. Ferrum's `generate_tokens(prompt, 16, &[], greedy)` text must equal llama.cpp's 16-token output.
+  - `llama_cpp_runs_q8_0_and_q4_0`: the same model saved Int8 and Int4. llama.cpp loads both and prints 16 tokens. For Q8_0, also compare to Ferrum's greedy output from the reloaded file and print the first mismatch index. Assert equality only on the first 8 tokens, because llama.cpp quantizes activations for Q8_0 matmuls, which can flip near-ties late in a tiny model.
+  - `ollama_and_lm_studio_run_ferrum_gguf`: runs only when `FERRUM_VERIFY_RUNTIMES=1`. Invokes `scripts/verify_runtimes.sh` on the F32 file and asserts that each available tool returned non-empty text equal to llama.cpp's.
+  - Also the **507,552-param reference config** (embed 96): train for a few steps, save as Int8, and require that llama.cpp loads it and generates. This proves the larger end too.
+
+- [ ] **Step 2: Run them** with the tools installed in the scratchpad:
+
+```bash
+export FERRUM_LLAMA_BIN=/tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/tools/llama.cpp/llama-b11521 FERRUM_OLLAMA=/tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/tools/ollama/bin/ollama FERRUM_VERIFY_RUNTIMES=1
+cargo test -p integration_tests --release --test test_runtime_compat -- --nocapture --test-threads 1
+```
+
+(Use the integration crate's real package name from `tests/Cargo.toml`.) Expected: every test passes, none skipped. A greedy mismatch in the F32 test is a real bug: find the first diverging op (tokenizer ids, then logits of the first step via a single forward) rather than loosening the assertion.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add scripts/verify_runtimes.sh tests/tests/test_runtime_compat.rs
+git commit -m "test: Ferrum GGUFs run in llama.cpp, Ollama, LM Studio (0.1M and 0.5M configs)
+
+<paste the three tools' outputs for the 0.1M model>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```

@@ -25,7 +25,7 @@
 
 - `score_rolling` scores **every** token, conditioned on a leading BOS (EOS id when the tokenizer has one, else id 0). `evaluate()` therefore reports `num_predictions == token count`.
 - The new token-budget, multi-stop generator is a **new** method `generate_tokens`; the existing `generate_until(seed, max_chars, stop: &str, …)` keeps its signature because the GUI and tests call it.
-- EOS is registered only when the training corpus contains `<|endoftext|>` (keeps every existing training run and test bit-identical).
+- EOS (`<|endoftext|>` = `TOK_EOS` = `DOC_SEP`) is always reserved by BPE training (Phase 0-G Task GT), so every GGUF has a real `eos_token_id`. `train_with_docs` therefore only strips separators before training.
 
 ## Review Focus
 
@@ -488,7 +488,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Interfaces:**
 - Produces:
   ```rust
-  pub const DOC_SEP: &str = "<|endoftext|>";
+  pub const DOC_SEP: &str = TOK_EOS; // "<|endoftext|>" since Phase 0-G GT
   impl ByteBpeTokenizer {
       /// Like `encode`, but each `DOC_SEP` becomes the EOS id when the tokenizer has one.
       pub fn encode_docs(&self, text: &str) -> Vec<usize>;
@@ -515,7 +515,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
         let plain = ByteBpeTokenizer::train("abc abc abc", 260).unwrap();
         let docs = ByteBpeTokenizer::train_with_docs("abc abc abc", 260).unwrap();
         assert_eq!(plain.encode_state(), docs.encode_state());
-        assert_eq!(docs.encode_docs("x<|endoftext|>y"), docs.encode("x<|endoftext|>y"));
+        // A tokenizer rebuilt without specials keeps the separator as literal text.
+        let bare = ByteBpeTokenizer::byte_level();
+        assert_eq!(bare.encode_docs("x<|endoftext|>y"), bare.encode("x<|endoftext|>y"));
     }
 ```
 
@@ -549,7 +551,7 @@ In `tokenizer.rs`, near the `TOK_*` constants:
 /// Document separator used by prepared corpora (`train_transformer prepare`)
 /// and TinyStories. Tokenizers trained with [`ByteBpeTokenizer::train_with_docs`]
 /// on text containing it map it to the EOS special token.
-pub const DOC_SEP: &str = "<|endoftext|>";
+pub const DOC_SEP: &str = TOK_EOS; // "<|endoftext|>" since Phase 0-G GT
 ```
 
 Replace the temporary `encode_docs` and add `train_with_docs`:
@@ -576,12 +578,9 @@ Replace the temporary `encode_docs` and add `train_with_docs`:
     /// separators to `vocab_size - 1` and [`TOK_EOS`] is registered, so the
     /// total vocabulary is still `vocab_size`. Otherwise identical to `train`.
     pub fn train_with_docs(corpus: &str, vocab_size: usize) -> Result<Self> {
-        if !corpus.contains(DOC_SEP) {
-            return Self::train(corpus, vocab_size);
-        }
-        let mut tok = Self::train(&corpus.replace(DOC_SEP, ""), vocab_size - 1)?;
-        tok.add_special_token(TOK_EOS)?;
-        Ok(tok)
+        // `train` already reserves TOK_EOS (Phase 0-G GT); separators must not
+        // leak into the learned merges.
+        Self::train(&corpus.replace(DOC_SEP, ""), vocab_size)
     }
 ```
 
