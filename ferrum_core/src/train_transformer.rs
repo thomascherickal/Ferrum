@@ -949,16 +949,16 @@ impl TransformerNet {
     }
 
     /// Snap exactly the tensors the GGUF writer stores as Q8_0 onto their
-    /// Q8_0 values (32-blocks, f16 scale, same axis as GGML): embedding tables
-    /// along their rows, `[in, out]` weights down each column, the untied head
-    /// likewise. 1-D params and matrices whose GGML row length is not a
-    /// multiple of 32 (stored F32) are left alone. With weight tying the head
-    /// is re-mirrored from the snapped embedding.
+    /// Q8_0 values (32-blocks, f16 scale, same axis as GGML): the token
+    /// embedding along its rows, `[in, out]` weights down each column, the
+    /// untied head likewise. 1-D params, the position embedding (GGUF keeps
+    /// `position_embd` F32, the llama-quantize convention) and matrices whose
+    /// GGML row length is not a multiple of 32 (stored F32) are left alone.
+    /// With weight tying the head is re-mirrored from the snapped embedding.
     pub(crate) fn fake_quantize_weights(&mut self) {
         use crate::quant::{fake_quantize_q8_0_cols, fake_quantize_q8_0_rows};
         let e = self.embed_dim;
         fake_quantize_q8_0_rows(&mut self.tok_emb.data.data, e);
-        fake_quantize_q8_0_rows(&mut self.pos_emb.data.data, e);
         for b in &mut self.blocks {
             for w in [
                 &mut b.q_w,
@@ -1858,7 +1858,13 @@ mod tests {
         let mut rng = Rng::new(3);
         let mut net = TransformerNet::new(8, 4, 32, 2, 64, 1, &mut rng).unwrap();
         net.set_weight_tying(true);
+        let pos_before = net.pos_emb.data.data.clone();
         net.fake_quantize_weights();
+        // position_embd stays F32 in GGUF (llama-quantize convention): never snapped.
+        assert_eq!(
+            net.pos_emb.data.data, pos_before,
+            "pos_emb must not be snapped"
+        );
         let mut once = net.snapshot_weights();
         net.fake_quantize_weights();
         assert_eq!(net.snapshot_weights(), once, "snap must be idempotent");
