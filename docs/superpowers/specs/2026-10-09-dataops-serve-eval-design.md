@@ -66,14 +66,14 @@ loads the prepared train split whole); OpenAI-compatible routes; a DVC remote.
 - **Model file** = `general.architecture = "gpt2"` GGUF with llama.cpp's GPT-2 tensor names (fused
   `attn_qkv`), plus a `ferrum.*` metadata namespace (task, class names, normalizer, quant) that
   llama.cpp ignores. Tensor types: F32, F16, Q8_0 (int8), Q4_0 (int4). A tensor whose row length is
-  not a multiple of 32 is stored F16 (Q8_0/Q4_0 need 32-element blocks).
+  not a multiple of 32 is stored F32 — exact, never F16 (Q8_0/Q4_0 need 32-element blocks).
 - **QAT simulates Q8_0 exactly** (32-element blocks along each weight row, f16-rounded scale), so an
   int8 file reloads bit-identically to the trained model. int4 (Q4_0) export stays a lossy option.
 - Loaded Ferrum GGUF weights are dequantized to f32 in memory (small models); the packed
   int8/int4 kernels remain for imported Llama models.
 - **Non-model files**: training checkpoints and the reusable tokenizer file are GGUF containers
   with `general.architecture = "ferrum-checkpoint"` / `"ferrum-tokenizer"` (not runnable models).
-- **Non-transformer models** (Ferrum-ML tabular MLPs) are GGUF with `general.architecture = "ferrum-mlp"`
+- **Non-transformer models** (Ferrum-ML tabular MLPs) are GGUF with `general.architecture = "ferrum"` (the generic layer-list codec; also used for character-level models)
   (generic layer list) — GGUF, but not runnable in llama.cpp, which has no MLP-classifier architecture.
 - Exact key names, tensor shapes, and the pre-tokenizer regex are pinned from llama.cpp's source in
   plan `2026-10-09-p0g-gguf-only.md`.
@@ -214,7 +214,7 @@ train_transformer prepare --input <file|dir>... --out <dir>
 ### 5.3 DVC
 
 - `params.yaml`: `fetch` (url, sha256), `prepare` (flags in §5.1), `model`
-  (context, embed, heads, blocks, hidden, vocab — the 486,624-param review
+  (context, embed, heads, blocks, hidden, vocab — the 507,552-param reference (embed 96, 3 blocks; all dims multiples of 32), replacing the 486,624-param review
   config as default), `train` (tokens, lr, warmup, clip, val, patience, quant,
   seed).
 - `dvc.yaml` stages, each a CLI call templated from `params.yaml`:
@@ -252,7 +252,7 @@ Binary `ferrum-serve --model <path.gguf> [--host 127.0.0.1] [--port 8080]
 | `POST /v1/loglikelihood_rolling` | `{"texts":[...]}` | `{"results":[{"logprob","n_tokens"}]}` |
 | `POST /v1/generate` | `{"requests":[{"prompt","max_tokens","stop","temperature","top_k","top_p","seed"}]}` | `{"results":[{"text","n_tokens"}]}` |
 
-- Model held in `Arc`; each request's work runs in `spawn_blocking`.
+- `GenerativeSLM` is not `Sync`, so one dedicated model thread owns it and serves jobs from a channel (one request at a time; each matmul still uses every core).
 - Limits enforced before any compute; violations → `400`/`413` with
   `{"error": "..."}`. Model errors → `422`. Binds loopback by default.
 - `generate` defaults: `temperature 0` (greedy), `max_tokens 64`, `seed 0`.

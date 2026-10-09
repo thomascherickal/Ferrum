@@ -181,7 +181,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - §7 generation cost: one re-prime per `context_len/2` tokens.
   - Eval section: every token is scored, plus speed.
   - Add a short serving and LightEval chapter that points to `Samples.md` §7–8.
-  - Fix the `--tie` text: shared weights during training; the file still stores the head.
+  - Fix the `--tie` text: shared weights during training, and a tied GGUF omits `output.weight` (llama.cpp reuses `token_embd`), so the file shrinks by `vocab × embed` weights.
   - Fix the `clean_corpus` lowercase default.
 - [ ] **Status.md:**
   - Snapshot: date 2026-10-09, branch, test counts from `$S/facts/tests.txt`.
