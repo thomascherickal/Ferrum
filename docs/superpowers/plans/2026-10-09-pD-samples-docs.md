@@ -74,7 +74,7 @@ git worktree remove ../Ferrum-A; git worktree remove ../Ferrum-B; git worktree r
 
 ### Task 2: Gather the facts the docs will cite
 
-- [ ] Run and save each output to `$S/facts/` (`S=/tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad`):
+- [ ] Run and save each output to `$S/facts/` (`S=/home/thomas/Projects/ferrum-cpu/.ferrum-dev`):
 
 ```bash
 mkdir -p $S/facts

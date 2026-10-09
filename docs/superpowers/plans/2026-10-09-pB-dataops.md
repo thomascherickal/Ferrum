@@ -926,9 +926,9 @@ Then check reproducibility and the DVC workflow:
 ```bash
 .venv/bin/dvc status                     # "Data and pipelines are up to date."
 cat metrics/test.json data/prepared/manifest.json | head -40
-sha256sum models/slm.gguf > /tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/slm1.sha
+sha256sum models/slm.gguf > /home/thomas/Projects/ferrum-cpu/.ferrum-dev/slm1.sha
 .venv/bin/dvc repro --force train
-sha256sum -c /tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/slm1.sha   # must print OK (deterministic training)
+sha256sum -c /home/thomas/Projects/ferrum-cpu/.ferrum-dev/slm1.sha   # must print OK (deterministic training)
 .venv/bin/dvc params diff && .venv/bin/dvc metrics show
 ```
 

@@ -302,7 +302,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
       pub fn from_gguf_vocab(tokens: &[String], merges: &[String], token_types: &[i32]) -> Result<Self>;
   }
   ```
-- `pretokenize(text)` becomes a port of llama.cpp b11521's `unicode_regex_split_custom_gpt2`, i.e. the regex `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)` (with the implicit `\s+` fallback the C++ splitter applies). It still returns a partition of `text`, so encode/decode round-trips. The reference source is at `/tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/tools/llama-src/llama.cpp-b11521/src/unicode.cpp:215` (splitter) and `:148` (byte map); read both before writing the port. `\p{L}` and `\p{N}` come from `unicode_general_category::get_general_category` (letter = Lu/Ll/Lt/Lm/Lo; number = Nd/Nl/No). `\s` is `char::is_whitespace`.
+- `pretokenize(text)` becomes a port of llama.cpp b11521's `unicode_regex_split_custom_gpt2`, i.e. the regex `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)` (with the implicit `\s+` fallback the C++ splitter applies). It still returns a partition of `text`, so encode/decode round-trips. The reference source is at `/home/thomas/Projects/ferrum-cpu/.ferrum-dev/llama-src/llama.cpp-b11521/src/unicode.cpp:215` (splitter) and `:148` (byte map); read both before writing the port. `\p{L}` and `\p{N}` come from `unicode_general_category::get_general_category` (letter = Lu/Ll/Lt/Lm/Lo; number = Nd/Nl/No). `\s` is `char::is_whitespace`.
 
 - [ ] **Step 1: Failing tests**
 
@@ -326,7 +326,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
     }
 ```
 
-(The expected splits above follow the GPT-2 regex by hand. If the ported splitter disagrees on a case, check that case against llama.cpp: `/tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/tools/llama.cpp/llama-b11521/llama-tokenize -m /tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/gpt2gguf/gpt2-f32.gguf -p "<text>" --ids` gives GPT-2's ids. Decode them with the HF tokenizer in `/tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/venv` to see the pieces. Then fix whichever side is wrong; llama.cpp is the authority.)
+(The expected splits above follow the GPT-2 regex by hand. If the ported splitter disagrees on a case, check that case against llama.cpp: `/home/thomas/.local/opt/llama.cpp-b11521/llama-tokenize -m /home/thomas/Projects/ferrum-cpu/.ferrum-dev/gpt2gguf/gpt2-f32.gguf -p "<text>" --ids` gives GPT-2's ids. Decode them with the HF tokenizer in `/home/thomas/Projects/ferrum-cpu/.ferrum-dev/venv` to see the pieces. Then fix whichever side is wrong; llama.cpp is the authority.)
 
 ```rust
     #[test]
@@ -434,7 +434,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - `to_gguf` picks the **GPT-2 codec** when the model is a BPE transformer SLM: `meta.task == TaskType::TransformerSLM`, non-empty `meta.tokenizer_state`, and layers `Embedding, TransformerBlock×N, LayerNorm, Linear, Softmax`. Anything else uses the **generic codec**: `general.architecture = "ferrum"`, the `ferrum.layer.{i}.*` keys and `l{i}.*` tensors from the layout table at the top of this plan, with the I8 encoding replaced by standard F32/Q8_0/Q4_0 under the same `ne0 % 32` rule and the same transposed `[in,out]` handling.
   - `from_gguf` dispatches on `general.architecture`:
     - `gpt2` builds `Embedding`, the blocks (via `TransformerBlock::from_parts`, splitting QKV), `LayerNorm`, the head `Linear` (zero bias; from `output.weight`, or the transposed `token_embd` when absent) and `Softmax`. All weights are dequantized to f32.
-    - The tokenizer comes from `ByteBpeTokenizer::from_gguf_vocab(tokens, merges, token_type)`. `ModelMetadata` is rebuilt from `ferrum.metadata` when present, otherwise from the `gpt2.*` keys, so a **foreign** GPT-2 GGUF (e.g. `/tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/gpt2gguf/gpt2-f32.gguf`) also loads.
+    - The tokenizer comes from `ByteBpeTokenizer::from_gguf_vocab(tokens, merges, token_type)`. `ModelMetadata` is rebuilt from `ferrum.metadata` when present, otherwise from the `gpt2.*` keys, so a **foreign** GPT-2 GGUF (e.g. `/home/thomas/Projects/ferrum-cpu/.ferrum-dev/gpt2gguf/gpt2-f32.gguf`) also loads.
     - `ferrum` builds the generic layer list.
     - Anything else returns `Err(Format("not a Ferrum-loadable model: architecture …"))`.
   - `gguf_quant` reads `ferrum.quant`, falling back to `general.file_type`.
@@ -446,7 +446,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - `gpt2_layout_matches_llama_cpp`: parse a written file and assert the exact key and tensor names and dims above, including that `output.weight` is absent for a tied model and present for an untied one.
   - `tabular_mlp_roundtrips_with_normalizer` (generic codec, as in the original G1 text below).
   - `rejects_foreign_and_truncated_gguf`: a llama-architecture GGUF is rejected; every truncation point errors without panicking; `b"FINF…"` errors.
-  - `loads_foreign_gpt2_gguf`: if `/tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/gpt2gguf/gpt2-f32.gguf` exists, load it and check that `generate_tokens` (or a greedy argmax loop over `forward`) continues `"Hello, my name is"` with `" John. I'm a writer"`, which is what llama.cpp and HF produced. Skip with a printed note when the file is absent.
+  - `loads_foreign_gpt2_gguf`: if `/home/thomas/Projects/ferrum-cpu/.ferrum-dev/gpt2gguf/gpt2-f32.gguf` exists, load it and check that `generate_tokens` (or a greedy argmax loop over `forward`) continues `"Hello, my name is"` with `" John. I'm a writer"`, which is what llama.cpp and HF produced. Skip with a printed note when the file is absent.
 
   Use a 0.1M-class tiny config for speed: `--context 64 --embed 64 --heads 4 --blocks 2 --hidden 128 --vocab 512 --tie`.
 
@@ -1072,7 +1072,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>")
 ### Task G5: Run Ferrum GGUFs in llama.cpp, Ollama, and LM Studio (compat tests) — execute after Phase 0 Task 4
 
 **Files:**
-- Create: `scripts/verify_runtimes.sh` (based on `/tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/gpt2gguf/verify.sh`; tool paths come from env vars `FERRUM_LLAMA_BIN` (the dir holding `llama-completion` and `llama-tokenize`), `FERRUM_OLLAMA` (the `ollama` binary), and `FERRUM_LMS` (default `~/.lmstudio/bin/lms`). Any tool that is not found is skipped with a message.)
+- Create: `scripts/verify_runtimes.sh` (based on `/home/thomas/Projects/ferrum-cpu/.ferrum-dev/gpt2gguf/verify.sh`; tool paths come from env vars `FERRUM_LLAMA_BIN` (the dir holding `llama-completion` and `llama-tokenize`), `FERRUM_OLLAMA` (the `ollama` binary), and `FERRUM_LMS` (default `~/.lmstudio/bin/lms`). Any tool that is not found is skipped with a message.)
 - Create: `tests/tests/test_runtime_compat.rs`
 - Modify: `.github/workflows/ci.yml` (new job `runtimes`)
 
