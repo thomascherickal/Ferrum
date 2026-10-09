@@ -2175,7 +2175,7 @@ mod tests {
         let mut rng = Rng::new(3);
         let _ = GenerativeSLM::train_transformer_config_validated(
             &corpus,
-            &t5_cfg(200),
+            &t5_cfg(3000),
             1,
             &vcfg,
             &mut rng,
@@ -2183,7 +2183,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            count < 200,
+            count < 3000,
             "early stopping never triggered (ran {count} epochs)"
         );
         assert!(

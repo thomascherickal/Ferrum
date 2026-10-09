@@ -494,10 +494,12 @@ struct BlockCache {
     xhat2: Tensor,
     inv_std2: Vec<f32>,
     norm2: Tensor,
-    /// FFN-2 input [M, hidden]: ReLU(h) — or, when dropout is active, the
-    /// dropped-and-scaled hidden `ReLU(h) ⊙ mask`.
-    h_relu: Tensor,
-    /// Inverted-dropout mask×scale applied to `h_relu` (T7), present only when
+    /// FFN-1 pre-activation [M, hidden].
+    h_pre: Tensor,
+    /// FFN-2 input [M, hidden]: GELU(h) — or, when dropout is active, the
+    /// dropped-and-scaled hidden `GELU(h) ⊙ mask`.
+    h_act: Tensor,
+    /// Inverted-dropout mask×scale applied to the GELU output (T7), present only when
     /// dropout was active for this forward; `None` means no dropout.
     ffn_dropout: Option<Vec<f32>>,
 }
@@ -538,7 +540,6 @@ pub struct TransformerNet {
     lnf_g: Param,
     lnf_b: Param,
     head_w: Param, // [C, vocab]
-    head_b: Param, // [vocab]
     step_t: u64,
     /// Quantization Aware Training: when enabled, `train_transformer_epoch`
     /// runs forward/backward against int8-snapped weights while Adam updates
@@ -610,7 +611,6 @@ impl TransformerNet {
             lnf_g: Param::constant(vec![embed_dim], 1.0),
             lnf_b: Param::constant(vec![embed_dim], 0.0),
             head_w: Param::randn(vec![embed_dim, vocab_size], scale, rng),
-            head_b: Param::constant(vec![vocab_size], 0.0),
             step_t: 0,
             qat: false,
             grad_clip: None,
@@ -789,7 +789,6 @@ impl TransformerNet {
         v.push(&self.lnf_g);
         v.push(&self.lnf_b);
         v.push(&self.head_w);
-        v.push(&self.head_b);
         v
     }
 
@@ -801,7 +800,6 @@ impl TransformerNet {
         v.push(&mut self.lnf_g);
         v.push(&mut self.lnf_b);
         v.push(&mut self.head_w);
-        v.push(&mut self.head_b);
         v
     }
 
@@ -895,7 +893,6 @@ impl TransformerNet {
         v.push(&mut self.lnf_g.data);
         v.push(&mut self.lnf_b.data);
         v.push(&mut self.head_w.data);
-        v.push(&mut self.head_b.data);
         v
     }
 
@@ -925,7 +922,6 @@ impl TransformerNet {
         v.push(&mut self.lnf_g.grad);
         v.push(&mut self.lnf_b.grad);
         v.push(&mut self.head_w.grad);
-        v.push(&mut self.head_b.grad);
         v
     }
 
@@ -988,7 +984,6 @@ impl TransformerNet {
             + self.lnf_g.data.numel()
             + self.lnf_b.data.numel()
             + self.head_w.data.numel()
-            + self.head_b.data.numel()
     }
 
     /// Forward pass over `tokens` (length must be a multiple of `context_len`;
@@ -1002,7 +997,7 @@ impl TransformerNet {
     }
 
     /// Forward pass with optional FFN-hidden dropout (T7). When `dropout > 0`,
-    /// each block's post-ReLU hidden activations are inverted-dropout masked
+    /// each block's post-GELU hidden activations are inverted-dropout masked
     /// using a local generator seeded by `seed` (so the masks are deterministic
     /// for a given seed and a worker can reproduce them in `backward` from the
     /// cache). `dropout = 0` is the plain, deterministic forward.
@@ -1055,13 +1050,13 @@ impl TransformerNet {
             let x_attn = ops::add(&x_in, &proj)?;
             let (norm2, xhat2, inv_std2) = ln_fwd(&x_attn, &blk.ln2_g.data, &blk.ln2_b.data)?;
             let h_pre = linear_fwd(&norm2, &blk.f1_w.data, &blk.f1_b.data)?;
-            let h_relu = h_pre.map(|v| v.max(0.0));
+            let h_act = h_pre.map(crate::activation::gelu);
             // Inverted FFN dropout: zero each hidden unit with prob `dropout`,
             // scale survivors by 1/(1-dropout) so the expectation is unchanged
             // and inference needs no rescaling.
             let (h_ffn, ffn_dropout) = if dropout > 0.0 {
                 let scale = 1.0 / (1.0 - dropout);
-                let mask: Vec<f32> = (0..h_relu.data.len())
+                let mask: Vec<f32> = (0..h_act.data.len())
                     .map(|_| {
                         if drng.next_f32() < dropout {
                             0.0
@@ -1070,15 +1065,11 @@ impl TransformerNet {
                         }
                     })
                     .collect();
-                let dropped: Vec<f32> = h_relu
-                    .data
-                    .iter()
-                    .zip(&mask)
-                    .map(|(&h, &m)| h * m)
-                    .collect();
-                (Tensor::new(h_relu.shape.clone(), dropped)?, Some(mask))
+                let dropped: Vec<f32> =
+                    h_act.data.iter().zip(&mask).map(|(&h, &m)| h * m).collect();
+                (Tensor::new(h_act.shape.clone(), dropped)?, Some(mask))
             } else {
-                (h_relu, None)
+                (h_act, None)
             };
             let ff2 = linear_fwd(&h_ffn, &blk.f2_w.data, &blk.f2_b.data)?;
             cur = ops::add(&x_attn, &ff2)?;
@@ -1094,13 +1085,16 @@ impl TransformerNet {
                 xhat2,
                 inv_std2,
                 norm2,
-                h_relu: h_ffn,
+                h_pre,
+                h_act: h_ffn,
                 ffn_dropout,
             });
         }
 
         let (norm_f, xhat_f, inv_std_f) = ln_fwd(&cur, &self.lnf_g.data, &self.lnf_b.data)?;
-        let logits = linear_fwd(&norm_f, &self.head_w.data, &self.head_b.data)?;
+        // LM head has no bias (GPT-2 / llama.cpp graph).
+        let no_bias = Tensor::vector(vec![0.0; self.vocab_size]);
+        let logits = linear_fwd(&norm_f, &self.head_w.data, &no_bias)?;
 
         Ok((
             logits,
@@ -1141,7 +1135,7 @@ impl TransformerNet {
         let c = self.embed_dim;
 
         // LM head + final LayerNorm (each produced exactly once).
-        let (g_head_w, g_head_b, d_normf) = linear_bwd(&cache.norm_f, &self.head_w.data, dlogits)?;
+        let (g_head_w, _g_head_b, d_normf) = linear_bwd(&cache.norm_f, &self.head_w.data, dlogits)?;
         let (mut dx, g_lnf_g, g_lnf_b) =
             ln_bwd(&d_normf, &cache.xhat_f, &cache.inv_std_f, &self.lnf_g.data)?;
 
@@ -1150,28 +1144,26 @@ impl TransformerNet {
         let mut block_grads: Vec<Option<BlockGrads>> =
             (0..self.blocks.len()).map(|_| None).collect();
         for (bi, (blk, bc)) in self.blocks.iter().zip(&cache.blocks).enumerate().rev() {
-            // out = x_attn + ffn2(relu(ffn1(norm2)))
+            // out = x_attn + ffn2(gelu(ffn1(norm2)))
             let d_out = dx;
-            let (g_f2_w, g_f2_b, dh) = linear_bwd(&bc.h_relu, &blk.f2_w.data, &d_out)?;
-            // Backward through (optional) dropout then ReLU. `bc.h_relu` is the
-            // FFN-2 input — post-dropout when active — so `h > 0` flags units
-            // that were both kept and ReLU-active; the dropout mask×scale then
-            // carries the inverted-dropout scaling into the gradient.
+            let (g_f2_w, g_f2_b, dh) = linear_bwd(&bc.h_act, &blk.f2_w.data, &d_out)?;
+            // Backward through (optional) dropout then GELU. The dropout
+            // mask×scale carries the inverted-dropout scaling into the gradient.
             let dh_pre = Tensor::new(
                 dh.shape.clone(),
                 match &bc.ffn_dropout {
                     Some(mask) => dh
                         .data
                         .iter()
-                        .zip(&bc.h_relu.data)
+                        .zip(&bc.h_pre.data)
                         .zip(mask)
-                        .map(|((&g, &h), &m)| if h > 0.0 { g * m } else { 0.0 })
+                        .map(|((&g, &h), &m)| g * m * crate::activation::gelu_grad(h))
                         .collect(),
                     None => dh
                         .data
                         .iter()
-                        .zip(&bc.h_relu.data)
-                        .map(|(&g, &h)| if h > 0.0 { g } else { 0.0 })
+                        .zip(&bc.h_pre.data)
+                        .map(|(&g, &h)| g * crate::activation::gelu_grad(h))
                         .collect(),
                 },
             )?;
@@ -1251,7 +1243,6 @@ impl TransformerNet {
         out.extend_from_slice(&g_lnf_g.data);
         out.extend_from_slice(&g_lnf_b.data);
         out.extend_from_slice(&g_head_w.data);
-        out.extend_from_slice(&g_head_b.data);
         Ok(out)
     }
 
@@ -1266,7 +1257,6 @@ impl TransformerNet {
         self.lnf_g.zero_grad();
         self.lnf_b.zero_grad();
         self.head_w.zero_grad();
-        self.head_b.zero_grad();
     }
 
     /// Apply one Adam update to every parameter. When a learning-rate schedule
@@ -1300,7 +1290,6 @@ impl TransformerNet {
         self.lnf_g.step(adam, t)?;
         self.lnf_b.step(adam, t)?;
         self.head_w.step(adam, t)?;
-        self.head_b.step(adam, t)?;
         Ok(())
     }
 
@@ -1362,7 +1351,7 @@ impl TransformerNet {
             self.embed_dim,
             self.vocab_size,
             head_w_data,
-            self.head_b.data.data.clone(),
+            vec![0.0; self.vocab_size],
         )?));
         m.push(Box::new(ActivationLayer::new(
             crate::activation::Activation::Softmax,
@@ -1763,7 +1752,6 @@ mod tests {
         check!(lnf_g, "lnf_g", &[0, 3]);
         check!(lnf_b, "lnf_b", &[1]);
         check!(head_w, "head_w", &[0, 7, 19]);
-        check!(head_b, "head_b", &[2]);
         check_blk!(ln1_g, "ln1_g", &[0, 2]);
         check_blk!(ln1_b, "ln1_b", &[1]);
         check_blk!(q_w, "q_w", &[0, 5, 15]);
@@ -1879,6 +1867,14 @@ mod tests {
         for (a, b) in before.data.iter().zip(&after.data) {
             assert!((a - b).abs() < 0.05, "int8 export drifted: {a} vs {b}");
         }
+    }
+
+    #[test]
+    fn head_has_no_bias() {
+        let mut rng = Rng::new(9);
+        let net = TransformerNet::new(40, 8, 16, 2, 32, 2, &mut rng).unwrap();
+        // tok 640 + pos 128 + 2 blocks * 2224 + lnf 32 + head_w 640; no `+ vocab` bias term.
+        assert_eq!(net.num_params(), 640 + 128 + 2 * 2224 + 32 + 640);
     }
 
     #[test]
@@ -2072,7 +2068,7 @@ mod tests {
         for v in net.tok_emb.data.data.iter_mut() {
             *v = 2.0;
         } // 2-D weight
-        for v in net.head_b.data.data.iter_mut() {
+        for v in net.blocks[0].f1_b.data.data.iter_mut() {
             *v = 2.0;
         } // 1-D bias
         for v in net.lnf_g.data.data.iter_mut() {
@@ -2088,7 +2084,7 @@ mod tests {
         );
         // Bias and LN gain untouched.
         assert!(
-            (net.head_b.data.data[0] - 2.0).abs() < 1e-6,
+            (net.blocks[0].f1_b.data.data[0] - 2.0).abs() < 1e-6,
             "bias was decayed"
         );
         assert!(
@@ -2176,7 +2172,7 @@ mod tests {
     /// The dropout backward is correct: against a fixed mask (fixed seed), the
     /// analytic gradient matches central differences both for the FFN-2 weight
     /// (directly downstream of dropout) and the FFN-1 weight (upstream, so the
-    /// mask must propagate back through ReLU).
+    /// mask must propagate back through GELU).
     #[test]
     fn dropout_gradient_is_correct_for_fixed_mask() {
         let mut rng = Rng::new(3);

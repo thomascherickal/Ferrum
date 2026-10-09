@@ -733,7 +733,7 @@ impl TransformerBlock {
         let x_attn = Tensor::matrix(1, c, x_attn)?;
 
         let norm2 = self.ln2.forward(&x_attn)?;
-        let hidden = self.ffn1.forward(&norm2)?.map(|v| v.max(0.0));
+        let hidden = self.ffn1.forward(&norm2)?.map(crate::activation::gelu);
         let ff2 = self.ffn2.forward(&hidden)?;
         let out: Vec<f32> = (0..c).map(|i| x_attn.data[i] + ff2.data[i]).collect();
         Tensor::matrix(1, c, out)
@@ -934,12 +934,12 @@ impl Layer for TransformerBlock {
 
         vprintln!("[layer::TransformerBlock::forward]   ├─ FFN (in → hidden → out)");
         let ff1 = self.ffn1.forward(&norm2)?;
-        // ReLU
-        let ffn_hidden = ff1.map(|x| x.max(0.0));
+        // GELU
+        let ffn_hidden = ff1.map(crate::activation::gelu);
         if verbose::is_verbose() {
             let zeros = ffn_hidden.data.iter().filter(|&&v| v == 0.0).count();
             vprintln!(
-                "[layer::TransformerBlock::forward]   │  FFN ReLU: {}/{} zeros ({:.1}% dead)",
+                "[layer::TransformerBlock::forward]   │  FFN GELU: {}/{} exact zeros ({:.1}%)",
                 zeros,
                 ffn_hidden.data.len(),
                 100.0 * zeros as f32 / ffn_hidden.data.len() as f32

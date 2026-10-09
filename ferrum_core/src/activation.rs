@@ -4,6 +4,21 @@ use crate::ops;
 use crate::tensor::Tensor;
 use crate::verbose;
 
+/// GELU, tanh approximation — identical to llama.cpp's `ggml_gelu`, so Ferrum
+/// models run unchanged in llama.cpp's GPT-2 graph.
+pub fn gelu(x: f32) -> f32 {
+    const K: f32 = 0.797_884_6; // sqrt(2/pi)
+    0.5 * x * (1.0 + (K * (x + 0.044715 * x * x * x)).tanh())
+}
+
+/// d/dx [`gelu`].
+pub fn gelu_grad(x: f32) -> f32 {
+    const K: f32 = 0.797_884_6;
+    let u = K * (x + 0.044715 * x * x * x);
+    let t = u.tanh();
+    0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * K * (1.0 + 3.0 * 0.044715 * x * x)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Activation {
     Identity,
@@ -115,6 +130,23 @@ mod tests {
         ] {
             assert_eq!(Activation::from_tag(a.tag()), Some(a));
         }
+    }
+
+    #[test]
+    fn gelu_matches_tanh_approximation_and_its_derivative() {
+        let k = (2.0f32 / std::f32::consts::PI).sqrt();
+        for &x in &[-6.0f32, -2.0, -0.5, 0.0, 0.3, 1.0, 4.0] {
+            let want = 0.5 * x * (1.0 + (k * (x + 0.044715 * x * x * x)).tanh());
+            assert!((gelu(x) - want).abs() < 1e-6, "gelu({x})");
+            let h = 1e-3;
+            let num = (gelu(x + h) - gelu(x - h)) / (2.0 * h);
+            assert!(
+                (gelu_grad(x) - num).abs() < 1e-3,
+                "gelu'({x}): {} vs {num}",
+                gelu_grad(x)
+            );
+        }
+        assert_eq!(gelu(0.0), 0.0);
     }
 
     #[test]
