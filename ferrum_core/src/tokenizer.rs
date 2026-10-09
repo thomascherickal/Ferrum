@@ -333,6 +333,11 @@ impl ByteBpeTokenizer {
         out.extend(ids.into_iter().map(|i| i as usize));
     }
 
+    /// Encode text that may contain document separators (see DOC_SEP).
+    pub fn encode_docs(&self, text: &str) -> Vec<usize> {
+        self.encode(text)
+    }
+
     /// Encode text to token IDs: pre-tokenize at whitespace boundaries (K2),
     /// then rank-based BPE-encode each chunk (K1) and concatenate.
     pub fn encode(&self, text: &str) -> Vec<usize> {

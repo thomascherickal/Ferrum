@@ -104,7 +104,7 @@ pub use parallel::num_threads;
 pub use quant::{fake_quantize_int8, QKind, QWeight, QUANT_MIN_LEN};
 pub use rng::Rng;
 pub use slm::{
-    Evaluation, GenerativeSLM, SamplingParams, TransformerConfig, ValidationConfig,
+    Evaluation, GenerativeSLM, SamplingParams, Score, TransformerConfig, ValidationConfig,
     ValidationProgress,
 };
 pub use tensor::Tensor;
