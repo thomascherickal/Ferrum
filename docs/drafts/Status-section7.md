@@ -60,12 +60,11 @@ must do.
 | Severity | Issue |
 |---|---|
 | 🟡 | **The training corpus is read whole.** `train` loads the prepared train split into memory and holds tokens as 8-byte `usize`. `prepare` streams its input, but there is no pre-tokenized file or streamed training. A multi-gigabyte corpus will hit RAM. |
-| 🟡 | **The server handles one request at a time.** <!-- MEASURE: confirm; the plan says one model thread because GenerativeSLM is not Send/Sync, the spec says spawn_blocking --> A long batch delays other clients. It has no authentication and no TLS, and binds to loopback by default. |
-| 🟡 | **LightEval needs two workarounds on 0.13.0.** `FerrumModel` skips `super().__init__()`, and rolling log-likelihood is not cached. The module is pinned to that version and to `xxhash<4`. The litellm and TGI backends cannot run log-likelihood tasks. Python is not in CI. |
-| 🟡 | **Quantized files can differ from llama.cpp late in a generation.** llama.cpp quantizes activations in Q8_0 matmuls. f32 files match exactly; Q8_0 files are checked over the first 8 tokens; Q4_0 files are checked only for loading and generating. |
-| 🟡 | **Character-level models and Ferrum-ML tabular models do not run in llama.cpp, Ollama, or LM Studio.** They are GGUF, but use a generic Ferrum layout. |
-| 🟡 | **`export-unsloth` is pending.** The location where Unsloth Studio discovers local models is still being verified. <!-- MEASURE: resolve and update --> |
-| 🟡 | **Only the verified tool versions are tested.** llama.cpp b11521, Ollama v0.40.2, LM Studio 0.4.18. The runtime tests skip a tool that is not installed. Newer versions may behave differently. |
+| 🟡 | **The server handles one request at a time.** One dedicated model thread owns the model, because `GenerativeSLM` is not `Send` or `Sync`. Each matmul still uses every core, but a long batch delays other clients. It has no authentication and no TLS, and binds to loopback by default. |
+| 🟡 | **LightEval needs two workarounds on 0.13.0.** `FerrumModel` skips `super().__init__()`, and rolling log-likelihood is not cached. The module is pinned to that version, to `xxhash<4`, and to `datasets<5`. The litellm and TGI backends cannot run log-likelihood tasks. Python is not in CI. |
+| 🟡 | **Quantized files can differ from llama.cpp late in a generation.** llama.cpp quantizes activations in Q8_0 matmuls. f32 files match exactly; Q8_0 files are compared over the first 8 tokens; Q4_0 files are checked only for loading and generating. |
+| 🟡 | **Character-level models and Ferrum-ML tabular models do not run in llama.cpp, Ollama, or LM Studio.** They are GGUF, but use a generic Ferrum layout. The export commands refuse them. |
+| 🟡 | **Only the verified tool versions are tested.** llama.cpp b11521, Ollama v0.40.2, LM Studio 0.4.18. Runtime tests skip a missing tool, but fail under `FERRUM_REQUIRE_RUNTIMES=1`; the CI `runtimes` job sets it (llama.cpp and Ollama required, `FERRUM_SKIP_LMSTUDIO=1` as the one exemption; LM Studio is required locally before a release). Newer versions may behave differently. |
 | 🟡 | **Models are small and CPU-bound.** The reachable sizes in Status §3 are unchanged until re-measured. <!-- MEASURE: re-run the capability table after the speed work --> |
 | 🟡 | **The Capable tab's training estimates are rough.** They ignore activation memory and attention FLOPs, and they scale a single-thread GEMM rate by 8 hyperthreads on 4 physical cores. Treat them as loose upper bounds. |
 | 🟡 | **The GUI is not click-tested after the 2026-10-03 changes, or after the GGUF change.** The backend compiles and its tests pass. |
@@ -76,3 +75,51 @@ must do.
 
 <!-- MEASURE: test counts for §1 Snapshot (ferrum_core unit, integration, slm_wasm, slm_server, doc-tests, ferrum_gui, Ferrum-ML) -->
 <!-- MEASURE: §9 Metrics before/after: train tokens/s, eval seconds, generate ms/token on the reference model, with the machine name and date -->
+
+---
+
+## 1. Snapshot (replacement)
+
+| | |
+|---|---|
+| **Scope** | A pure-Rust engine for training, running, serving, and evaluating small transformer SLMs on the CPU. Models are GPT-2-architecture GGUF files that run in llama.cpp, Ollama, and LM Studio. Also GGUF import, fine-tuning, and export for Llama/Qwen |
+| **Date and branch** | 2026-10-09 · `feat/dataops-serve-eval` <!-- MEASURE: version and branch at release --> |
+| **Build** | <!-- MEASURE: cargo build --workspace result; ferrum_gui build result --> |
+| **Tests** | <!-- MEASURE: counts for ferrum_core unit, slm_cli, slm_server, integration, slm_wasm, doc-tests, ferrum_gui, Ferrum-ML; Python unittest count --> |
+| **Safety** | `#![forbid(unsafe_code)]` in every crate, plus a repo-wide scan test |
+| **Dependencies** | Few, each with a measured reason <!-- MEASURE: list --> |
+| **Commits** | <!-- MEASURE: git log --oneline master..HEAD --> |
+
+## 6. Roadmap (replacement)
+
+### 6.1 Done in this release
+
+Scoring API and fast evaluation, EOS as a special token, strict CLI, linear-time
+generation, `prepare` with manifests, DVC pipeline, `ferrum-serve`, the LightEval
+module, GGUF-only files, GPT-2-compatible models, and the Ollama and LM Studio
+export commands.
+
+### 6.2 Still open
+
+The eight-upgrades items (F3 `qwen3`, F7 GGUF perplexity, F5 streamed export, F6
+safe-SIMD decode, F4 GUI boot test) and the from-scratch gaps in the old §6.2
+that this release did not touch: a pre-tokenized streamed corpus, Llama
+architecture from scratch, gradient accumulation, distillation, SFT, LoRA.
+<!-- MEASURE: copy the still-open rows from the current Status §6 after checking each against the release -->
+These are directions, not commitments.
+
+## 9. Metrics (replacement)
+
+_As of commit <!-- MEASURE: sha and date -->, excluding `target/`._
+
+| Metric | Value |
+|---|---:|
+| Workspace crates | <!-- MEASURE: ferrum_core, slm_cli, slm_server, slm_wasm, tests + ferrum_gui (excluded) --> |
+| `ferrum_core` source files / lines | <!-- MEASURE --> |
+| External dependencies (`ferrum_core`) | <!-- MEASURE --> |
+| `unsafe` blocks | 0 (forbidden) |
+| Tests | <!-- MEASURE --> |
+| Train tokens/s, reference model, review baseline vs final | <!-- MEASURE: machine, date --> |
+| Eval seconds, reference model, before vs after | <!-- MEASURE: machine, date --> |
+| Generate ms/token, before vs after | <!-- MEASURE: machine, date --> |
+| Markdown documents | 5 (`ReadMe`, `Manual`, `Status`, `Samples`, `glossary`) |

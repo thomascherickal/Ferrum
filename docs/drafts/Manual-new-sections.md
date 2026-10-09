@@ -20,8 +20,8 @@ numbers in the order shown. Cross-references in `ReadMe.md` use these numbers.
   `deny` instead of `forbid`. Dependencies may use `unsafe` inside themselves;
   Ferrum calls only their safe APIs. This rules out crate functions that are
   `unsafe fn` (for example `matrixmultiply::sgemm` and the `gemm` crate when
-  called directly). The cost is concrete: reading a model cannot use
-  memory-mapping, so Ferrum streams files with ordinary safe reads.
+  called directly). Ferrum's own code never calls `unsafe`, so none of
+  these appear in it.
 - **Dependencies need a measured reason.** Earlier versions had an empty
   `[dependencies]` table. That rule is dropped. A crate is admitted only when:
   1. a benchmark shows a gain (or the crate replaces more code than it adds),
@@ -37,8 +37,8 @@ numbers in the order shown. Cross-references in `ReadMe.md` use these numbers.
 
 | Crate | Used for | Why it is kept |
 |---|---|---|
-| `rayon` | Worker pool behind the matmul row split (not on wasm32) | Replaced the hand-written pool. Kept only if no slower than it. <!-- MEASURE: rayon vs hand-written pool, train tokens/s and generate ms/token --> |
-| A matmul crate (`gemm` or `matrixmultiply`, called only through safe APIs) | `ops::matmul`, `qlinear` | Kept only if at least as fast as the current kernel. <!-- MEASURE: which crate won, or "none beat the current kernel", with GFLOP/s from `cargo bench --bench gemm` --> |
+| `rayon` | Worker pool behind the matmul row split (not on wasm32) | Replaces the hand-written pool. Kept only if no slower than it. <!-- MEASURE: rayon vs hand-written pool, train tokens/s and generate ms/token --> |
+| A matmul crate used through a safe API (candidates: `ndarray` with its `matrixmultiply` backend, and `faer`) | `ops::matmul`, `qlinear` | Kept only if at least 10% faster on train tokens/s than the current kernel, and deterministic and wasm32-clean. <!-- MEASURE: which candidate won, or "none beat the current kernel", with GFLOP/s from `cargo bench --bench gemm` --> |
 | `sha2` | sha256 in `prepare` manifests and the server's `model_sha256` | Hashes are correctness-critical; a hand-written one is more code to audit. |
 | `serde_json` | `manifest.json`, `eval --json`, the server's JSON | Standard JSON. |
 | `unicode-normalization` | `prepare --nfkc` | NFKC needs the Unicode tables. |
@@ -107,7 +107,8 @@ What it does to each document, in order:
 2. Strip the byte-order mark, zero-width characters (U+200B to U+200D, U+2060,
    U+FEFF), and control characters except newline and tab.
 3. Apply NFKC if asked.
-4. Collapse runs of spaces, and runs of three or more newlines.
+4. Normalize punctuation, then collapse runs of spaces and runs of three or
+   more newlines.
 5. Lowercase if asked.
 6. Strip Gutenberg boilerplate if asked.
 7. Apply the length filter, then the duplicate filter.
@@ -217,10 +218,10 @@ restores the best validation score from the checkpoint.
 | `--top-k N` | 0 (off) | Sample only from the `N` most likely tokens |
 | `--top-p F` | 1.0 (off) | Nucleus sampling |
 | `--repetition-penalty F` | 1.0 (off) | Penalize tokens already generated |
-| `--max-tokens N` | see Manual §7 | Token budget for the continuation |
+| `--max-tokens N` | 64 | Token budget for the continuation |
 | `--stop S` | none | Stop when `S` appears. Repeatable. The text excludes the stop string. |
 
-<!-- MEASURE: defaults of --top-k, --top-p, --repetition-penalty, --max-tokens in the finished CLI -->
+<!-- MEASURE: defaults of --top-k, --top-p, --repetition-penalty in the finished CLI -->
 
 **`eval`**
 
@@ -234,9 +235,8 @@ DVC tracks this file as a metric.
 **Export commands**
 
 ```text
-train_transformer export-ollama   <model.gguf> <name>
-train_transformer export-lmstudio <model.gguf>
-train_transformer export-unsloth  <model.gguf>
+train_transformer export-ollama   <model.gguf> <name> [--bin P] [--modelfile-only out.Modelfile]
+train_transformer export-lmstudio <model.gguf> [--repo ferrum/<stem>] [--bin P]
 ```
 
 See §9.6.
@@ -255,7 +255,7 @@ train_transformer generate <model.gguf> <seed text> [--chars N] [--max-tokens N]
 | Flag | Default | Meaning |
 |---|---|---|
 | `--chars N` | 200 | Characters to generate (characters even for BPE models) |
-| `--max-tokens N` | see §6.2 | Token budget instead of a character count |
+| `--max-tokens N` | 64 | Token budget instead of a character count |
 | `--temp F` | 0.8 | Sampling temperature. **`0` is exact argmax (greedy).** 0.1–0.3 for faithful, 0.7+ for varied. |
 | `--gen-seed N` | time-based | Fix it for reproducible output |
 | `--top-k`, `--top-p`, `--repetition-penalty` | see §6.2 | Sampling controls |
@@ -310,8 +310,9 @@ println!("ppl {:.3}  bits/token {:.3}  CE {:.3} nats  ({} predictions)",
          e.perplexity, e.bits_per_token, e.cross_entropy, e.num_predictions);
 ```
 
-- **Every token is scored.** Each token after the first is predicted from a
-  start-of-text position, so `num_predictions` equals the token count. Earlier
+- **Every token is scored.** The first token is conditioned on a start
+  position (BOS, which is the EOS id), so `num_predictions` equals the token
+  count. Earlier
   versions skipped the first window, so perplexities from before this change are
   not comparable (Status §7).
 - Texts longer than the context window use sliding windows with stride
@@ -329,15 +330,15 @@ println!("ppl {:.3}  bits/token {:.3}  CE {:.3} nats  ({} predictions)",
 - To compare models with **different tokenizers**, compare **bits per byte**.
   Per-token numbers are not comparable across vocabularies.
 
-**Speed.** Evaluation runs one padded forward pass per window, so it is about
-two orders of magnitude faster than the old per-window loop.
+**Speed.** Evaluation runs one padded forward pass per window, which is much faster
+than the old per-window loop.
 <!-- MEASURE: eval seconds before/after on the reference model and corpus (Samples §9) -->
 
 ### 8.3 The scoring API
 
 ```rust
 let s = slm.score("The cat sat on the", " mat")?;   // log p(continuation | context)
-let r = slm.score_rolling(&text)?;                   // every token after the first
+let r = slm.score_rolling(&text)?;                   // every token, the first conditioned on BOS
 // Score { logprob: f64, n_tokens: usize, greedy: bool }
 ```
 
@@ -354,8 +355,9 @@ argmax. The server and LightEval use this API.
 ## 9.5 Running Ferrum models in llama.cpp, Ollama, and LM Studio
 
 A Ferrum BPE transformer SLM is a `gpt2`-architecture GGUF. Other runtimes load
-it without changes. The same file gives the same greedy continuation in Ferrum
-and in llama.cpp; a test checks this. Verified so far:
+it without changes. The same f32 file gives the same greedy continuation in
+Ferrum and in llama.cpp; the test `llama_cpp_greedy_matches_ferrum_f32` checks
+this. Verified so far:
 
 | Tool | Version | Verified how |
 |---|---|---|
@@ -377,7 +379,7 @@ llama-tokenize   -m models/slm.gguf -p "Once upon a time" --ids --log-disable
 
 ```bash
 OLLAMA_HOST=127.0.0.1:11545 OLLAMA_MODELS=./ollama-models ollama serve &
-printf 'FROM %s\nTEMPLATE "{{ .Prompt }}"\nPARAMETER num_predict 16\n' "$PWD/models/slm.gguf" > Modelfile
+printf 'FROM "%s"\nTEMPLATE "{{ .Prompt }}"\nPARAMETER num_predict 16\n' "$PWD/models/slm.gguf" > Modelfile
 OLLAMA_HOST=127.0.0.1:11545 OLLAMA_MODELS=./ollama-models ollama create ferrum-tiny -f Modelfile
 curl -s http://127.0.0.1:11545/api/generate \
   -d '{"model":"ferrum-tiny","prompt":"Once upon a time","raw":true,"stream":false,"options":{"temperature":0,"num_predict":16}}'
@@ -403,11 +405,20 @@ to see 16. And its default repeat penalty (1.1) changes the output, so set
 **What to expect**
 
 - **f32:** greedy output equals Ferrum's.
-- **Q8_0 and Q4_0:** llama.cpp quantizes activations in its Q8_0 matmuls, which
-  can flip near-ties late in a generation. The compatibility test asserts equal
-  output only over the first 8 tokens for quantized files.
+- **Q8_0:** llama.cpp quantizes activations in its Q8_0 matmuls, which can flip
+  near-ties late in a generation. The compatibility test compares Ferrum's
+  output with llama.cpp's and asserts equality only over the first 8 tokens.
+- **Q4_0:** the test only checks that llama.cpp loads the file and generates.
 - **Prompts** are tokenized the same way as in Ferrum, because the file declares
   `tokenizer.ggml.pre = "gpt-2"` and Ferrum uses the same pre-tokenizer.
+
+**Finding the tools.** Ferrum looks for each tool in this order: the `--bin`
+flag (export commands), the environment variable (`FERRUM_LLAMA_BIN` for the
+llama.cpp directory, `FERRUM_OLLAMA`, `FERRUM_LMS`), `PATH`, then the default
+install location (`~/.local/opt/llama.cpp-b11521`, `~/.local/bin/ollama`,
+`~/.lmstudio/bin/lms`). If none has it, the error lists all four places.
+Compatibility tests skip a missing tool, but fail instead when
+`FERRUM_REQUIRE_RUNTIMES=1` is set.
 
 **What does not run there.** Character-level models (no BPE vocabulary) and
 Ferrum-ML tabular MLPs are valid GGUF files, but llama.cpp has no architecture
@@ -416,21 +427,35 @@ for them. Use `train_transformer` or the Ferrum library for those.
 ## 9.6 One-command exports
 
 ```text
-train_transformer export-ollama   <model.gguf> <name>
-train_transformer export-lmstudio <model.gguf>
-train_transformer export-unsloth  <model.gguf>
+train_transformer export-ollama   <model.gguf> <name> [--bin P] [--modelfile-only out.Modelfile]
+train_transformer export-lmstudio <model.gguf> [--repo ferrum/<stem>] [--bin P]
 ```
 
 | Command | What it does |
 |---|---|
-| `export-ollama <model.gguf> <name>` | Writes a Modelfile (`FROM <absolute path>`) and runs `ollama create <name> -f Modelfile`. <!-- MEASURE: exact Modelfile contents (TEMPLATE, PARAMETER lines), where the Modelfile is written, and the flags (e.g. --ollama-bin, --dir) --> |
-| `export-lmstudio <model.gguf>` | Imports the file into LM Studio's model library with `lms import`. <!-- MEASURE: exact lms import flags used, the --user-repo default, and whether the file is copied or linked --> |
-| `export-unsloth <model.gguf>` | **Pending.** Registers the GGUF where Unsloth Studio discovers local models. The exact location is still being verified. <!-- MEASURE: Unsloth Studio local-model location and the final behaviour of this command --> |
+| `export-ollama` | Writes a Modelfile and runs `ollama create <name> -f Modelfile`. `--modelfile-only out.Modelfile` writes the Modelfile and stops. `--bin` names the `ollama` binary. |
+| `export-lmstudio` | Runs `lms import -y -l` on the file. `-l` links the file instead of copying it. `--repo` sets the `publisher/name` (default `ferrum/<file stem>`). `--bin` names `lms`. |
 
-Each command needs the tool installed. A missing tool is reported as an error
-that names the tool; it does not change your GGUF file. The Ollama and LM
-Studio commands do the manual steps in §9.5, so after export you can use
-`ollama run <name>` or load the model in LM Studio.
+The Modelfile contains:
+
+```text
+FROM "<absolute path to the GGUF>"
+TEMPLATE "{{ .Prompt }}"
+PARAMETER stop "<|endoftext|>"
+PARAMETER temperature 0.8
+PARAMETER num_ctx <context_length of the model>
+```
+
+Rules for both commands:
+
+- A GGUF that llama.cpp cannot run (generic layout, character-level, tabular) is
+  **refused before any tool runs**. The error says why.
+- A missing tool gives an error that lists the four places searched (§9.5).
+- If the Ollama server is not running, `ollama create` fails and the error says
+  to start it with `ollama serve`.
+- After export you can use `ollama run <name>` or load the model in LM Studio.
+
+<!-- MEASURE: confirm the --repo default and the printed messages against the finished commands -->
 
 ## 9.7 Serving: `ferrum-serve`
 
@@ -440,7 +465,9 @@ ferrum-serve --model <path.gguf> [--host 127.0.0.1] [--port 8080]
 ```
 
 The server binds to loopback by default. Unknown flags are errors. It holds one
-loaded model. <!-- MEASURE: confirm whether requests run strictly one at a time (a dedicated model thread, per the plan) or in parallel (spec: spawn_blocking). Each matmul uses every core either way. -->
+loaded model on **one dedicated model thread** and handles **one request at a
+time**, because `GenerativeSLM` is not `Send` or `Sync`. Each matmul still uses
+every core.
 
 | Route | Request | Response |
 |---|---|---|
@@ -487,7 +514,7 @@ eval/lighteval/run.sh --model models/slm.gguf --test data/prepared/test.txt \
 `run.sh` starts `ferrum-serve`, waits for `/health`, runs
 `lighteval custom ferrum ferrum_model.py "<tasks>" --custom-tasks ferrum_tasks.py`,
 stops the server, and writes a summary:
-`{"tasks": {"<task>": {"<metric>": value}}, "lighteval_version": "0.13.0", "model": ..., "max_samples": ...}`.
+`{"tasks": {"<task>|0": {"<metric>": value}}, "lighteval_version": "0.13.0", "model": ..., "max_samples": ...}`.
 
 | Option | Meaning |
 |---|---|
@@ -501,8 +528,8 @@ stops the server, and writes a summary:
 | Task | What it measures | Metrics |
 |---|---|---|
 | `ferrum_heldout` | Rolling log-likelihood of the test documents | word and byte perplexity, bits per byte |
-| `tinystories_cloze` | Multiple choice: the true next sentence versus 3 sentences from other stories (fixed seed) | `loglikelihood_acc` |
-| `blimp` subset | Grammatical versus ungrammatical sentence pairs | accuracy |
+| `tinystories_cloze` | Multiple choice: the true next sentence versus 3 sentences from other stories (fixed seed) | `loglikelihood_acc` (reported as `acc`) |
+| `blimp:anaphor_gender_agreement`, `blimp:determiner_noun_agreement_1`, `blimp:regular_plural_subject_verb_agreement_1` | Grammatical versus ungrammatical sentence pairs | accuracy |
 | `arc:easy` | Science questions | accuracy |
 
 A 500K-parameter model will score near chance on `arc:easy` (25% for four
@@ -517,7 +544,7 @@ choices). That is expected. <!-- MEASURE: results table from a real run -->
    sets `self.config` and the sample cache directly.
 2. `loglikelihood_rolling` is not cached, because 0.13.0's perplexity cache
    drops results. `requirements.txt` also pins `xxhash<4`, because xxhash 4.x
-   crashes the details logger.
+   crashes the details logger, and `datasets<5`.
 
 LightEval's litellm and TGI backends cannot run log-likelihood tasks, which is
 why Ferrum plugs in as a custom model class.
@@ -576,7 +603,7 @@ Every file Ferrum writes is GGUF v3. There are four kinds.
 | Kind | `general.architecture` | Runs in llama.cpp |
 |---|---|---|
 | BPE transformer SLM (what `train` writes) | `gpt2` | Yes |
-| Generic Ferrum model (character-level SLMs, Ferrum-ML tabular MLPs) | `ferrum` or `ferrum-mlp` <!-- MEASURE: final value; the spec says ferrum-mlp, the p0g plan says ferrum --> | No |
+| Generic Ferrum model (character-level SLMs, Ferrum-ML tabular MLPs) | `ferrum` | No |
 | Training checkpoint | `ferrum-checkpoint` (`ferrum-llama-checkpoint` for Llama fine-tunes) | No |
 | Reusable tokenizer file | `ferrum-tokenizer` | No |
 
@@ -638,8 +665,7 @@ also loads, with its metadata rebuilt from the `gpt2.*` keys.
 
 | Type | Used for |
 |---|---|
-| F32 | `quant = f32`; 1-D tensors (biases, LayerNorm) always |
-| F16 | A matrix that cannot use a 32-wide block (row length not a multiple of 32) <!-- MEASURE: spec §4.0 says F16; plan p0g says F32 (exact). Check the finished writer. --> |
+| F32 | `quant = f32`; all 1-D tensors (biases, LayerNorm); `position_embd`; and any matrix whose row length (`ne0`) is not a multiple of 32 (stored exactly, never as F16) |
 | Q8_0 | `int8`: blocks of 32 values along each weight row, one f16 scale per block |
 | Q4_0 | `int4`: same block size, 4 bits per value; lossy |
 
@@ -647,6 +673,8 @@ also loads, with its metadata rebuilt from the `gpt2.*` keys.
   32. Keep `--embed`, `--hidden`, and `--vocab` multiples of 32 so every matrix
   quantizes. The 507,552-parameter reference is built that way.
 - `position_embd` stays F32 when quantizing, following llama-quantize.
+- Because ineligible tensors are F32, an int8 file reloads bit-identically for
+  **every** tensor.
 - Loaded Ferrum GGUF weights are dequantized to f32 in memory. The packed
   int8/int4 kernels are for imported Llama models.
 

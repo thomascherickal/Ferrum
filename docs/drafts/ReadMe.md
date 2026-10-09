@@ -15,7 +15,7 @@ Raspberry Pi, or in a browser tab.
 
 Ferrum keeps its dependencies few. It uses an external crate only where a
 measurement shows a gain (see the table below and [Manual §2](Manual.md#2-why-rust-and-what-few-dependencies-buy)).
-It is a precise tool for small models. It is not a runtime for frontier LLMs.
+It is built for small models. It is not a runtime for frontier LLMs.
 
 | Property | What it means |
 |---|---|
@@ -54,7 +54,7 @@ tokenizer. Only BPE transformer SLMs run there.
 | Path | Kind | What it is |
 |---|---|---|
 | `ferrum_core` | library | The engine: tensors, layers, the transformer trainer, tokenizer, quantization, the GGUF model codecs, and the GGUF reader/writer plus Llama/Qwen runner and trainer |
-| `slm_cli` | binary `train_transformer` | Train, generate, evaluate, inspect, and `prepare` data; `export-ollama`, `export-lmstudio`, `export-unsloth`; `run-gguf`, `finetune-gguf`, `export-gguf` for external checkpoints |
+| `slm_cli` | binary `train_transformer` | Train, generate, evaluate, inspect, and `prepare` data; `export-ollama`, `export-lmstudio`; `run-gguf`, `finetune-gguf`, `export-gguf` for external checkpoints |
 | `slm_server` | binary `ferrum-serve` | HTTP inference server (axum): log-likelihood, rolling log-likelihood, generation |
 | `slm_wasm` | cdylib + rlib | `wasm-bindgen` bindings that run a trained SLM in the browser (`TransformerSLMModel`) |
 | `eval/lighteval/` | Python package | `FerrumModel` and custom tasks for Hugging Face LightEval 0.13.0, plus `run.sh` |
@@ -85,6 +85,7 @@ to live here (see [Status §2](Status.md#2-the-2026-10-03-restructuring)):
 | Rust + Cargo | 1.74+ stable, edition 2021 <!-- MEASURE: confirm minimum Rust version after new dependencies (axum 0.8, rayon 1.12) --> | Install via [rustup](https://rustup.rs) |
 | OS | Linux, macOS, or Windows | Pure CPU code with no platform-specific paths |
 | `curl` | any | Only for `scripts/fetch.sh` (Samples 1 and 2) |
+| GNU coreutils | Linux | The samples use `sha256sum`, `md5sum`, and `timeout`; they are written for Linux |
 | Python 3.10+ | optional | Only for DVC and LightEval (Samples 2 and 8) |
 | `wasm32-unknown-unknown` | optional | Only for browser builds (`slm_wasm`) |
 | WebView system libraries | optional | Only for the desktop GUI; see [Manual §10.2](Manual.md#102-building-and-launching) |
@@ -178,7 +179,7 @@ use ferrum_core::{GenerativeSLM, Rng, TransformerConfig};
 let corpus = std::fs::read_to_string("corpus.txt")?;
 let cfg = TransformerConfig {
     context_len: 64, embed_dim: 64, num_heads: 4, num_blocks: 2, hidden_dim: 128,
-    vocab_size: 512, tie_weights: true, lr: 0.003, batch_size: 16,
+    vocab_size: 512, weight_tying: true, lr: 0.003, batch_size: 16,
     max_tokens: 5_000_000, cosine_lr: true, warmup_steps: 100, grad_clip: 1.0,
     ..TransformerConfig::default()
 };
@@ -191,7 +192,6 @@ let s = slm.score("The cat sat on the", " mat")?;           // log p(continuatio
 println!("logprob {:.3} over {} tokens", s.logprob, s.n_tokens);
 ```
 
-<!-- MEASURE: confirm the TransformerConfig field name for weight tying (tie_weights?) and that this snippet compiles against the finished API; Samples.md sample 10 holds the executed version -->
 
 ### Run, fine-tune, and export a Llama/Qwen GGUF model
 
@@ -215,13 +215,16 @@ or with a one-command export.
 # llama.cpp
 llama-completion -m models/slm.gguf -p "Once upon a time" -n 16 --temp 0 -no-cnv --no-warmup </dev/null 2>/dev/null
 
-# One-command exports
+# One-command exports (each refuses a GGUF that llama.cpp cannot run)
 train_transformer export-ollama   models/slm.gguf ferrum-tiny   # writes a Modelfile, runs `ollama create`
-train_transformer export-lmstudio models/slm.gguf               # imports into LM Studio with `lms import`
-train_transformer export-unsloth  models/slm.gguf               # pending: see Manual §9.6
+train_transformer export-lmstudio models/slm.gguf               # links it into LM Studio with `lms import -l`
 ```
 
 Versions verified so far: llama.cpp b11521, Ollama v0.40.2, LM Studio 0.4.18.
+Each tool is found from a `--bin` flag (export commands), then the env var
+(`FERRUM_LLAMA_BIN`, `FERRUM_OLLAMA`, `FERRUM_LMS`), then `PATH`, then the default
+install location (`~/.local/opt/llama.cpp-b11521`, `~/.local/bin/ollama`,
+`~/.lmstudio/bin/lms`).
 The exact commands, and what to expect from each tool, are in
 [Samples.md §7](Samples.md#7-serving-and-running-your-model-in-llamacpp-ollama-and-lm-studio)
 and [Manual §9.5](Manual.md#95-running-ferrum-models-in-llamacpp-ollama-and-lm-studio).
@@ -292,14 +295,17 @@ python3 -m unittest eval/lighteval/test_ferrum_model.py            # LightEval m
 eval/lighteval/run.sh --model models/slm.gguf --test data/prepared/test.txt --out metrics/lighteval.json
 ```
 
-Runtime compatibility tests skip a tool that is not installed. Point them at
-your installs with `FERRUM_LLAMA_BIN`, `FERRUM_OLLAMA`, and `FERRUM_LMS`, and set
-`FERRUM_VERIFY_RUNTIMES=1` to include Ollama and LM Studio.
+Runtime compatibility tests skip a tool that is not installed. Set
+`FERRUM_REQUIRE_RUNTIMES=1` and a missing tool becomes a test **failure**
+instead. CI and pre-release runs set it. Tool discovery is described above.
 
 CI (`.github/workflows/ci.yml`) runs build and test, rustfmt, clippy, JS syntax
 checks, cargo-deny, a wasm32 build of `slm_wasm`, the LightEval module's import
-check, and the GUI crate's own format, lint, and test jobs. Python and DVC are
-not in CI.
+check, and the GUI crate's own format, lint, and test jobs. A `runtimes` job
+runs the compatibility tests with `FERRUM_REQUIRE_RUNTIMES=1`: llama.cpp b11521
+and Ollama v0.40.2 are required there, and `FERRUM_SKIP_LMSTUDIO=1` is its one
+exemption (LM Studio is required locally before a release). Python and DVC are
+otherwise not in CI.
 
 ---
 

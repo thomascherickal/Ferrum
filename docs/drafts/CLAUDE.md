@@ -49,7 +49,7 @@ Do not break these; they are the product's selling points.
 | Path | What |
 |---|---|
 | `ferrum_core/` | The engine library; everything calls into it (`slm`, `train_transformer`, `tokenizer`, `loader` GGUF codecs, `dataset`, `gguf*`, `llm*`) |
-| `slm_cli/` | Binary `train_transformer`: train, run, generate, eval, info, prepare, run-gguf, finetune-gguf, export-gguf, export-ollama, export-lmstudio, export-unsloth |
+| `slm_cli/` | Binary `train_transformer`: train, run, generate, eval, info, prepare, run-gguf, finetune-gguf, export-gguf, export-ollama, export-lmstudio |
 | `slm_server/` | Binary `ferrum-serve` (axum): `/health`, `/v1/info`, `/v1/loglikelihood`, `/v1/loglikelihood_rolling`, `/v1/generate` |
 | `slm_wasm/` | wasm-bindgen browser bindings (`TransformerSLMModel`) |
 | `eval/lighteval/` | Python: `FerrumModel`, `ferrum_tasks.py`, `run.sh`; pinned `lighteval==0.13.0` |
@@ -101,12 +101,15 @@ python3 -m unittest eval/lighteval/test_ferrum_model.py           # skips withou
 eval/lighteval/run.sh --model models/slm.gguf --test data/prepared/test.txt --out metrics/lighteval.json --max-samples 200
 ```
 
-Runtime compatibility tests skip a tool that is absent. Set `FERRUM_LLAMA_BIN`
-(dir with `llama-completion`, `llama-tokenize`), `FERRUM_OLLAMA`, `FERRUM_LMS`,
-and `FERRUM_VERIFY_RUNTIMES=1` to run them all:
+Runtime compatibility tests skip a tool that is absent, unless
+`FERRUM_REQUIRE_RUNTIMES=1` is set (then a missing tool fails the test; CI's
+`runtimes` job sets it, with `FERRUM_SKIP_LMSTUDIO=1` as its one exemption).
+Tools are found by flag (`--bin`), then env (`FERRUM_LLAMA_BIN`,
+`FERRUM_OLLAMA`, `FERRUM_LMS`), then `PATH`, then the default install path.
+Export commands refuse non-gpt2 GGUFs.
 
 ```bash
-cargo test -p <integration crate, see tests/Cargo.toml> --release --test test_runtime_compat -- --nocapture --test-threads 1
+FERRUM_REQUIRE_RUNTIMES=1 cargo test -p integration_tests --release --test test_runtime_compat -- --nocapture --test-threads 1
 ```
 
 **`ferrum_gui`** is outside the workspace, so `cargo … -p ferrum_gui` from the

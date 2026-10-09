@@ -15,8 +15,10 @@ All samples use the release build and put it on your `PATH` for the shell sessio
 ```bash
 cargo build --release --workspace
 export PATH="$PWD/target/release:$PATH"
-mkdir -p samples
+mkdir -p samples models metrics
 ```
+
+The commands are written for Linux (they use `sha256sum`, `md5sum`, and `timeout` from GNU coreutils).
 
 ## Contents
 
@@ -37,7 +39,7 @@ mkdir -p samples
 
 **Goal.** Go from nothing to a trained 507,552-parameter model that writes short stories.
 
-**You need.** Rust, `curl`, and about 25 MB of disk. No Python and no DVC.
+**You need.** Rust, `curl`, and about 45 MB of disk (the raw file plus the prepared splits). No Python and no DVC.
 
 **Steps.**
 
@@ -92,10 +94,10 @@ train_transformer generate models/slm.gguf "Once upon a time" --max-tokens 80 --
 row was trained for one step (`--tokens 1`) and read from `info`.
 
 ```bash
-for cfg in "64 4 2 128 512" "96 4 3 320 1024" "192 6 4 768 2048"; do
+for cfg in "64 4 2 128 512 --tie" "96 4 3 320 1024" "192 6 4 768 2048"; do
   set -- $cfg
   train_transformer train data/prepared/train.txt samples/size.gguf \
-      --context 128 --embed $1 --heads $2 --blocks $3 --hidden $4 --vocab $5 \
+      --context 128 --embed $1 --heads $2 --blocks $3 --hidden $4 --vocab $5 $6 \
       --tokens 1 --force >/dev/null
   train_transformer info samples/size.gguf | grep -i param
 done
@@ -105,7 +107,7 @@ done
 
 | Target | `--embed` | `--heads` | `--blocks` | `--hidden` | `--vocab` | Parameters |
 |---|---|---|---|---|---|---|
-| about 100K | 64 | 4 | 2 | 128 | 512 | <!-- MEASURE: from info; the `--tie` variant of this config is 103,936 --> |
+| about 100K (with `--tie`) | 64 | 4 | 2 | 128 | 512 | 103,936 (136,704 without `--tie`) |
 | about 500K | 96 | 4 | 3 | 320 | 1024 | 507,552 |
 | about 2M | 192 | 6 | 4 | 768 | 2048 | <!-- MEASURE: from info --> |
 
@@ -200,14 +202,17 @@ sha256sum -c samples/slm1.sha
 
 **Steps.**
 
-1. Build a messy input. It has a byte-order mark, Windows line endings, zero-width characters, a duplicated paragraph, a two-book Gutenberg file, and a file with an invalid byte.
+1. Build a messy input. It has a byte-order mark, Windows line endings, zero-width characters, the same document in two files (a duplicate), a two-book Gutenberg file, a too-short file, a too-long file, and a file with an invalid byte. One file is one document, so duplicates must be in separate files (or separated by `<|endoftext|>`).
 
 ```bash
 mkdir -p samples/raw
 printf '\xef\xbb\xbfThe sun rose over the quiet town and the baker opened his shop.\n' > samples/raw/bom.txt
 printf 'The river ran down to the sea.\r\nIt carried leaves and small boats.\r\n' > samples/raw/crlf.txt
 printf 'The mountain stood tall\xe2\x80\x8b and silent\xe2\x80\x8c in the cold morning air.\n' > samples/raw/zerowidth.txt
-printf 'A fox came out of the wood at night.\n\nA fox came out of the wood at night.\n' > samples/raw/dup.txt
+printf 'A fox came out of the wood at night.\n' > samples/raw/dup1.txt
+cp samples/raw/dup1.txt samples/raw/dup2.txt
+printf 'Hi.\n' > samples/raw/tiny.txt
+yes 'and the story went on and on ' | head -n 20 | tr -d '\n' > samples/raw/long.txt
 printf 'Preface text.\n*** START OF THE PROJECT GUTENBERG EBOOK ONE ***\nBook one is about a lighthouse keeper who counted the waves each night.\n*** END OF THE PROJECT GUTENBERG EBOOK ONE ***\nlicence text\n*** START OF THE PROJECT GUTENBERG EBOOK TWO ***\nBook two is about a girl who found a map inside an old clock.\n*** END OF THE PROJECT GUTENBERG EBOOK TWO ***\n' > samples/raw/books.txt
 printf 'This line has a bad byte \xff in the middle of the sentence.\n' > samples/raw/badbyte.txt
 ```
@@ -224,7 +229,7 @@ train_transformer prepare --input samples/raw --out samples/prepared
 
 ```bash
 train_transformer prepare --input samples/raw --out samples/prepared \
-    --lossy --dedup --nfkc --strip-gutenberg --min-chars 20 --val-frac 0.2 --test-frac 0.2
+    --lossy --dedup --nfkc --strip-gutenberg --min-chars 20 --max-chars 300 --val-frac 0.2 --test-frac 0.2
 cat samples/prepared/manifest.json
 ```
 
@@ -334,7 +339,7 @@ ls -l samples/slm-*.gguf
 - Every token after the first is scored, so `tokens` in the JSON is the token count of the file.
 - **Perplexity** is per token. **Bits per byte** divides the total loss by the file's bytes, so it compares models with different tokenizers. Per-token numbers do not.
 - QAT is int8 only. The int8 file reloads bit-identically to the model that trained, so its numbers match the f32-QAT model closely. int4 is converted after training and is lossy.
-- Matrices whose row length is not a multiple of 32 are not quantized (they stay in a wider type). That is why the reference config uses multiples of 32.
+- Matrices whose row length is not a multiple of 32 are not quantized (they stay F32, exactly). That is why the reference config uses multiples of 32.
 
 ---
 
@@ -397,12 +402,12 @@ FERRUM_NUM_THREADS=8 train_transformer generate models/slm.gguf "Once upon a tim
 
 **You need.** `models/slm.gguf` from Sample 1. The tools are optional; skip any you do not have. The commands were verified with llama.cpp b11521, Ollama v0.40.2, and LM Studio 0.4.18.
 
-Set these to your install paths:
+Ferrum finds each tool from an env var, then `PATH`, then the default install location. On a machine with the default installs (`~/.local/opt/llama.cpp-b11521`, `~/.local/bin/ollama`, `~/.lmstudio/bin/lms`) you set only:
 
 ```bash
-export FERRUM_LLAMA_BIN=/path/to/llama.cpp        # the directory holding llama-completion and llama-tokenize
-export FERRUM_OLLAMA=/path/to/ollama
-export FERRUM_LMS="$HOME/.lmstudio/bin/lms"
+LLAMA="$HOME/.local/opt/llama.cpp-b11521"
+OLLAMA="$HOME/.local/bin/ollama"
+LMS="$HOME/.lmstudio/bin/lms"
 PROMPT="Once upon a time"
 ```
 
@@ -417,8 +422,8 @@ train_transformer generate models/slm.gguf "$PROMPT" --max-tokens 16 --temp 0
 **Part B. llama.cpp.**
 
 ```bash
-"$FERRUM_LLAMA_BIN/llama-completion" -m models/slm.gguf -p "$PROMPT" -n 16 --temp 0 -no-cnv --no-warmup </dev/null 2>/dev/null
-"$FERRUM_LLAMA_BIN/llama-tokenize" -m models/slm.gguf -p "$PROMPT" --ids --log-disable
+"$LLAMA/llama-completion" -m models/slm.gguf -p "$PROMPT" -n 16 --temp 0 -no-cnv --no-warmup </dev/null 2>/dev/null
+"$LLAMA/llama-tokenize" -m models/slm.gguf -p "$PROMPT" --ids --log-disable
 ```
 
 <!-- OUTPUT: llama.cpp continuation and token ids; compare with Part A -->
@@ -427,49 +432,53 @@ train_transformer generate models/slm.gguf "$PROMPT" --max-tokens 16 --temp 0
 
 ```bash
 export OLLAMA_HOST=127.0.0.1:11545 OLLAMA_MODELS="$PWD/samples/ollama-models"
-"$FERRUM_OLLAMA" serve >samples/ollama.log 2>&1 &
+"$OLLAMA" serve >samples/ollama.log 2>&1 &
+OLLAMA_PID=$!
 sleep 3
-printf 'FROM %s\nTEMPLATE "{{ .Prompt }}"\nPARAMETER num_predict 16\n' "$PWD/models/slm.gguf" > samples/Modelfile
-"$FERRUM_OLLAMA" create ferrum-tiny -f samples/Modelfile
+printf 'FROM "%s"\nTEMPLATE "{{ .Prompt }}"\nPARAMETER num_predict 16\n' "$PWD/models/slm.gguf" > samples/Modelfile
+"$OLLAMA" create ferrum-tiny -f samples/Modelfile
 curl -s http://127.0.0.1:11545/api/generate \
   -d '{"model":"ferrum-tiny","prompt":"Once upon a time","raw":true,"stream":false,"options":{"temperature":0,"num_predict":16}}'
 ```
 
 <!-- OUTPUT: the JSON response, with the "response" field to compare with Part A -->
 
-Stop that server when done: `kill %1`.
+Leave the Ollama server running for Part E. It is stopped there.
 
 **Part D. LM Studio.**
 
 ```bash
-"$FERRUM_LMS" import -y -l --user-repo ferrum-test/slm models/slm.gguf
-KEY=$("$FERRUM_LMS" ls --json | python3 -I -c 'import json,sys; print([m["modelKey"] for m in json.load(sys.stdin) if "ferrum-test" in m.get("path","")][0])')
-"$FERRUM_LMS" load "$KEY" --gpu off --identifier ferrum-tiny -y
-"$FERRUM_LMS" server start -p 1234
+"$LMS" import -y -l --user-repo ferrum-test/slm models/slm.gguf
+KEY=$("$LMS" ls --json | python3 -I -c 'import json,sys; print([m["modelKey"] for m in json.load(sys.stdin) if "ferrum-test" in m.get("path","")][0])')
+"$LMS" load "$KEY" --gpu off --identifier ferrum-tiny -y
+"$LMS" server start -p 1234
 curl -s http://127.0.0.1:1234/v1/completions \
   -d '{"model":"ferrum-tiny","prompt":"Once upon a time","max_tokens":17,"temperature":0,"repeat_penalty":1.0}'
-"$FERRUM_LMS" server stop
-"$FERRUM_LMS" unload ferrum-tiny
+"$LMS" unload ferrum-tiny
 ```
 
-<!-- OUTPUT: the completion JSON. Note: max_tokens 17 shows 16 visible tokens; repeat_penalty 1.0 matters because the default 1.1 changes the text. Check the `lms ls --json` field names and the `lms server stop` / `lms unload` subcommands against the installed version. -->
+<!-- OUTPUT: the completion JSON. Note: max_tokens 17 shows 16 visible tokens; repeat_penalty 1.0 matters because the default 1.1 changes the text. Check the `lms ls --json` field names against the installed version. -->
 
-**Part E. One-command exports.**
+**Part E. One-command exports.** Both commands refuse a GGUF that llama.cpp cannot run (a character-level or tabular model) before they start any tool. They find the tools as described above, or take `--bin`.
 
 ```bash
-train_transformer export-ollama   models/slm.gguf ferrum-tiny
+train_transformer export-ollama models/slm.gguf ferrum-export --modelfile-only samples/ferrum-export.Modelfile
+cat samples/ferrum-export.Modelfile
+train_transformer export-ollama models/slm.gguf ferrum-export
+"$OLLAMA" run ferrum-export "Once upon a time"
+kill $OLLAMA_PID
 train_transformer export-lmstudio models/slm.gguf
-train_transformer export-unsloth  models/slm.gguf
+"$LMS" ls
 ```
 
-<!-- OUTPUT: export-ollama (Modelfile written, ollama create result), then `ollama run ferrum-tiny "Once upon a time"` -->
+<!-- OUTPUT: the Modelfile (FROM "<abs path>", TEMPLATE, PARAMETER stop/temperature/num_ctx), the `ollama create` result, and the `ollama run` text -->
 <!-- OUTPUT: export-lmstudio result and the model listed by `lms ls` -->
-<!-- OUTPUT: export-unsloth: PENDING. The location where Unsloth Studio finds local models is still being verified. Paste the real result once the command is final. -->
+<!-- OUTPUT: the error when a character-level model is exported, naming why llama.cpp cannot run it -->
 
 **Part F. Serve over HTTP.**
 
 ```bash
-cargo run --release -p slm_server -- --model models/slm.gguf &
+ferrum-serve --model models/slm.gguf &
 sleep 2
 ```
 
@@ -490,7 +499,7 @@ An oversized batch (65 items, over the default limit of 64) is rejected before a
 ```bash
 python3 -I -c 'import json; print(json.dumps({"requests":[{"context":"a","continuation":"b"}]*65}))' \
   | curl -s -i http://127.0.0.1:8080/v1/loglikelihood -d @-
-kill %1
+kill $!
 ```
 
 <!-- OUTPUT: HTTP 400 and {"error": "..."} -->
@@ -501,7 +510,7 @@ kill %1
 - `llama-tokenize` ids equal Ferrum's ids for the same text, because both use the GPT-2 pre-tokenizer.
 - LightEval and your own scripts use `/v1/loglikelihood`. A higher `logprob` is a more likely continuation. `greedy` is true when every token was the model's top choice.
 - The server binds to `127.0.0.1` by default and has no authentication. Limits (body 8 MiB, batch 64, 65,536 characters per text) are checked first: 413 for a large body, 400 for the others, 422 for a model error.
-- The server handles requests one at a time on a model thread. <!-- MEASURE: confirm (plan) vs spawn_blocking (spec) -->
+- The server handles one request at a time, on one dedicated model thread (the model is not `Send` or `Sync`). Each matmul still uses every core.
 
 ---
 
@@ -509,7 +518,7 @@ kill %1
 
 **Goal.** Score the model with Hugging Face LightEval and read the results.
 
-**You need.** Python 3.10 or newer. `models/slm.gguf` and `data/prepared/test.txt` from Sample 1. About 2 GB of disk for CPU PyTorch.
+**You need.** Python 3.10 or newer. `models/slm.gguf` and `data/prepared/test.txt` from Sample 1. Disk space for CPU PyTorch <!-- MEASURE: size of eval/lighteval/.venv -->.
 
 **Steps.**
 
@@ -520,7 +529,7 @@ python3 -m venv eval/lighteval/.venv
 eval/lighteval/.venv/bin/pip install -r eval/lighteval/requirements.txt
 ```
 
-`requirements.txt` pins `lighteval==0.13.0` and `xxhash<4` (xxhash 4.x crashes the details logger), and uses the CPU PyTorch index.
+`requirements.txt` pins `lighteval==0.13.0`, `xxhash<4` (xxhash 4.x crashes the details logger), and `datasets<5`, and uses the CPU PyTorch index.
 
 2. Run it. `run.sh` starts `ferrum-serve`, waits for `/health`, runs LightEval, and stops the server.
 
@@ -543,12 +552,13 @@ cat metrics/lighteval.json
 | Task | Metrics | Value |
 |---|---|---|
 | `ferrum_heldout` | word perplexity, byte perplexity, bits per byte | <!-- MEASURE --> |
-| `tinystories_cloze` | `loglikelihood_acc` | <!-- MEASURE --> |
-| `blimp` subset | accuracy | <!-- MEASURE --> |
+| `tinystories_cloze` | `acc` (the `loglikelihood_acc` metric) | <!-- MEASURE --> |
+| `blimp:anaphor_gender_agreement`, `blimp:determiner_noun_agreement_1`, `blimp:regular_plural_subject_verb_agreement_1` | accuracy | <!-- MEASURE --> |
 | `arc:easy` | accuracy | <!-- MEASURE --> |
 
 **What to look at.**
 
+- Result keys in the JSON are `<task>|0`, for example `tinystories_cloze|0`.
 - `ferrum_heldout` is rolling log-likelihood of whole test documents.
 - `tinystories_cloze` gives the model a story prefix and four sentences: the real next sentence and three from other stories (fixed seed). It must choose the real one. Chance is 25%.
 - `blimp` compares a grammatical sentence with a minimally different ungrammatical one. Chance is 50%.
@@ -562,7 +572,7 @@ cat metrics/lighteval.json
 
 **Goal.** Measure training, evaluation, and generation speed, thread scaling, and the before/after of this release.
 
-**You need.** Sample 1's data. Report the machine with every table.
+**You need.** Sample 1's data. Every table below states the machine and date it was measured on.
 
 **Steps.**
 
@@ -592,6 +602,8 @@ for t in 1 2 4 8; do
 done
 ```
 
+Machine and date: <!-- MEASURE: lscpu model name, core count, date -->
+
 | Threads | Train tokens/s | Eval seconds | Generate ms/token |
 |---:|---:|---:|---:|
 | 1 | <!-- MEASURE --> | <!-- MEASURE --> | <!-- MEASURE --> |
@@ -600,6 +612,8 @@ done
 | 8 | <!-- MEASURE --> | <!-- MEASURE --> | <!-- MEASURE --> |
 
 4. Before and after this release. The "before" numbers come from the Phase 1A commit messages (the review baseline); the "after" numbers from the runs above.
+
+Machine and date: <!-- MEASURE: lscpu model name, core count, date -->
 
 | Measure | Review baseline | Final |
 |---|---:|---:|
@@ -662,7 +676,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-<!-- MEASURE: the program above is a draft. Compile it against the finished API (field names, load/save signatures, SamplingParams::default, StopReason Debug) and replace it with the file as committed. -->
+<!-- MEASURE: the program above is a draft. Compile it against the finished API (load/save signatures, StopReason Debug); `SamplingParams::default()` and `weight_tying` are confirmed and replace it with the file as committed. -->
 
 ```bash
 mkdir -p samples
@@ -674,6 +688,6 @@ cargo run --release -p ferrum_core --example library_tour
 **What to look at.**
 
 - `score` returns the log-probability of the continuation given the context, the number of tokens scored, and whether all of them were the model's top choice.
-- `score_rolling` scores every token after the first; long texts use sliding windows.
+- `score_rolling` scores every token, the first conditioned on BOS (the EOS id), so the count equals the token count; long texts use sliding windows.
 - `generate_tokens` returns only the continuation, without the stop string.
 - A model saved with `save` is a `gpt2` GGUF. The reloaded model gives the same score, because the int8 file reloads bit-identically to a QAT model.
