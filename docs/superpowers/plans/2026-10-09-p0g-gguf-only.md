@@ -1074,6 +1074,15 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>")
 **Files:**
 - Create: `scripts/verify_runtimes.sh` (based on `/tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/gpt2gguf/verify.sh`; tool paths come from env vars `FERRUM_LLAMA_BIN` (the dir holding `llama-completion` and `llama-tokenize`), `FERRUM_OLLAMA` (the `ollama` binary), and `FERRUM_LMS` (default `~/.lmstudio/bin/lms`). Any tool that is not found is skipped with a message.)
 - Create: `tests/tests/test_runtime_compat.rs`
+- Modify: `.github/workflows/ci.yml` (new job `runtimes`)
+
+**Tool discovery:** env var, then `PATH`, then the default location: `~/.local/opt/llama.cpp-b11521/` (installed on this machine; `llama-completion`, `llama-tokenize`), `~/.local/bin/ollama` (v0.40.2), `~/.lmstudio/bin/lms` (0.4.18). With `FERRUM_REQUIRE_RUNTIMES=1`, a tool that can't be found is a **failure**, not a skip.
+
+**CI job `runtimes`** (ubuntu-latest):
+- download the llama.cpp `b11521` Linux x64 CPU release zip and the Ollama `v0.40.2` linux-amd64 tarball, both by pinned URL, verifying their sha256 (record the hashes when writing the job)
+- start `ollama serve`
+- run `FERRUM_REQUIRE_RUNTIMES=1 FERRUM_SKIP_LMSTUDIO=1 cargo test --release --test test_runtime_compat`
+LM Studio can't run in CI (it needs its desktop app), so `FERRUM_SKIP_LMSTUDIO=1` is the one allowed exemption there. The LM Studio test is required in local pre-release runs.
 
 **Pinned commands** (b11521, Ollama v0.40.2, LM Studio 0.4.18):
 - llama.cpp: `$FERRUM_LLAMA_BIN/llama-completion -m X.gguf -p "<prompt>" -n 16 --temp 0 -no-cnv --no-warmup </dev/null 2>/dev/null`
@@ -1099,11 +1108,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>")
 - [ ] **Step 2: Run them** with the tools installed in the scratchpad:
 
 ```bash
-export FERRUM_LLAMA_BIN=/tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/tools/llama.cpp/llama-b11521 FERRUM_OLLAMA=/tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/tools/ollama/bin/ollama FERRUM_VERIFY_RUNTIMES=1
+export FERRUM_REQUIRE_RUNTIMES=1 FERRUM_VERIFY_RUNTIMES=1   # tools found at their default locations
 cargo test -p integration_tests --release --test test_runtime_compat -- --nocapture --test-threads 1
 ```
 
-(Use the integration crate's real package name from `tests/Cargo.toml`.) Expected: every test passes, none skipped. A greedy mismatch in the F32 test is a real bug: find the first diverging op (tokenizer ids, then logits of the first step via a single forward) rather than loosening the assertion.
+(Use the integration crate's real package name from `tests/Cargo.toml`.) Expected: every test passes, none skipped (the flag makes a skip fail). Also add a unit test showing that a missing tool under `FERRUM_REQUIRE_RUNTIMES=1` fails. Share the helper with plan 1E (`require_or_skip`). A greedy mismatch in the F32 test is a real bug: find the first diverging op (tokenizer ids, then logits of the first step via a single forward) rather than loosening the assertion.
 
 - [ ] **Step 3: Commit**
 

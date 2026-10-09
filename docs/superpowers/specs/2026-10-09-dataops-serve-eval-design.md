@@ -37,6 +37,8 @@ loads the prepared train split whole); OpenAI-compatible routes; a DVC remote.
 | File formats | GGUF only; FINF removed (breaking: old `.bin` files stop loading; committed ones converted) |
 | Model architecture | Ferrum's own Transformer becomes GPT-2-compatible (GELU FFN, no LM-head bias, GPT-2 pre-tokenizer + byte-to-unicode vocab); saved as `gpt2` GGUF in F32/F16/Q8_0/Q4_0 |
 | Compatibility target | llama.cpp, Ollama, LM Studio run Ferrum GGUFs; verified by automated tests against installed binaries |
+| Runtime export | One-command export: `export-ollama`, `export-lmstudio` (Unsloth Studio dropped) — plan `2026-10-09-pE-runtime-export.md` |
+| Runtime tests | Ollama + LM Studio installed on the dev machine; runtime tests skip when a tool is absent unless `FERRUM_REQUIRE_RUNTIMES=1` (then fail); a CI job installs pinned llama.cpp b11521 + Ollama v0.40.2 and runs them required (LM Studio needs its desktop app, so it is required locally before release, not in CI) |
 | Unsafe | `#![forbid(unsafe_code)]` in every crate (`deny` only where a third-party proc macro forces it) |
 
 ## 3. Hard invariants (still enforced)
