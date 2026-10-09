@@ -12,6 +12,8 @@
 
 ## Global Constraints
 
+- **Full unit-test coverage (user requirement, 2026-10-09):** every function you add or change gets unit tests written with it, in the same commit. Cover every branch, error path and edge case (empty input, boundaries, invalid input). Measure with `cargo llvm-cov --release -p <crate> --summary-only` (and `--html` for detail). Every new or changed line must be covered; justify any line that cannot be (e.g. `main()`'s process exit) in the report. Reviewers check this per function.
+
 - `#![forbid(unsafe_code)]` stays in `ferrum_core`.
 - Results bit-for-bit identical at `FERRUM_NUM_THREADS=1` vs N.
 - `ferrum_core` must build for `wasm32-unknown-unknown` (`cargo build -p slm_wasm --target wasm32-unknown-unknown --release`).

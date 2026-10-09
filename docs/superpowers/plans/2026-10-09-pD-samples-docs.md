@@ -12,6 +12,8 @@
 
 ## Global Constraints
 
+- **Full unit-test coverage (user requirement, 2026-10-09):** every function you add or change gets unit tests written with it, in the same commit. Cover every branch, error path and edge case (empty input, boundaries, invalid input). Measure with `cargo llvm-cov --release -p <crate> --summary-only` (and `--html` for detail). Every new or changed line must be covered; justify any line that cannot be (e.g. `main()`'s process exit) in the report. Reviewers check this per function.
+
 - Every command shown in `Samples.md` is executed while writing it, and the output excerpts are pasted from that run. No invented numbers. Where output is long, show the meaningful lines and mark cuts with `…`.
 - Docs style: plain English and short sentences, matching `ReadMe.md` and `Manual.md`. Tables for reference material. No marketing adjectives.
 - Keep the docs set to `ReadMe.md`, `Manual.md`, `Status.md`, `Samples.md`, and `glossary.md`. Update `CLAUDE.md`'s docs rule to list `Samples.md`.

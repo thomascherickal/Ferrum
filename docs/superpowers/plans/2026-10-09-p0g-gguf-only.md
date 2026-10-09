@@ -15,6 +15,8 @@
 
 ## Global Constraints
 
+- **Full unit-test coverage (user requirement, 2026-10-09):** every function you add or change gets unit tests written with it, in the same commit. Cover every branch, error path and edge case (empty input, boundaries, invalid input). Measure with `cargo llvm-cov --release -p <crate> --summary-only` (and `--html` for detail). Every new or changed line must be covered; justify any line that cannot be (e.g. `main()`'s process exit) in the report. Reviewers check this per function.
+
 - Task order: GA, GB, GT, G1, G2, G3, G4; then Phase 0 Tasks 1–5; then G5 (needs Phase 0 Task 4's `generate_tokens`).
 - Supported size range: from **~0.1M params** (reference tiny config `--context 64 --embed 64 --heads 4 --blocks 2 --hidden 128 --vocab 512 --tie` = 103,936 params) to the 507,552-param reference and beyond. Tensors whose GGML row length is not a multiple of 32 are stored **F32** (exact), never F16.
 

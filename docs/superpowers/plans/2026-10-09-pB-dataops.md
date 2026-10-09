@@ -12,6 +12,8 @@
 
 ## Global Constraints
 
+- **Full unit-test coverage (user requirement, 2026-10-09):** every function you add or change gets unit tests written with it, in the same commit. Cover every branch, error path and edge case (empty input, boundaries, invalid input). Measure with `cargo llvm-cov --release -p <crate> --summary-only` (and `--html` for detail). Every new or changed line must be covered; justify any line that cannot be (e.g. `main()`'s process exit) in the report. Reviewers check this per function.
+
 - Start from the Phase 0 tip in a worktree: `git worktree add ../Ferrum-B -b feat/dos-B feat/dataops-serve-eval`.
 - `#![forbid(unsafe_code)]` stays. `ferrum_core` must build for `wasm32-unknown-unknown`. `unicode-normalization` is pure Rust and wasm-safe. Do not add file-system or hashing crates to `ferrum_core`.
 - `prepare` output must be **byte-identical** across runs with the same inputs and flags. That means no timestamps or absolute paths in the manifest, and maps serialized in sorted key order.

@@ -21,6 +21,8 @@
 
 ## Global Constraints
 
+- **Full unit-test coverage (user requirement, 2026-10-09):** every function you add or change gets unit tests written with it, in the same commit. Cover every branch, error path and edge case (empty input, boundaries, invalid input). Measure with `cargo llvm-cov --release -p <crate> --summary-only` (and `--html` for detail). Every new or changed line must be covered; justify any line that cannot be (e.g. `main()`'s process exit) in the report. Reviewers check this per function.
+
 - Start from the Phase 0 tip in a worktree: `git worktree add ../Ferrum-C -b feat/dos-C feat/dataops-serve-eval`.
 - `#![forbid(unsafe_code)]` at the top of `slm_server/src/lib.rs` and `main.rs`.
 - Bind `127.0.0.1` by default. Enforce limits **before** any model compute: body size (default 8 MiB), batch length (default 64), per-text characters (default 65,536). Return `413` for an oversized body and `400` for other limit or validation failures, both with `{"error": "..."}`. Model errors return `422`.

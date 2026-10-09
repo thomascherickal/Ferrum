@@ -18,7 +18,7 @@ reproducible, servable, and testable with a standard harness:
    checkpoints, tokenizer files — is GGUF. Ferrum's own trained SLMs are **GPT-2-architecture GGUFs
    that run unmodified in llama.cpp, Ollama, and LM Studio** (§4.0).
 7. **No unsafe code** in any crate (`#![forbid(unsafe_code)]` everywhere, plus a repo-wide test).
-8. Unit tests land with every feature (test first).
+8. Unit tests land with every feature (test first) and **completely cover** the code they accompany — every function, branch and error path — measured with `cargo llvm-cov`.
 
 Out of scope: the imported Llama/GGUF stack (`llm`, `llm_train`, `gguf*`,
 `chat_format`) is untouched; streaming the *training* corpus (the trainer still
