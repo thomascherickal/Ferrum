@@ -1,0 +1,5 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+lighteval==0.13.0
+xxhash<4
+datasets<5  # datasets 5.x needs huggingface_hub>=1.31, transformers 4.57 needs <1.0
+torch

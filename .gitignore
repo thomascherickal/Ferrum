@@ -42,3 +42,7 @@ web/datasets/wine/
 *.swo
 .idea/
 .vscode/settings.json
+
+eval/lighteval/.venv/
+eval/lighteval/out/
+__pycache__/
