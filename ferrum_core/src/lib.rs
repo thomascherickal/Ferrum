@@ -108,7 +108,7 @@ pub use slm::{
     ValidationProgress,
 };
 pub use tensor::Tensor;
-pub use tokenizer::{ByteBpeTokenizer, TOK_BOS, TOK_EOS, TOK_PAD, TOK_UNK};
+pub use tokenizer::{ByteBpeTokenizer, DOC_SEP, TOK_BOS, TOK_EOS, TOK_PAD, TOK_UNK};
 pub use train_transformer::{
     train_transformer_epoch, train_transformer_epoch_threaded, train_transformer_steps, StepHook,
     TransformerNet,

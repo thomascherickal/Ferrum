@@ -48,6 +48,11 @@ pub const TOK_EOS: &str = "<|endoftext|>";
 pub const TOK_PAD: &str = "<pad>";
 pub const TOK_UNK: &str = "<unk>";
 
+/// Document separator used by prepared corpora (`train_transformer prepare`)
+/// and TinyStories. [`ByteBpeTokenizer::encode_docs`] maps it to the EOS special
+/// token, and [`ByteBpeTokenizer::train_with_docs`] keeps it out of the merges.
+pub const DOC_SEP: &str = TOK_EOS; // "<|endoftext|>" since Phase 0-G GT
+
 /// Replace every non-overlapping occurrence of `pair` in `ids` with `new_id`,
 /// scanning left to right.
 fn merge_pair(ids: &[u32], pair: (u32, u32), new_id: u32) -> Vec<u32> {
@@ -333,9 +338,28 @@ impl ByteBpeTokenizer {
         out.extend(ids.into_iter().map(|i| i as usize));
     }
 
-    /// Encode text that may contain document separators (see DOC_SEP).
+    /// Like [`encode`](Self::encode), but every [`DOC_SEP`] becomes the EOS id
+    /// when this tokenizer has one. Without EOS it is exactly `encode`.
     pub fn encode_docs(&self, text: &str) -> Vec<usize> {
-        self.encode(text)
+        let Some(eos) = self.eos_id() else {
+            return self.encode(text);
+        };
+        let mut ids = Vec::new();
+        for (i, doc) in text.split(DOC_SEP).enumerate() {
+            if i > 0 {
+                ids.push(eos);
+            }
+            ids.extend(self.encode(doc));
+        }
+        ids
+    }
+
+    /// [`train`](Self::train) that understands document separators: they are
+    /// removed before learning merges, and `train` already reserves [`TOK_EOS`]
+    /// (the last id), so the total vocabulary is still `vocab_size`. Identical
+    /// to `train` when the corpus has no separator.
+    pub fn train_with_docs(corpus: &str, vocab_size: usize) -> Result<Self> {
+        Self::train(&corpus.replace(DOC_SEP, ""), vocab_size)
     }
 
     /// Encode text to token IDs: pre-tokenize at whitespace boundaries (K2),
@@ -946,6 +970,67 @@ mod tests {
         assert_eq!(back.encode_state(), tok.encode_state());
         let text = "the cat sat. ünïcode 123";
         assert_eq!(back.encode(text), tok.encode(text));
+    }
+
+    /// A corpus with enough distinct words to always reach the requested vocab.
+    fn docs_corpus() -> String {
+        (0..200)
+            .map(|i| format!("the cat{i} sat{} on mat{}.<|endoftext|>", i % 13, i % 7))
+            .collect::<String>()
+            .repeat(2)
+    }
+
+    #[test]
+    fn doc_separator_becomes_eos_when_registered() {
+        let corpus = docs_corpus();
+        let tok = ByteBpeTokenizer::train_with_docs(&corpus, 300).unwrap();
+        assert_eq!(tok.vocab_size(), 300);
+        let eos = tok.eos_id().expect("EOS registered");
+        assert_eq!(DOC_SEP, TOK_EOS);
+        let ids = tok.encode_docs("a.<|endoftext|>b.");
+        assert_eq!(ids.iter().filter(|&&i| i == eos).count(), 1);
+        assert_eq!(tok.decode(&ids), "a.b.");
+        // The separator never leaks into the learned merges.
+        assert!(!tok.encode(&corpus).contains(&eos));
+        assert!(tok.encode_docs(&corpus).contains(&eos));
+    }
+
+    #[test]
+    fn train_with_docs_without_separator_equals_plain_training() {
+        let corpus = "abc abc abc abd abd abd ".repeat(10);
+        let plain = ByteBpeTokenizer::train(&corpus, 262).unwrap();
+        let docs = ByteBpeTokenizer::train_with_docs(&corpus, 262).unwrap();
+        assert_eq!(plain.encode_state(), docs.encode_state());
+        // Vocab below the irreducible minimum still errors through the wrapper.
+        assert!(ByteBpeTokenizer::train_with_docs("<|endoftext|>", 256).is_err());
+    }
+
+    #[test]
+    fn encode_docs_separator_positions_and_missing_eos() {
+        let tok = ByteBpeTokenizer::train(&"ab ab ab ".repeat(10), 270).unwrap();
+        let eos = tok.eos_id().unwrap();
+        // Leading, trailing, adjacent and absent separators.
+        assert_eq!(tok.encode_docs("<|endoftext|>"), vec![eos]);
+        assert_eq!(
+            tok.encode_docs("<|endoftext|><|endoftext|>"),
+            vec![eos, eos]
+        );
+        let mixed = tok.encode_docs("<|endoftext|>ab<|endoftext|>");
+        assert_eq!(mixed.first(), Some(&eos));
+        assert_eq!(mixed.last(), Some(&eos));
+        assert_eq!(tok.encode_docs("ab ab"), tok.encode("ab ab"));
+        assert!(tok.encode_docs("").is_empty());
+        // A tokenizer without EOS keeps the separator as literal text.
+        let bare = ByteBpeTokenizer::byte_level();
+        assert!(bare.eos_id().is_none());
+        assert_eq!(
+            bare.encode_docs("x<|endoftext|>y"),
+            bare.encode("x<|endoftext|>y")
+        );
+        assert_eq!(
+            bare.decode(&bare.encode_docs("x<|endoftext|>y")),
+            "x<|endoftext|>y"
+        );
     }
 
     #[test]

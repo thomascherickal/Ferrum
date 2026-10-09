@@ -1556,7 +1556,7 @@ fn tokenize_for_lm_cfg(corpus: &str, cfg: &TransformerConfig) -> Result<LmTokens
         vprintln!("[slm::tokenize] reusing tokenizer {}", path.display());
         ByteBpeTokenizer::from_state(&std::fs::read_to_string(path)?)?
     } else {
-        let tok = ByteBpeTokenizer::train(corpus, cfg.vocab_size)?;
+        let tok = ByteBpeTokenizer::train_with_docs(corpus, cfg.vocab_size)?;
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
@@ -1727,7 +1727,7 @@ fn tokenize_for_lm(corpus: &str, context_len: usize, vocab_size: usize) -> Resul
             tokenizer_state: String::new(),
         });
     }
-    let tok = ByteBpeTokenizer::train(corpus, vocab_size)?;
+    let tok = ByteBpeTokenizer::train_with_docs(corpus, vocab_size)?;
     lm_tokens_from_bpe(&tok, corpus, context_len)
 }
 
@@ -1736,7 +1736,7 @@ fn lm_tokens_from_bpe(
     corpus: &str,
     context_len: usize,
 ) -> Result<LmTokens> {
-    let tokens = tok.encode(corpus);
+    let tokens = tok.encode_docs(corpus);
     if tokens.len() < context_len + 1 {
         return Err(InferError::DimMismatch(
             "BPE-tokenized corpus must be longer than the context window".into(),
@@ -2758,6 +2758,52 @@ mod tests {
         // Longer than one window: every char still counted exactly once.
         let long = "abc".repeat(30);
         assert_eq!(slm.evaluate(&long).unwrap().num_predictions, 90);
+    }
+
+    #[test]
+    fn training_on_docs_registers_eos_and_bos_uses_it() {
+        let corpus = "the cat sat.<|endoftext|>the dog ran.<|endoftext|>".repeat(30);
+        let cfg = TransformerConfig {
+            context_len: 8,
+            embed_dim: 8,
+            num_heads: 2,
+            num_blocks: 1,
+            hidden_dim: 16,
+            epochs: 1,
+            vocab_size: 280,
+            ..TransformerConfig::default()
+        };
+        let slm =
+            GenerativeSLM::train_transformer_config(&corpus, &cfg, &mut Rng::new(2), |_, _| {})
+                .unwrap();
+        let tok = ByteBpeTokenizer::from_state(&slm.meta.tokenizer_state).unwrap();
+        assert_eq!(slm.bos_id(), tok.eos_id().unwrap());
+        assert_eq!(tok.vocab_size(), slm.meta.output_dim);
+        // Separators in text are scored as the EOS token, not as literal bytes.
+        let doc = slm.encode_text("the cat sat.<|endoftext|>").unwrap();
+        assert_eq!(doc.last(), tok.eos_id().as_ref());
+        assert_eq!(doc.len(), tok.encode("the cat sat.").len() + 1);
+    }
+
+    #[test]
+    fn legacy_positional_trainer_also_uses_doc_aware_tokenization() {
+        // tokenize_for_lm (positional train_transformer API) path.
+        let corpus = "the cat sat.<|endoftext|>the dog ran.<|endoftext|>".repeat(30);
+        let tc = tokenize_for_lm(&corpus, 8, 280).unwrap();
+        let tok = ByteBpeTokenizer::from_state(&tc.tokenizer_state).unwrap();
+        let eos = tok.eos_id().unwrap();
+        assert_eq!(tc.tokens.iter().filter(|&&t| t == eos).count(), 60);
+        // Char-level corpora are untouched by document handling.
+        let c = tokenize_for_lm("abcabcabcabc", 4, 0).unwrap();
+        assert!(c.tokenizer_state.is_empty());
+    }
+
+    #[test]
+    fn encode_text_rejects_legacy_non_token_models() {
+        let mut slm = tiny_char_slm();
+        slm.meta.task = TaskType::Classification;
+        let err = slm.encode_text("abc").unwrap_err().to_string();
+        assert!(err.contains("not a token-ID SLM"), "{err}");
     }
 
     #[test]
