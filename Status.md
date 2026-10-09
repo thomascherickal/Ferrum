@@ -242,6 +242,11 @@ These are directions, not commitments.
 - **Legacy one-hot MLP model files** load and inspect, but `generate` and
   `evaluate` return an error. Embedding-MLP files (token-ID input) still
   generate.
+- **`evaluate()` scores every token** (the first conditioned on BOS) through
+  `score_rolling`, so `num_predictions` equals the token count, short texts are
+  accepted, and perplexities shift slightly versus earlier releases (which
+  skipped the first `context_len` tokens). Char-level models now error on
+  characters outside the vocabulary instead of scoring them as id 0.
 - The GUI `train_slm` command ignores the removed `momentum` field. New fields
   are optional and default sensibly, so older front-ends keep working.
 

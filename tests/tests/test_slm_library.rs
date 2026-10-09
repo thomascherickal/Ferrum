@@ -392,7 +392,7 @@ fn test_evaluate_transformer_memorizes_training_corpus() {
         .unwrap();
 
     let eval = slm.evaluate(corpus).unwrap();
-    assert_eq!(eval.num_predictions, corpus.chars().count() - 4);
+    assert_eq!(eval.num_predictions, corpus.chars().count());
     assert!(
         eval.perplexity >= 1.0,
         "perplexity cannot be below 1.0: {}",
@@ -485,11 +485,13 @@ fn test_evaluate_survives_finf_roundtrip() {
 }
 
 #[test]
-fn test_evaluate_rejects_text_shorter_than_context() {
+fn test_evaluate_accepts_short_text_rejects_empty() {
     let corpus = "abcabcabcabcabcabcabcabcabcabcabcabc";
     let mut rng = Rng::new(7);
     let slm =
         GenerativeSLM::train_transformer(corpus, 8, 8, 2, 1, 16, 10, 0.01, 8, 0, &mut rng).unwrap();
-    // Fewer than context_len + 1 characters → nothing to predict.
-    assert!(slm.evaluate("abc").is_err());
+    // Every token is scored (the first after BOS), so short text is fine...
+    assert_eq!(slm.evaluate("abc").unwrap().num_predictions, 3);
+    // ...but empty text has nothing to predict.
+    assert!(slm.evaluate("").is_err());
 }

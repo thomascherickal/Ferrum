@@ -114,8 +114,8 @@ impl Default for TransformerConfig {
 /// the numbers reflect the shipped (quantization-aware) model.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Evaluation {
-    /// Number of next-token predictions scored (positions past the first
-    /// `context_len` tokens of the held-out text).
+    /// Number of next-token predictions scored (every token of the text, the
+    /// first conditioned on the BOS token).
     pub num_predictions: usize,
     /// Mean next-token negative log-likelihood in **nats** (natural-log
     /// cross-entropy). Lower is better.
@@ -1256,46 +1256,28 @@ impl GenerativeSLM {
     /// Score the model's next-token predictions against held-out `text`,
     /// returning cross-entropy, bits-per-token, and perplexity.
     ///
-    /// This slides the model's context window across `text` and, at every
-    /// position past the first `context_len` tokens, measures the probability
-    /// the model assigns to the token that actually follows. It dispatches over
-    /// the same three families [`GenerativeSLM::generate`] handles — byte-level
-    /// BPE, char/token-ID transformer & embedded, and the one-hot MLP — using
-    /// the trained (quantization-aware) weights, so the reported perplexity is
-    /// the quality of the model you will ship, not a separate f32 reference.
+    /// Every token is scored (the first conditioned on
+    /// [`GenerativeSLM::bos_id`]); long texts use sliding windows with at least
+    /// `context_len / 2` tokens of history (see [`GenerativeSLM::score_rolling`]).
+    /// The trained (quantization-aware) weights are used, so the reported
+    /// perplexity is the quality of the model you will ship. Character-level
+    /// models return an error for characters outside the vocabulary.
     ///
-    /// `text` must contain at least `context_len + 1` tokens; otherwise no
-    /// prediction can be scored and a [`InferError::DimMismatch`] is returned.
-    /// Use a corpus the model was **not** trained on to measure generalization.
+    /// `text` must contain at least one token, else [`InferError::DimMismatch`]
+    /// is returned. Use a corpus the model was **not** trained on to measure
+    /// generalization.
     pub fn evaluate(&self, text: &str) -> Result<Evaluation> {
         vprintln!(
             "[slm::evaluate] scoring {} chars of held-out text",
             text.chars().count()
         );
-
-        if !self.meta.tokenizer_state.is_empty() {
-            let tok = ByteBpeTokenizer::from_state(&self.meta.tokenizer_state)?;
-            let ids = tok.encode(text);
-            return self.score_token_ids(&ids, self.meta.input_dim);
+        let s = self.score_rolling(text)?;
+        if s.n_tokens == 0 {
+            return Err(InferError::DimMismatch(
+                "evaluation text must contain at least one token".into(),
+            ));
         }
-
-        self.require_token_id_model()?;
-        let context_len = self.meta.input_dim;
-
-        let chars: Vec<char> = text.chars().filter(|&c| c != '\r').collect();
-        let ids: Vec<usize> = chars
-            .iter()
-            .map(|&ch| {
-                let hex = char_to_hex(ch);
-                self.meta
-                    .class_names
-                    .iter()
-                    .position(|s| s == &hex)
-                    .unwrap_or(0)
-            })
-            .collect();
-
-        self.score_token_ids(&ids, context_len)
+        Ok(finish_evaluation(-s.logprob, s.n_tokens))
     }
 
     /// The conditioning token placed before the first scored or generated
@@ -1484,40 +1466,12 @@ impl GenerativeSLM {
             )))
         }
     }
-
-    /// Accumulate held-out cross-entropy for the token-ID families (BPE,
-    /// char-level transformer, and embedded MLP). The model is fed the last
-    /// `context_len` token IDs and its final-row softmax row gives the predicted
-    /// next-token distribution.
-    fn score_token_ids(&self, ids: &[usize], context_len: usize) -> Result<Evaluation> {
-        if ids.len() <= context_len {
-            return Err(InferError::DimMismatch(
-                "evaluation text must contain more than context_len tokens".into(),
-            ));
-        }
-        let mut total_nll = 0.0f64;
-        let mut count = 0usize;
-        for i in context_len..ids.len() {
-            let ctx: Vec<f32> = ids[i - context_len..i].iter().map(|&t| t as f32).collect();
-            let input = Tensor::matrix(1, context_len, ctx)?;
-            let out = self.model.forward(&input)?;
-            let (rows, cols) = out.matrix_dims()?;
-            // The model ends in Softmax, so the last row holds probabilities.
-            let p = out.data[(rows - 1) * cols + ids[i]].max(1e-12);
-            total_nll += -(p as f64).ln();
-            count += 1;
-        }
-        Ok(finish_evaluation(total_nll, count))
-    }
 }
 
-/// Turn an accumulated negative-log-likelihood sum into an [`Evaluation`].
+/// Turn an accumulated negative-log-likelihood sum into an [`Evaluation`]
+/// (`count` must be non-zero).
 fn finish_evaluation(total_nll: f64, count: usize) -> Evaluation {
-    let ce = if count == 0 {
-        0.0
-    } else {
-        (total_nll / count as f64) as f32
-    };
+    let ce = (total_nll / count as f64) as f32;
     Evaluation {
         num_predictions: count,
         cross_entropy: ce,
@@ -2776,6 +2730,34 @@ mod tests {
             },
             meta,
         )
+    }
+
+    #[test]
+    fn evaluate_agrees_with_score_rolling_and_accepts_short_text() {
+        let slm = tiny_bpe_slm();
+        let text = "the cat sat on the log.";
+        let e = slm.evaluate(text).unwrap();
+        let s = slm.score_rolling(text).unwrap();
+        assert_eq!(e.num_predictions, s.n_tokens);
+        let ce = (-s.logprob / s.n_tokens as f64) as f32;
+        assert!((e.cross_entropy - ce).abs() < 1e-5);
+        assert!((e.perplexity - ce.exp()).abs() < 1e-3);
+        assert!((e.bits_per_token - ce / std::f32::consts::LN_2).abs() < 1e-5);
+        assert!(slm.evaluate("").is_err());
+        // One token is enough.
+        assert_eq!(slm.evaluate("a").unwrap().num_predictions, 1);
+    }
+
+    #[test]
+    fn evaluate_char_level_errors_on_unknown_chars_and_counts_every_char() {
+        let slm = tiny_char_slm();
+        let e = slm.evaluate("abcabc").unwrap();
+        assert_eq!(e.num_predictions, 6);
+        assert!(slm.evaluate("abcz").is_err());
+        assert!(slm.evaluate("").is_err());
+        // Longer than one window: every char still counted exactly once.
+        let long = "abc".repeat(30);
+        assert_eq!(slm.evaluate(&long).unwrap().num_predictions, 90);
     }
 
     #[test]
