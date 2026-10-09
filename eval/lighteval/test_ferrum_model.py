@@ -33,6 +33,7 @@ class Stub(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        CALLS.append((self.path, None))
         self._send(200, {"context_len": 128, "vocab": 1024, "params": 486624})
 
     def do_POST(self):
@@ -99,6 +100,44 @@ class FerrumModelTest(unittest.TestCase):
             self.m.greedy_until(docs)
         self.assertIn("422", str(ctx.exception))
         self.assertIn("kaput", str(ctx.exception))
+
+    def test_generation_size_unset_zero_or_negative_means_64(self):
+        for i, gs in enumerate([None, 0, -1, -100]):
+            CALLS.clear()
+            self.m.greedy_until([Doc(query=f"p{i}", choices=[], gold_index=0, task_name=f"t_gs{i}", generation_size=gs)])
+            self.assertEqual(CALLS[0][1]["requests"][0]["max_tokens"], 64, gs)
+        CALLS.clear()
+        self.m.greedy_until([Doc(query="p", choices=[], gold_index=0, task_name="t_gs_pos", generation_size=1)])
+        self.assertEqual(CALLS[0][1]["requests"][0]["max_tokens"], 1)
+
+    def test_greedy_without_stop_sequences_sends_empty_list(self):
+        self.m.greedy_until([Doc(query="nostop", choices=[], gold_index=0, task_name="t_nostop")])
+        self.assertEqual(CALLS[0][1]["requests"][0]["stop"], [])
+
+    def test_generate_output_tokens_match_n_tokens(self):
+        out = self.m.greedy_until([Doc(query="ntok", choices=[], gold_index=0, task_name="t_ntok")])
+        self.assertEqual(len(out[0].output_tokens[0]), 3)
+
+    def test_unreachable_server_raises_runtime_error(self):
+        old = self.m.url
+        self.m.url = "http://127.0.0.1:9"
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                self.m.loglikelihood_rolling([Doc(query="x", choices=[], gold_index=0, task_name="t_down")])
+        finally:
+            self.m.url = old
+        self.assertIn("cannot reach ferrum-serve", str(ctx.exception))
+
+    def test_static_properties_and_batches(self):
+        self.assertIsNone(self.m.tokenizer)
+        self.assertFalse(self.m.add_special_tokens)
+        self.assertEqual(list(ferrum_model._batches([1, 2, 3, 4, 5], 2)), [[1, 2], [3, 4], [5]])
+        self.assertEqual(list(ferrum_model._batches([], 2)), [])
+
+    def test_max_length_fetches_info_once(self):
+        self.m._info = None
+        self.assertEqual((self.m.max_length, self.m.max_length), (128, 128))
+        self.assertEqual(CALLS, [("/v1/info", None)])
 
 
 if __name__ == "__main__":

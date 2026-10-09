@@ -35,6 +35,8 @@ def main(test_path, out_dir):
                 continue
             k = rng.randrange(2, len(ss))
             gold = ss[k]
+            if len(set(pool) - {gold}) < 3:  # not enough distinct distractors: skip (would loop forever)
+                continue
             distractors = []
             while len(distractors) < 3:
                 c = rng.choice(pool)

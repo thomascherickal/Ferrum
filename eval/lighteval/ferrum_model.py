@@ -79,7 +79,8 @@ class FerrumModel(LightevalModel):
         reqs = [
             {
                 "prompt": d.query,
-                "max_tokens": int(d.generation_size or 64),
+                # None, 0 and -1 (lighteval's "unset") all mean the default budget
+                "max_tokens": int(d.generation_size) if d.generation_size and d.generation_size > 0 else 64,
                 "stop": list(d.stop_sequences or []),
                 "temperature": 0.0,
             }

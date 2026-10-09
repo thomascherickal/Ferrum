@@ -29,7 +29,11 @@ work="$here/out"; rm -rf "$work"; mkdir -p "$work"
 "$root/target/release/ferrum-serve" --model "$model" --port "$port" 2>"$work/server.log" &
 srv=$!
 trap 'kill $srv 2>/dev/null || true' EXIT
-for _ in $(seq 1 100); do curl -sf "http://127.0.0.1:$port/health" >/dev/null && break; sleep 0.1; done
+for _ in $(seq 1 600); do   # up to 60 s; bail out early if the server died
+  curl -sf "http://127.0.0.1:$port/health" >/dev/null && break
+  kill -0 "$srv" 2>/dev/null || break
+  sleep 0.1
+done
 curl -sf "http://127.0.0.1:$port/health" >/dev/null || { cat "$work/server.log" >&2; exit 1; }
 
 tasks="ferrum_heldout|0,tinystories_cloze|0,blimp:anaphor_gender_agreement|0,blimp:anaphor_number_agreement|0,blimp:regular_plural_subject_verb_agreement_1|0,arc:easy|0"
@@ -38,7 +42,7 @@ extra=(); [ -n "$max" ] && extra=(--max-samples "$max")
 
 FERRUM_URL="http://127.0.0.1:$port" FERRUM_TASK_DATA="$work/data" \
   "$le" custom ferrum "$here/ferrum_model.py" "$tasks" \
-  --custom-tasks "$here/ferrum_tasks.py" --output-dir "$work/results" "${extra[@]}"
+  --custom-tasks "$here/ferrum_tasks.py" --output-dir "$work/results" ${extra[@]+"${extra[@]}"}
 
 "$py" - "$work/results" "$out" "$model" "${max:-}" <<'EOF'
 import glob, json, os, sys
