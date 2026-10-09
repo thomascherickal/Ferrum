@@ -4,6 +4,8 @@
 //! prediction (full forward or KV-cached), sampling helpers, and the last
 //! attention map for visualization — so a trained model runs in any browser.
 
+#![forbid(unsafe_code)]
+
 use ferrum_core::layer::{Embedding, KvCache, TransformerBlock};
 use ferrum_core::{from_bytes, TaskType};
 use wasm_bindgen::prelude::*;

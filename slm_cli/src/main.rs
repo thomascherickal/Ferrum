@@ -52,6 +52,8 @@
 //!   --stream     print the completion live as it is generated
 //! ```
 
+#![forbid(unsafe_code)]
+
 use ferrum_core::{GenerativeSLM, Rng, TaskType, TransformerConfig, ValidationConfig};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 

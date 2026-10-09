@@ -21,6 +21,8 @@
 //!      config to get a measured ms/token and tokens/sec (an estimate; see the
 //!      caveats it prints).
 
+#![forbid(unsafe_code)]
+
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

@@ -14,6 +14,8 @@
 //! | `finetune-done` | [`commands::FinetuneResult`]         | GGUF fine-tune done   |
 //! | `gen-fragment`  | `String` (streamed text fragment)    | streaming generation  |
 
+#![forbid(unsafe_code)]
+
 mod capable;
 mod commands;
 mod datasets;
