@@ -55,92 +55,211 @@
 use ferrum_core::{GenerativeSLM, Rng, TaskType, TransformerConfig, ValidationConfig};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-/// Minimal flag parser over a positional/`--flag value` argument vector.
+/// How a `--flag` is parsed. Values are validated at parse time, so a typo
+/// like `--context 12x` is an error instead of a silent default.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Bool,
+    Usize,
+    U64,
+    F32,
+    /// f64, so budgets like `5e7` parse.
+    F64,
+    Str,
+    /// Repeatable string flag (`--stop a --stop b`).
+    // ponytail: first used by the Phase 1 serve/eval flags; keep the parser complete.
+    #[allow(dead_code)]
+    StrList,
+}
+
+/// A subcommand's accepted flags.
+type Spec = &'static [(&'static str, Kind)];
+
+const TRAIN_FLAGS: Spec = &[
+    ("context", Kind::Usize),
+    ("embed", Kind::Usize),
+    ("heads", Kind::Usize),
+    ("blocks", Kind::Usize),
+    ("hidden", Kind::Usize),
+    ("epochs", Kind::Usize),
+    ("lr", Kind::F32),
+    ("batch", Kind::Usize),
+    ("vocab", Kind::Usize),
+    ("seed", Kind::U64),
+    ("threads", Kind::Usize),
+    ("weight_decay", Kind::F32),
+    ("dropout", Kind::F32),
+    ("stride", Kind::Usize),
+    ("tokens", Kind::F64),
+    ("cosine", Kind::Bool),
+    ("warmup", Kind::U64),
+    ("clip", Kind::F32),
+    ("tie", Kind::Bool),
+    ("no-qat", Kind::Bool),
+    ("tokenizer", Kind::Str),
+    ("checkpoint", Kind::Str),
+    ("checkpoint-every", Kind::U64),
+    ("resume", Kind::Str),
+    ("val", Kind::F32),
+    ("patience", Kind::Usize),
+    ("force", Kind::Bool),
+    ("sample", Kind::Bool),
+];
+const GENERATE_FLAGS: Spec = &[
+    ("chars", Kind::Usize),
+    ("temp", Kind::F32),
+    ("gen-seed", Kind::U64),
+    ("stream", Kind::Bool),
+];
+const RUN_GGUF_FLAGS: Spec = &[
+    ("quant", Kind::Str),
+    ("max", Kind::Usize),
+    ("temp", Kind::F32),
+    ("gen-seed", Kind::U64),
+    ("top-k", Kind::Usize),
+    ("top-p", Kind::F32),
+    ("rep", Kind::F32),
+    ("ids", Kind::Str),
+    ("raw", Kind::Bool),
+    ("force", Kind::Bool),
+    ("resume", Kind::Str),
+];
+const FINETUNE_FLAGS: Spec = &[
+    ("epochs", Kind::Usize),
+    ("lr", Kind::F32),
+    ("batch", Kind::Usize),
+    ("seq", Kind::Usize),
+    ("weight_decay", Kind::F32),
+    ("dropout", Kind::F32),
+    ("clip", Kind::F32),
+    ("warmup", Kind::U64),
+    ("qat", Kind::Bool),
+    ("seed", Kind::U64),
+    ("threads", Kind::Usize),
+    ("resume", Kind::Str),
+    ("sample", Kind::Bool),
+    ("temp", Kind::F32),
+    ("max", Kind::Usize),
+    ("force", Kind::Bool),
+];
+const EXPORT_FLAGS: Spec = &[
+    ("quant", Kind::Str),
+    ("resume", Kind::Str),
+    ("force", Kind::Bool),
+];
+const NO_FLAGS: Spec = &[];
+
+/// `run` takes the union of train and generate flags.
+fn run_flags() -> Vec<(&'static str, Kind)> {
+    TRAIN_FLAGS.iter().chain(GENERATE_FLAGS).copied().collect()
+}
+
+fn spec_for(cmd: &str) -> Option<Spec> {
+    static RUN: std::sync::OnceLock<Vec<(&'static str, Kind)>> = std::sync::OnceLock::new();
+    Some(match cmd {
+        "train" => TRAIN_FLAGS,
+        "run" => RUN.get_or_init(run_flags).as_slice(),
+        "generate" | "gen" => GENERATE_FLAGS,
+        "run-gguf" | "gguf" => RUN_GGUF_FLAGS,
+        "finetune-gguf" | "finetune" => FINETUNE_FLAGS,
+        "export-gguf" | "export" => EXPORT_FLAGS,
+        "eval" | "info" => NO_FLAGS,
+        _ => return None,
+    })
+}
+
+/// Parsed `positional --flag value` arguments for one subcommand.
 struct Args {
     positional: Vec<String>,
     verbose: bool,
-    flags: std::collections::HashMap<String, String>,
+    flags: std::collections::HashMap<String, Vec<String>>,
     bools: std::collections::HashSet<String>,
 }
 
 impl Args {
-    fn parse(raw: &[String]) -> Self {
-        let mut positional = Vec::new();
-        let mut flags = std::collections::HashMap::new();
-        let mut bools = std::collections::HashSet::new();
-        let mut verbose = false;
-        // Flags that take a value rather than acting as a boolean switch.
-        const VALUE_FLAGS: &[&str] = &[
-            "context",
-            "embed",
-            "heads",
-            "blocks",
-            "hidden",
-            "epochs",
-            "lr",
-            "batch",
-            "seed",
-            "chars",
-            "temp",
-            "gen-seed",
-            "vocab",
-            "threads",
-            // AdamW / regularization (exposing the engine's existing knobs).
-            "weight_decay",
-            "dropout",
-            // run-gguf options.
-            "quant",
-            "max",
-            "top-k",
-            "top-p",
-            "rep",
-            "ids",
-            // finetune-gguf options.
-            "seq",
-            "warmup",
-            "clip",
-            "resume",
-            // train pipeline options.
-            "stride",
-            "tokens",
-            "tokenizer",
-            "checkpoint",
-            "checkpoint-every",
-            "val",
-            "patience",
-        ];
+    #[cfg(test)]
+    fn parse(raw: &[String], spec: Spec) -> Result<Self, String> {
+        Self::parse_for("", raw, spec)
+    }
+
+    fn parse_for(cmd: &str, raw: &[String], spec: Spec) -> Result<Self, String> {
+        let mut a = Args {
+            positional: Vec::new(),
+            verbose: false,
+            flags: Default::default(),
+            bools: Default::default(),
+        };
         let mut i = 0;
         while i < raw.len() {
-            let a = &raw[i];
-            if a == "--verbose" || a == "-v" {
-                verbose = true;
-            } else if let Some(name) = a.strip_prefix("--") {
-                if VALUE_FLAGS.contains(&name) {
-                    if let Some(val) = raw.get(i + 1) {
-                        flags.insert(name.to_string(), val.clone());
-                        i += 1;
-                    }
+            let arg = &raw[i];
+            if arg == "--verbose" || arg == "-v" {
+                a.verbose = true;
+            } else if let Some(name) = arg.strip_prefix("--") {
+                let kind = spec
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, k)| *k)
+                    .ok_or_else(|| {
+                        let valid: Vec<String> =
+                            spec.iter().map(|(n, _)| format!("--{n}")).collect();
+                        let for_cmd = if cmd.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" for '{cmd}'")
+                        };
+                        format!(
+                            "unknown flag --{name}{for_cmd} (valid: {})",
+                            valid.join(" ")
+                        )
+                    })?;
+                if kind == Kind::Bool {
+                    a.bools.insert(name.to_string());
                 } else {
-                    bools.insert(name.to_string());
+                    let val = raw
+                        .get(i + 1)
+                        .ok_or_else(|| format!("--{name} needs a value"))?;
+                    let ok = match kind {
+                        Kind::Usize => val.parse::<usize>().is_ok(),
+                        Kind::U64 => val.parse::<u64>().is_ok(),
+                        Kind::F32 => val.parse::<f32>().is_ok(),
+                        Kind::F64 => val.parse::<f64>().is_ok(),
+                        Kind::Str | Kind::StrList | Kind::Bool => true,
+                    };
+                    if !ok {
+                        return Err(format!(
+                            "--{name}: cannot parse '{val}' as {}",
+                            kind_name(kind)
+                        ));
+                    }
+                    a.flags
+                        .entry(name.to_string())
+                        .or_default()
+                        .push(val.clone());
+                    i += 1;
                 }
             } else {
-                positional.push(a.clone());
+                a.positional.push(arg.clone());
             }
             i += 1;
         }
-        Args {
-            positional,
-            verbose,
-            flags,
-            bools,
-        }
+        Ok(a)
     }
 
+    /// Last value of `key` (values were validated at parse time).
     fn get<T: std::str::FromStr>(&self, key: &str, default: T) -> T {
-        self.flags
-            .get(key)
+        self.value(key)
             .and_then(|s| s.parse().ok())
             .unwrap_or(default)
+    }
+    fn value(&self, key: &str) -> Option<&str> {
+        self.flags
+            .get(key)
+            .and_then(|v| v.last())
+            .map(String::as_str)
+    }
+    #[allow(dead_code)] // ponytail: StrList consumers land in Phase 1.
+    fn get_all(&self, key: &str) -> Vec<String> {
+        self.flags.get(key).cloned().unwrap_or_default()
     }
     fn has(&self, key: &str) -> bool {
         self.bools.contains(key)
@@ -171,14 +290,21 @@ impl Args {
             tokenizer_path: self.get("tokenizer", d.tokenizer_path),
             // `--resume ckpt` resumes from and keeps writing to that file.
             checkpoint_path: self
-                .flags
-                .get("resume")
-                .or_else(|| self.flags.get("checkpoint"))
-                .cloned()
+                .value("resume")
+                .or_else(|| self.value("checkpoint"))
+                .map(String::from)
                 .unwrap_or_default(),
             checkpoint_every: self.get("checkpoint-every", d.checkpoint_every),
-            resume: self.flags.contains_key("resume"),
+            resume: self.value("resume").is_some(),
         }
+    }
+}
+
+fn kind_name(k: Kind) -> &'static str {
+    match k {
+        Kind::Usize | Kind::U64 => "a non-negative integer",
+        Kind::F32 | Kind::F64 => "a number",
+        _ => "a string",
     }
 }
 
@@ -204,7 +330,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
     let cmd = argv[1].clone();
-    let args = Args::parse(&argv[2..]);
+    let Some(spec) = spec_for(&cmd) else {
+        if matches!(cmd.as_str(), "-h" | "--help" | "help") {
+            print_usage();
+            return Ok(());
+        }
+        eprintln!("unknown command: {cmd}\n");
+        print_usage();
+        std::process::exit(1);
+    };
+    let args = Args::parse_for(&cmd, &argv[2..], spec)?;
     if args.verbose {
         ferrum_core::set_verbose(true);
     }
@@ -217,15 +352,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "export-gguf" | "export" => cmd_export_gguf(&args),
         "eval" => cmd_eval(&args),
         "info" => cmd_info(&args),
-        "-h" | "--help" | "help" => {
-            print_usage();
-            Ok(())
-        }
-        other => {
-            eprintln!("unknown command: {other}\n");
-            print_usage();
-            std::process::exit(1);
-        }
+        _ => unreachable!("spec_for covers every command"),
     }
 }
 
@@ -309,6 +436,11 @@ fn train_and_save(
     model_path: &str,
     args: &Args,
 ) -> Result<GenerativeSLM, Box<dyn std::error::Error>> {
+    if let Some(ckpt) = args.value("resume") {
+        if !std::path::Path::new(ckpt).exists() {
+            return Err(format!("checkpoint {ckpt} does not exist (--resume needs an existing file; use --checkpoint to start a new one)").into());
+        }
+    }
     let cfg = args.config();
     let seed: u64 = args.get("seed", 1337);
     // 0 = auto-detect the machine's parallelism; 1 = serial.
@@ -371,7 +503,7 @@ fn train_and_save(
         format!("/{epochs}")
     };
 
-    let slm = if args.flags.contains_key("val") {
+    let slm = if args.value("val").is_some() {
         let val = ValidationConfig {
             val_fraction: args.get("val", 0.1),
             patience: args.get("patience", 0),
@@ -678,12 +810,8 @@ fn cmd_run_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // A fine-tune checkpoint holds f32 weights, so applying one forces an f32
     // load regardless of --quant.
-    let resume = args.flags.get("resume").cloned();
-    let quant = args
-        .flags
-        .get("quant")
-        .map(String::as_str)
-        .unwrap_or("int4");
+    let resume = args.value("resume").map(String::from);
+    let quant = args.value("quant").unwrap_or("int4");
     let prec = if resume.is_some() {
         if quant != "int4" && quant != "f32" && quant != "none" {
             eprintln!("note: --resume applies f32 fine-tuned weights; ignoring --quant {quant}");
@@ -762,7 +890,7 @@ fn cmd_run_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // Build the prompt token IDs (explicit --ids win; else encode the text,
     // auto-wrapping instruct prompts in their chat template unless --raw).
     let mut fmt = None;
-    let prompt_ids: Vec<usize> = if let Some(ids) = args.flags.get("ids") {
+    let prompt_ids: Vec<usize> = if let Some(ids) = args.value("ids") {
         ids.split_whitespace()
             .filter_map(|s| s.parse().ok())
             .collect()
@@ -972,7 +1100,7 @@ fn cmd_finetune_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let steps_per_epoch = num_windows.div_ceil(batch.max(1)) as u64;
 
     // 5. Resume optimizer state if requested (continues where a prior run stopped).
-    let mut rng = if let Some(ckpt) = args.flags.get("resume") {
+    let mut rng = if let Some(ckpt) = args.value("resume") {
         let bytes =
             std::fs::read(ckpt).map_err(|e| format!("cannot read checkpoint {ckpt}: {e}"))?;
         let r = tr
@@ -1068,11 +1196,7 @@ fn cmd_export_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     }
     let in_path = &args.positional[0];
     let out_path = &args.positional[1];
-    let quant_name = args
-        .flags
-        .get("quant")
-        .map(String::as_str)
-        .unwrap_or("q8_0");
+    let quant_name = args.value("quant").unwrap_or("q8_0");
     let quant =
         GgufQuant::from_str(quant_name).ok_or_else(|| format!("unknown --quant '{quant_name}'"))?;
 
@@ -1086,8 +1210,7 @@ fn cmd_export_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // Whitespace-only --resume means "none".
     let resume = args
-        .flags
-        .get("resume")
+        .value("resume")
         .map(|s| s.trim())
         .filter(|s| !s.is_empty());
 
@@ -1183,5 +1306,326 @@ fn ggml_type_name(t: u32) -> String {
         13 => "Q5_K".into(),
         14 => "Q6_K".into(),
         other => format!("type{other}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+    const SPEC: Spec = &[
+        ("stop", Kind::StrList),
+        ("temp", Kind::F32),
+        ("stream", Kind::Bool),
+        ("n", Kind::Usize),
+        ("seed", Kind::U64),
+        ("budget", Kind::F64),
+        ("name", Kind::Str),
+    ];
+
+    fn err(raw: &[&str]) -> String {
+        Args::parse(&s(raw), SPEC)
+            .err()
+            .expect("expected parse error")
+    }
+
+    #[test]
+    fn repeated_flags_keep_all_values() {
+        let a = Args::parse(&s(&["--stop", "a", "--stop", "b"]), SPEC).unwrap();
+        assert_eq!(a.get_all("stop"), vec!["a", "b"]);
+        assert_eq!(a.value("stop"), Some("b"));
+    }
+
+    #[test]
+    fn repeated_scalar_flag_last_wins() {
+        let a = Args::parse(&s(&["--n", "1", "--n", "2"]), SPEC).unwrap();
+        assert_eq!(a.get("n", 0usize), 2);
+    }
+
+    #[test]
+    fn negative_number_is_a_value() {
+        let a = Args::parse(&s(&["--temp", "-1"]), SPEC).unwrap();
+        assert_eq!(a.get("temp", 0.0f32), -1.0);
+    }
+
+    #[test]
+    fn bool_and_positionals_mix() {
+        let a = Args::parse(&s(&["m.bin", "--stream", "hello", "-v"]), SPEC).unwrap();
+        assert!(a.has("stream") && a.verbose);
+        assert_eq!(a.positional, vec!["m.bin", "hello"]);
+    }
+
+    #[test]
+    fn bool_does_not_consume_next_argument() {
+        let a = Args::parse(&s(&["--stream", "7"]), SPEC).unwrap();
+        assert!(a.has("stream"));
+        assert_eq!(a.positional, vec!["7"]);
+        assert!(a.value("stream").is_none());
+    }
+
+    #[test]
+    fn long_verbose_and_absent_flags() {
+        let a = Args::parse(&s(&["--verbose"]), SPEC).unwrap();
+        assert!(a.verbose);
+        let a = Args::parse(&s(&[]), SPEC).unwrap();
+        assert!(!a.verbose && !a.has("stream") && a.positional.is_empty());
+        assert_eq!(a.get("n", 9usize), 9);
+        assert!(a.get_all("stop").is_empty());
+        assert_eq!(a.value("n"), None);
+    }
+
+    #[test]
+    fn single_dash_is_positional() {
+        let a = Args::parse(&s(&["-x", "-"]), SPEC).unwrap();
+        assert_eq!(a.positional, vec!["-x", "-"]);
+    }
+
+    #[test]
+    fn unknown_flag_lists_valid_ones() {
+        let e = err(&["--nope"]);
+        assert!(e.contains("unknown flag --nope"), "{e}");
+        assert!(e.contains("--stop") && e.contains("--temp"), "{e}");
+        assert!(!e.contains(" for '"), "{e}");
+    }
+
+    #[test]
+    fn unknown_flag_names_the_command() {
+        let e = Args::parse_for("info", &s(&["--epochs", "3"]), NO_FLAGS)
+            .err()
+            .unwrap();
+        assert!(e.contains("unknown flag --epochs for 'info'"), "{e}");
+    }
+
+    #[test]
+    fn bare_double_dash_is_unknown() {
+        assert!(err(&["--"]).contains("unknown flag --"));
+    }
+
+    #[test]
+    fn missing_value_at_end_is_an_error() {
+        assert_eq!(err(&["--temp"]), "--temp needs a value");
+        assert_eq!(err(&["--name"]), "--name needs a value");
+        assert_eq!(err(&["--stop"]), "--stop needs a value");
+    }
+
+    #[test]
+    fn each_kind_rejects_unparsable_values() {
+        for (flag, bad, what) in [
+            ("n", "12x", "a non-negative integer"),
+            ("n", "-3", "a non-negative integer"),
+            ("seed", "1.5", "a non-negative integer"),
+            ("temp", "hot", "a number"),
+            ("budget", "5e", "a number"),
+        ] {
+            let e = err(&[&format!("--{flag}"), bad]);
+            assert_eq!(e, format!("--{flag}: cannot parse '{bad}' as {what}"));
+        }
+    }
+
+    #[test]
+    fn each_kind_accepts_valid_values() {
+        let a = Args::parse(
+            &s(&[
+                "--n",
+                "5",
+                "--seed",
+                "18446744073709551615",
+                "--temp",
+                "0.5",
+                "--budget",
+                "5e7",
+                "--name",
+                "-weird",
+                "--stop",
+                "",
+            ]),
+            SPEC,
+        )
+        .unwrap();
+        assert_eq!(a.get("n", 0usize), 5);
+        assert_eq!(a.get("seed", 0u64), u64::MAX);
+        assert_eq!(a.get("temp", 0.0f32), 0.5);
+        assert_eq!(a.get("budget", 0.0f64), 5e7);
+        assert_eq!(a.value("name"), Some("-weird"));
+        assert_eq!(a.get_all("stop"), vec![""]);
+    }
+
+    #[test]
+    fn get_falls_back_when_type_mismatches() {
+        // A Str flag read as a number falls back to the default.
+        let a = Args::parse(&s(&["--name", "abc"]), SPEC).unwrap();
+        assert_eq!(a.get("name", 4usize), 4);
+    }
+
+    #[test]
+    fn kind_names() {
+        assert_eq!(kind_name(Kind::Usize), "a non-negative integer");
+        assert_eq!(kind_name(Kind::U64), "a non-negative integer");
+        assert_eq!(kind_name(Kind::F32), "a number");
+        assert_eq!(kind_name(Kind::F64), "a number");
+        assert_eq!(kind_name(Kind::Str), "a string");
+        assert_eq!(kind_name(Kind::StrList), "a string");
+        assert_eq!(kind_name(Kind::Bool), "a string");
+    }
+
+    #[test]
+    fn spec_for_known_commands_and_aliases() {
+        for c in [
+            "train",
+            "run",
+            "generate",
+            "gen",
+            "run-gguf",
+            "gguf",
+            "finetune-gguf",
+            "finetune",
+            "export-gguf",
+            "export",
+            "eval",
+            "info",
+        ] {
+            assert!(spec_for(c).is_some(), "{c}");
+        }
+        for c in ["", "help", "-h", "bogus", "TRAIN"] {
+            assert!(spec_for(c).is_none(), "{c}");
+        }
+        assert!(spec_for("eval").unwrap().is_empty());
+        assert!(spec_for("info").unwrap().is_empty());
+        assert_eq!(
+            spec_for("gen").unwrap().len(),
+            spec_for("generate").unwrap().len()
+        );
+    }
+
+    #[test]
+    fn run_accepts_train_and_generate_flags_but_not_gguf_ones() {
+        let spec = spec_for("run").unwrap();
+        for f in TRAIN_FLAGS.iter().chain(GENERATE_FLAGS) {
+            assert!(spec.iter().any(|(n, _)| *n == f.0), "{}", f.0);
+        }
+        assert!(!spec.iter().any(|(n, _)| *n == "top-k"));
+        assert_eq!(spec.len(), run_flags().len());
+    }
+
+    #[test]
+    fn every_flag_each_command_reads_is_accepted() {
+        // Mirrors the `args.get/has/value` calls in each cmd_* function.
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "train",
+                &[
+                    "context",
+                    "embed",
+                    "heads",
+                    "blocks",
+                    "hidden",
+                    "epochs",
+                    "lr",
+                    "batch",
+                    "vocab",
+                    "seed",
+                    "threads",
+                    "weight_decay",
+                    "dropout",
+                    "stride",
+                    "tokens",
+                    "cosine",
+                    "warmup",
+                    "clip",
+                    "tie",
+                    "no-qat",
+                    "tokenizer",
+                    "checkpoint",
+                    "checkpoint-every",
+                    "resume",
+                    "val",
+                    "patience",
+                    "force",
+                    "sample",
+                ],
+            ),
+            ("generate", &["chars", "temp", "gen-seed", "stream"]),
+            ("run", &["force", "stream", "chars", "context"]),
+            (
+                "run-gguf",
+                &[
+                    "quant", "max", "temp", "gen-seed", "top-k", "top-p", "rep", "ids", "raw",
+                    "force", "resume",
+                ],
+            ),
+            (
+                "finetune-gguf",
+                &[
+                    "epochs",
+                    "lr",
+                    "batch",
+                    "seq",
+                    "weight_decay",
+                    "dropout",
+                    "clip",
+                    "warmup",
+                    "qat",
+                    "seed",
+                    "threads",
+                    "resume",
+                    "sample",
+                    "temp",
+                    "max",
+                    "force",
+                ],
+            ),
+            ("export-gguf", &["quant", "resume", "force"]),
+        ];
+        for (cmd, flags) in cases {
+            let spec = spec_for(cmd).unwrap();
+            for f in *flags {
+                let kind = spec.iter().find(|(n, _)| n == f).map(|(_, k)| *k);
+                assert!(kind.is_some(), "{cmd} --{f}");
+            }
+        }
+    }
+
+    #[test]
+    fn config_reads_flags_and_defaults() {
+        let spec = spec_for("train").unwrap();
+        let d = TransformerConfig::default();
+        let a = Args::parse(&s(&[]), spec).unwrap();
+        let c = a.config();
+        assert_eq!(c.context_len, d.context_len);
+        assert!(c.qat && !c.cosine_lr && !c.weight_tying && !c.resume);
+        assert_eq!(c.max_tokens, 0);
+        assert_eq!(c.checkpoint_path, "");
+
+        let a = Args::parse(
+            &s(&[
+                "--context",
+                "8",
+                "--tokens",
+                "5e7",
+                "--no-qat",
+                "--cosine",
+                "--tie",
+                "--checkpoint",
+                "a.fckp",
+            ]),
+            spec,
+        )
+        .unwrap();
+        let c = a.config();
+        assert_eq!(c.context_len, 8);
+        assert_eq!(c.max_tokens, 50_000_000);
+        assert!(!c.qat && c.cosine_lr && c.weight_tying && !c.resume);
+        assert_eq!(c.checkpoint_path, "a.fckp");
+    }
+
+    #[test]
+    fn resume_wins_over_checkpoint_and_sets_resume() {
+        let spec = spec_for("train").unwrap();
+        let a = Args::parse(&s(&["--checkpoint", "a", "--resume", "b"]), spec).unwrap();
+        let c = a.config();
+        assert_eq!(c.checkpoint_path, "b");
+        assert!(c.resume);
     }
 }
