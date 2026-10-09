@@ -373,6 +373,17 @@ impl GenerativeSLM {
     fn build_transformer_slm(net: &TransformerNet, tc: &LmTokens) -> Result<Self> {
         let model_vocab = tc.vocab_size;
         let context_len = net.context_len();
+        // QAT: ship exactly the Q8_0 values the training saw, so an int8 export
+        // changes nothing.
+        let snapped;
+        let net = if net.qat_enabled() {
+            let mut n = net.clone();
+            n.fake_quantize_weights();
+            snapped = n;
+            &snapped
+        } else {
+            net
+        };
         let model = net.to_inference()?;
         let meta = ModelMetadata {
             dataset_name: "GenerativeSLM Transformer".into(),

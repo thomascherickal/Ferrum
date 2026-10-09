@@ -205,19 +205,14 @@ fn enc_f16(data: &[f32]) -> Vec<u8> {
     o
 }
 
-/// Q8_0: per 32-element block, `d = amax/127` (f16), then 32 × i8 with
-/// `q = round(x/d)`. Decode is `d * q`.
+/// Q8_0: per 32-element block, via the shared [`crate::quant::q8_0_block`]
+/// (same encoder QAT snaps to). Decode is `d * q`.
 fn enc_q8_0(data: &[f32]) -> Vec<u8> {
     let mut o = Vec::with_capacity(data.len() / QK * (2 + QK));
     for blk in data.chunks_exact(QK) {
-        let amax = blk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        let d = amax / 127.0;
-        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
-        o.extend_from_slice(&f32_to_f16(d).to_le_bytes());
-        for &x in blk {
-            let q = (x * id).round().clamp(-127.0, 127.0) as i8;
-            o.push(q as u8);
-        }
+        let (d16, q) = crate::quant::q8_0_block(blk);
+        o.extend_from_slice(&d16.to_le_bytes());
+        o.extend(q.iter().map(|&v| v as u8));
     }
     o
 }

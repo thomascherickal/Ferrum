@@ -259,9 +259,108 @@ impl QWeight {
     }
 }
 
+/// Q8_0 block size (values per f16 scale).
+pub const Q8_0_BLOCK: usize = 32;
+
+/// Quantize one block exactly like llama.cpp's `quantize_row_q8_0_ref`:
+/// `d = amax/127`; `q = round(x * (1/d))`; stored scale = `f16(d)`.
+/// Single source of truth for both the GGUF writer and QAT.
+pub fn q8_0_block(x: &[f32]) -> (u16, [i8; 32]) {
+    let amax = x.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+    let d = amax / 127.0;
+    let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+    let mut q = [0i8; 32];
+    for (qi, &v) in q.iter_mut().zip(x) {
+        *qi = (v * id).round() as i8; // saturating cast; |v*id| <= 127 (+eps)
+    }
+    (crate::gguf_write::f32_to_f16(d), q)
+}
+
+/// True when a matrix with GGML row length `ne0` is stored Q8_0 (else F32).
+pub fn q8_0_eligible(ne0: usize) -> bool {
+    ne0.is_multiple_of(Q8_0_BLOCK)
+}
+
+/// Snap one block onto the values llama.cpp reads back (`q * f16(d)`).
+fn snap_q8_0_block(x: &mut [f32]) {
+    let (d16, q) = q8_0_block(x);
+    let d = crate::gguf::f16_to_f32(d16);
+    for (v, &qi) in x.iter_mut().zip(&q) {
+        *v = qi as f32 * d;
+    }
+}
+
+/// Snap a GGML-row-contiguous tensor (rows of length `ne0`, `ne0 % 32 == 0`)
+/// onto its Q8_0 values in place. Ineligible `ne0` leaves the data untouched.
+pub fn fake_quantize_q8_0_rows(data: &mut [f32], ne0: usize) {
+    if !q8_0_eligible(ne0) || ne0 == 0 {
+        return;
+    }
+    for blk in data.chunks_exact_mut(Q8_0_BLOCK) {
+        snap_q8_0_block(blk);
+    }
+}
+
+/// Snap a Ferrum `[in, out]` row-major weight as GGUF stores it (GGML
+/// `ne0 = in`: Q8_0 blocks run down each column). Ineligible `rows_in` is a no-op.
+pub fn fake_quantize_q8_0_cols(data: &mut [f32], rows_in: usize, cols_out: usize) {
+    if !q8_0_eligible(rows_in) || rows_in == 0 {
+        return;
+    }
+    let mut buf = [0.0f32; Q8_0_BLOCK];
+    for j in 0..cols_out {
+        for i0 in (0..rows_in).step_by(Q8_0_BLOCK) {
+            for (k, b) in buf.iter_mut().enumerate() {
+                *b = data[(i0 + k) * cols_out + j];
+            }
+            snap_q8_0_block(&mut buf);
+            for (k, b) in buf.iter().enumerate() {
+                data[(i0 + k) * cols_out + j] = *b;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn q8_0_block_matches_llama_cpp_reference() {
+        let x: Vec<f32> = (0..32).map(|i| ((i as f32) - 15.5) * 0.37).collect();
+        let (d16, q) = q8_0_block(&x);
+        let amax = x.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        let d = amax / 127.0;
+        assert_eq!(d16, crate::gguf_write::f32_to_f16(d));
+        for (i, &v) in x.iter().enumerate() {
+            assert_eq!(q[i] as f32, (v * (1.0 / d)).round());
+        }
+        let zeros = q8_0_block(&[0.0; 32]);
+        assert_eq!(zeros.1, [0i8; 32]);
+    }
+
+    #[test]
+    fn q8_0_snap_is_a_fixed_point_of_encode_decode() {
+        let mut w: Vec<f32> = (0..96 * 40)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 61.0)
+            .collect();
+        fake_quantize_q8_0_cols(&mut w, 96, 40);
+        let once = w.clone();
+        fake_quantize_q8_0_cols(&mut w, 96, 40);
+        assert_eq!(w, once, "snapping twice must not move values");
+    }
+
+    #[test]
+    fn q8_0_ineligible_is_untouched_and_rows_snap() {
+        let orig: Vec<f32> = (0..48 * 3).map(|i| i as f32 * 0.013).collect();
+        let mut w = orig.clone();
+        fake_quantize_q8_0_cols(&mut w, 48, 3);
+        fake_quantize_q8_0_rows(&mut w, 48);
+        assert_eq!(w, orig);
+        let mut r: Vec<f32> = (0..64).map(|i| (i as f32).sin()).collect();
+        fake_quantize_q8_0_rows(&mut r, 32);
+        assert_ne!(r, (0..64).map(|i| (i as f32).sin()).collect::<Vec<_>>());
+    }
 
     #[test]
     fn fake_quantize_snaps_to_int8_grid() {

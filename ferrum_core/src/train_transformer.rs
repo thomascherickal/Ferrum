@@ -541,8 +541,9 @@ pub struct TransformerNet {
     lnf_b: Param,
     head_w: Param, // [C, vocab]
     step_t: u64,
-    /// Quantization Aware Training: when enabled, `train_transformer_epoch`
-    /// runs forward/backward against int8-snapped weights while Adam updates
+    /// Quantization Aware Training (int8 QAT simulating GGUF Q8_0): when
+    /// enabled, `train_transformer_epoch` runs forward/backward against
+    /// Q8_0-snapped weights while Adam updates
     /// full-precision master weights (straight-through estimator).
     qat: bool,
     /// Global-norm gradient clipping threshold. When `Some(max_norm)`, every
@@ -629,7 +630,7 @@ impl TransformerNet {
         self.context_len
     }
 
-    /// Enable or disable int8 Quantization Aware Training (see the `qat`
+    /// Enable or disable int8 QAT simulating GGUF Q8_0 (see the `qat`
     /// field docs). Off by default; `GenerativeSLM` turns it on.
     pub fn set_qat(&mut self, enabled: bool) {
         self.qat = enabled;
@@ -947,17 +948,35 @@ impl TransformerNet {
             .collect()
     }
 
-    /// Snap every (large-enough) parameter tensor onto the int8 grid in place,
-    /// per output-row (§7) so QAT matches the per-channel quantization the FINF
-    /// v5 writer uses. 1-D parameters fall back to a single scale.
+    /// Snap exactly the tensors the GGUF writer stores as Q8_0 onto their
+    /// Q8_0 values (32-blocks, f16 scale, same axis as GGML): embedding tables
+    /// along their rows, `[in, out]` weights down each column, the untied head
+    /// likewise. 1-D params and matrices whose GGML row length is not a
+    /// multiple of 32 (stored F32) are left alone. With weight tying the head
+    /// is re-mirrored from the snapped embedding.
     pub(crate) fn fake_quantize_weights(&mut self) {
-        for t in self.param_tensors_mut() {
-            let channels = if t.shape.len() >= 2 {
-                t.shape[0].max(1)
-            } else {
-                1
-            };
-            crate::quant::fake_quantize_int8_per_channel(&mut t.data, channels);
+        use crate::quant::{fake_quantize_q8_0_cols, fake_quantize_q8_0_rows};
+        let e = self.embed_dim;
+        fake_quantize_q8_0_rows(&mut self.tok_emb.data.data, e);
+        fake_quantize_q8_0_rows(&mut self.pos_emb.data.data, e);
+        for b in &mut self.blocks {
+            for w in [
+                &mut b.q_w,
+                &mut b.k_w,
+                &mut b.v_w,
+                &mut b.o_w,
+                &mut b.f1_w,
+                &mut b.f2_w,
+            ] {
+                let (rows, cols) = (w.data.shape[0], w.data.shape[1]);
+                fake_quantize_q8_0_cols(&mut w.data.data, rows, cols);
+            }
+        }
+        if self.tie_weights {
+            self.sync_tied_head();
+        } else {
+            let v = self.vocab_size;
+            fake_quantize_q8_0_cols(&mut self.head_w.data.data, e, v);
         }
     }
 
@@ -1805,9 +1824,61 @@ mod tests {
     }
 
     #[test]
+    fn qat_snaps_only_q8_0_eligible_matrices() {
+        let mut rng = Rng::new(2);
+        // embed 48: ne0 = 48 is not a multiple of 32, so those tensors stay f32;
+        // hidden 64: ffn2 has ne0 = 64, so it is snapped.
+        let mut net = TransformerNet::new(40, 8, 48, 2, 64, 1, &mut rng).unwrap();
+        let before = net.snapshot_weights();
+        net.fake_quantize_weights();
+        let after = net.snapshot_weights();
+        assert!(
+            before.iter().zip(&after).any(|(a, b)| a != b),
+            "ffn2 must be snapped"
+        );
+        let shapes: Vec<Vec<usize>> = net
+            .param_tensors_mut()
+            .iter()
+            .map(|t| t.shape.clone())
+            .collect();
+        let mut changed_2d = 0;
+        for ((sh, a), b) in shapes.iter().zip(&before).zip(&after) {
+            if sh.len() == 1 {
+                assert_eq!(a, b, "1-D params must never be snapped");
+            } else if a != b {
+                changed_2d += 1;
+                assert_eq!(sh, &vec![64, 48], "only ffn2 [64,48] is eligible");
+            }
+        }
+        assert_eq!(changed_2d, 1);
+    }
+
+    #[test]
+    fn qat_slm_holds_snapped_weights_and_tied_head_follows() {
+        let mut rng = Rng::new(3);
+        let mut net = TransformerNet::new(8, 4, 32, 2, 64, 1, &mut rng).unwrap();
+        net.set_weight_tying(true);
+        net.fake_quantize_weights();
+        let mut once = net.snapshot_weights();
+        net.fake_quantize_weights();
+        assert_eq!(net.snapshot_weights(), once, "snap must be idempotent");
+        // head mirrors the snapped embedding
+        once.clear();
+        let (v, e) = (8, 32);
+        for i in 0..e {
+            for j in 0..v {
+                assert_eq!(
+                    net.head_w.data.data[i * v + j],
+                    net.tok_emb.data.data[j * e + i]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn qat_snapshot_quantize_restore_cycle() {
         let mut rng = Rng::new(11);
-        let mut net = TransformerNet::new(8, 4, 8, 2, 16, 1, &mut rng).unwrap();
+        let mut net = TransformerNet::new(8, 4, 32, 2, 64, 1, &mut rng).unwrap();
         let masters = net.snapshot_weights();
         net.fake_quantize_weights();
         let quantized = net.snapshot_weights();
