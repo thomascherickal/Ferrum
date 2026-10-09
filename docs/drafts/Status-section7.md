@@ -101,11 +101,7 @@ export commands.
 
 ### 6.2 Still open
 
-The eight-upgrades items (F3 `qwen3`, F7 GGUF perplexity, F5 streamed export, F6
-safe-SIMD decode, F4 GUI boot test) and the from-scratch gaps in the old §6.2
-that this release did not touch: a pre-tokenized streamed corpus, Llama
-architecture from scratch, gradient accumulation, distillation, SFT, LoRA.
-<!-- MEASURE: copy the still-open rows from the current Status §6 after checking each against the release -->
+<!-- MEASURE: copy the still-open roadmap rows from Status.md §6 at release -->
 These are directions, not commitments.
 
 ## 9. Metrics (replacement)

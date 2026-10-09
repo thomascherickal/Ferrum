@@ -336,7 +336,7 @@ ls -l samples/slm-*.gguf
 
 **What to look at.**
 
-- Every token after the first is scored, so `tokens` in the JSON is the token count of the file.
+- Every token is scored, the first conditioned on BOS (the EOS id), so `num_predictions` equals the token count and `tokens` in the JSON is the token count of the file.
 - **Perplexity** is per token. **Bits per byte** divides the total loss by the file's bytes, so it compares models with different tokenizers. Per-token numbers do not.
 - QAT is int8 only. The int8 file reloads bit-identically to the model that trained, so its numbers match the f32-QAT model closely. int4 is converted after training and is lossy.
 - Matrices whose row length is not a multiple of 32 are not quantized (they stay F32, exactly). That is why the reference config uses multiples of 32.
@@ -454,6 +454,7 @@ KEY=$("$LMS" ls --json | python3 -I -c 'import json,sys; print([m["modelKey"] fo
 "$LMS" server start -p 1234
 curl -s http://127.0.0.1:1234/v1/completions \
   -d '{"model":"ferrum-tiny","prompt":"Once upon a time","max_tokens":17,"temperature":0,"repeat_penalty":1.0}'
+"$LMS" server stop
 "$LMS" unload ferrum-tiny
 ```
 
@@ -506,7 +507,7 @@ kill $!
 
 **What to look at.**
 
-- Greedy outputs from Ferrum and llama.cpp should be the same text for an f32 file. For int8 or int4 files, tiny numeric differences in llama.cpp can change tokens late in a run.
+- Greedy outputs from Ferrum and llama.cpp should be the same text for an f32 file (the test `llama_cpp_greedy_matches_ferrum_f32` checks this). For int8 or int4 files, tiny numeric differences in llama.cpp can change tokens late in a run.
 - `llama-tokenize` ids equal Ferrum's ids for the same text, because both use the GPT-2 pre-tokenizer.
 - LightEval and your own scripts use `/v1/loglikelihood`. A higher `logprob` is a more likely continuation. `greedy` is true when every token was the model's top choice.
 - The server binds to `127.0.0.1` by default and has no authentication. Limits (body 8 MiB, batch 64, 65,536 characters per text) are checked first: 413 for a large body, 400 for the others, 422 for a model error.

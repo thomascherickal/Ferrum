@@ -20,8 +20,8 @@ numbers in the order shown. Cross-references in `ReadMe.md` use these numbers.
   `deny` instead of `forbid`. Dependencies may use `unsafe` inside themselves;
   Ferrum calls only their safe APIs. This rules out crate functions that are
   `unsafe fn` (for example `matrixmultiply::sgemm` and the `gemm` crate when
-  called directly). Ferrum's own code never calls `unsafe`, so none of
-  these appear in it.
+  called directly). Ferrum's crates forbid `unsafe` code
+  (`#![forbid(unsafe_code)]`); third-party crates may use it internally.
 - **Dependencies need a measured reason.** Earlier versions had an empty
   `[dependencies]` table. That rule is dropped. A crate is admitted only when:
   1. a benchmark shows a gain (or the crate replaces more code than it adds),
