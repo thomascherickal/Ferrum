@@ -1,6 +1,6 @@
 # Phase 0 — Shared Surfaces Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. **Runs after `2026-10-09-p0g-gguf-only.md`** (models are GPT-2-compatible GGUF; FFN is GELU; the LM head has no bias).
 
 **Goal:** Land the interfaces every later workstream depends on: a public scoring API, `evaluate()` rebuilt on it, EOS document boundaries, a token-budgeted multi-stop generation API, and a strict CLI parser.
 
@@ -15,7 +15,8 @@
 - `#![forbid(unsafe_code)]` stays in `ferrum_core`.
 - Results bit-for-bit identical at `FERRUM_NUM_THREADS=1` vs N.
 - `ferrum_core` must build for `wasm32-unknown-unknown` (`cargo build -p slm_wasm --target wasm32-unknown-unknown --release`).
-- FINF v4/v5 files load unchanged; `TransformerConfig` only grows via defaulted fields.
+- All files are GGUF (Phase 0-G); `TransformerConfig` only grows via defaulted fields.
+- Every feature lands with its unit tests in the same commit (test first). No `unsafe` code (`#![forbid(unsafe_code)]` in every crate).
 - Every commit builds and passes `cargo test --workspace --release`, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`.
 - `ferrum_gui` is outside the workspace; after touching public `ferrum_core` APIs also run `cd ferrum_gui && cargo check --all-targets`.
 - Work on branch `feat/dataops-serve-eval` (already exists).
@@ -1222,6 +1223,8 @@ Expected: all green.
 ```bash
 S=/tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/review
 cargo build --release -p slm_cli
-time ./target/release/train_transformer eval $S/model.bin $S/heldout.txt
+# The review's FINF model no longer loads (Phase 0-G); train the reference config once and reuse it.
+[ -f $S/ref.gguf ] || ./target/release/train_transformer train $S/train.txt $S/ref.gguf --context 128 --embed 96 --heads 4 --blocks 3 --hidden 320 --vocab 1024 --tokens 1.2e6 --lr 5e-3 --cosine --warmup 30 --clip 1 --tokenizer $S/ref_tok.gguf
+time ./target/release/train_transformer eval $S/ref.gguf $S/heldout.txt
 ```
-Expected: well under the 292 s baseline (target ≤ 10 s). Record the time in the Phase 0 summary for Status §9. (If `$S/model.bin` is missing, `ls $S` and use the `.bin` model there.)
+Expected: well under the review's 292 s baseline for 60 KB (target ≤ 10 s). Record the time in the Phase 0 summary for Status §9.

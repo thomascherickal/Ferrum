@@ -22,12 +22,13 @@
   - licence CDLA-Sharing-1.0, never committed
 - New flags go in `const` tables via the Phase 0 parser (`Kind`, `Spec`, `Args::{value, get, get_all, has}`).
 - Do not edit `ReadMe.md`, `Manual.md`, `Status.md` (Phase 2).
+- All model and tokenizer files are GGUF (`.gguf`). Every feature lands with its unit tests in the same commit. No `unsafe` code.
 - Each commit passes `cargo test --workspace --release`, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo build -p slm_wasm --target wasm32-unknown-unknown --release`.
 
 ## Contract with Phase 1C
 
 `dvc.yaml`'s optional `lighteval` stage calls
-`eval/lighteval/run.sh --model models/slm.bin --test data/prepared/test.txt --out metrics/lighteval.json`.
+`eval/lighteval/run.sh --model models/slm.gguf --test data/prepared/test.txt --out metrics/lighteval.json`.
 Phase 1C creates that script. The stage is `frozen: true`, so `dvc repro` skips it until a user unfreezes it.
 
 ## Merge note
@@ -769,7 +770,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Modify: `.gitignore` (add `.venv/`)
 
 **Interfaces:**
-- Produces: `dvc repro`, which yields `data/raw/tinystories.txt`, `data/prepared/{train,val,test}.txt` + `manifest.json`, `models/slm.bin` + `models/tokenizer.bpe`, and `metrics/{val,test}.json`.
+- Produces: `dvc repro`, which yields `data/raw/tinystories.txt`, `data/prepared/{train,val,test}.txt` + `manifest.json`, `models/slm.gguf` + `models/tokenizer.gguf`, and `metrics/{val,test}.json`.
 
 - [ ] **Step 1: Write `scripts/fetch.sh`**
 
@@ -805,11 +806,11 @@ prepare:
   val_frac: 0.05
   test_frac: 0.05
   seed: 42
-model:            # 486,624 parameters
+model:            # 507,552 parameters (all dims multiples of 32 → Q8_0-friendly)
   context: 128
-  embed: 80
+  embed: 96
   heads: 4
-  blocks: 4
+  blocks: 3
   hidden: 320
   vocab: 1024
 train:
@@ -855,13 +856,13 @@ stages:
           cache: false
   train:
     cmd: >-
-      cargo run --release -q -p slm_cli -- train data/prepared/train.txt models/slm.bin
+      cargo run --release -q -p slm_cli -- train data/prepared/train.txt models/slm.gguf
       --context ${model.context} --embed ${model.embed} --heads ${model.heads}
       --blocks ${model.blocks} --hidden ${model.hidden} --vocab ${model.vocab}
       --tokens ${train.tokens} --lr ${train.lr} --cosine --warmup ${train.warmup}
       --clip ${train.clip} --val ${train.val} --patience ${train.patience}
       --seed ${train.seed}
-      --tokenizer models/tokenizer.bpe --force
+      --tokenizer models/tokenizer.gguf --force
     deps:
       - data/prepared/train.txt
       - ferrum_core/src
@@ -870,14 +871,14 @@ stages:
       - model
       - train
     outs:
-      - models/slm.bin
-      - models/tokenizer.bpe
+      - models/slm.gguf
+      - models/tokenizer.gguf
   eval:
     cmd: >-
-      cargo run --release -q -p slm_cli -- eval models/slm.bin data/prepared/val.txt --json metrics/val.json &&
-      cargo run --release -q -p slm_cli -- eval models/slm.bin data/prepared/test.txt --json metrics/test.json
+      cargo run --release -q -p slm_cli -- eval models/slm.gguf data/prepared/val.txt --json metrics/val.json &&
+      cargo run --release -q -p slm_cli -- eval models/slm.gguf data/prepared/test.txt --json metrics/test.json
     deps:
-      - models/slm.bin
+      - models/slm.gguf
       - data/prepared/val.txt
       - data/prepared/test.txt
     metrics:
@@ -887,9 +888,9 @@ stages:
           cache: false
   lighteval:
     frozen: true
-    cmd: eval/lighteval/run.sh --model models/slm.bin --test data/prepared/test.txt --out metrics/lighteval.json
+    cmd: eval/lighteval/run.sh --model models/slm.gguf --test data/prepared/test.txt --out metrics/lighteval.json
     deps:
-      - models/slm.bin
+      - models/slm.gguf
       - data/prepared/test.txt
       - eval/lighteval
     metrics:
@@ -925,13 +926,13 @@ Then check reproducibility and the DVC workflow:
 ```bash
 .venv/bin/dvc status                     # "Data and pipelines are up to date."
 cat metrics/test.json data/prepared/manifest.json | head -40
-sha256sum models/slm.bin > /tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/slm1.sha
+sha256sum models/slm.gguf > /tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/slm1.sha
 .venv/bin/dvc repro --force train
 sha256sum -c /tmp/claude-1000/-home-thomas-Projects-ferrum-cpu/88623770-ced2-4a37-be7f-75cb7f78b99e/scratchpad/slm1.sha   # must print OK (deterministic training)
 .venv/bin/dvc params diff && .venv/bin/dvc metrics show
 ```
 
-Expected: `sha256sum -c` prints `models/slm.bin: OK`. If it does not, training is non-deterministic: stop and report.
+Expected: `sha256sum -c` prints `models/slm.gguf: OK`. If it does not, training is non-deterministic: stop and report.
 
 - [ ] **Step 5: Commit**
 

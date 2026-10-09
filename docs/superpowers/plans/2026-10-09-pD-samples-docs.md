@@ -82,11 +82,11 @@ lscpu | grep -E "Model name|^CPU\(s\)" > $S/facts/machine.txt; date -I >> $S/fac
 cargo test --workspace --release 2>&1 | grep "^test result" > $S/facts/tests.txt
 (cd ferrum_gui && cargo test 2>&1 | grep "^test result") >> $S/facts/tests.txt
 cat metrics/val.json metrics/test.json data/prepared/manifest.json > $S/facts/dvc.txt
-./target/release/train_transformer info models/slm.bin > $S/facts/info.txt
+./target/release/train_transformer info models/slm.gguf > $S/facts/info.txt
 scripts/bench_slm.sh data/prepared/train.txt > $S/facts/bench_auto.txt
 FERRUM_NUM_THREADS=1 scripts/bench_slm.sh data/prepared/train.txt > $S/facts/bench_1t.txt
 cargo bench --bench gemm 2>&1 | tail -30 > $S/facts/gemm.txt
-eval/lighteval/run.sh --model models/slm.bin --test data/prepared/test.txt --out metrics/lighteval.json --max-samples 200
+eval/lighteval/run.sh --model models/slm.gguf --test data/prepared/test.txt --out metrics/lighteval.json --max-samples 200
 cp metrics/lighteval.json $S/facts/
 git log --oneline master..HEAD > $S/facts/commits.txt
 ```
@@ -110,13 +110,13 @@ Run every block from the repo root on the machine in `$S/facts/machine.txt`, and
 
 - [ ] **Sample 1 — Quick start: a 500K SLM on TinyStories.**
   - Fetch the file with `scripts/fetch.sh` (the pinned URL and sha256 from `params.yaml`) and run `prepare`.
-  - Train with the review config (`--context 128 --embed 80 --heads 4 --blocks 4 --hidden 320 --vocab 1024 --tokens 2e6 --lr 5e-3 --cosine --warmup 50 --clip 1`), then `info`, then a `generate`.
+  - Train the reference config (`--context 128 --embed 96 --heads 4 --blocks 3 --hidden 320 --vocab 1024 --tokens 2e6 --lr 5e-3 --cosine --warmup 50 --clip 1`, 507,552 params), then `info`, then a `generate`.
   - Include a short "sizing a config" table for ~100K, ~500K and ~2M params. Get the counts from `info` on models trained for 1 step each, using `--tokens 1`. Add the per-block formula `4·e² + 4·e + 2·e·h + h + e + 4·e` plus the embeddings and head; verify it against `info` before printing it.
 - [ ] **Sample 2 — Full DVC pipeline.**
   - Commands: `python3 -m venv .venv && .venv/bin/pip install -r requirements-dataops.txt`, `.venv/bin/dvc repro`, `.venv/bin/dvc dag`.
   - Edit `params.yaml` (`train.tokens: 4.0e6`) with `.venv/bin/dvc exp run -S train.tokens=4e6` or a plain edit plus `dvc repro`, then show `dvc params diff` and `dvc metrics diff`.
   - Show that `dvc status` is clean afterwards.
-  - Explain that a second `dvc repro --force train` reproduces the same `models/slm.bin` sha256, because training is deterministic.
+  - Explain that a second `dvc repro --force train` reproduces the same `models/slm.gguf` sha256, because training is deterministic.
 - [ ] **Sample 3 — Cleaning your own corpus.**
   - Build a messy input in `samples/raw/`: a BOM file, CRLF endings, zero-width characters, a duplicated paragraph, a two-book Gutenberg file, and a file with an invalid byte.
   - Run `prepare` without `--lossy` to show the error with its byte offset, then run with `--lossy --dedup --nfkc --strip-gutenberg --min-chars 20`.
@@ -132,8 +132,13 @@ Run every block from the repo root on the machine in `$S/facts/machine.txt`, and
 - [ ] **Sample 6 — Generation.**
   - Greedy (`--temp 0`), sampled (`--temp 0.8 --top-k 40 --top-p 0.9 --repetition-penalty 1.2`), `--stop` (repeatable), `--max-tokens`, and EOS stopping.
   - Show the same `--gen-seed` giving the same output at `FERRUM_NUM_THREADS=1` and `=8` (compare with `md5sum`).
-- [ ] **Sample 7 — Serving.**
-  - `cargo run --release -p slm_server -- --model models/slm.bin &`
+- [ ] **Sample 7 — Serving, and running your model in llama.cpp, Ollama, and LM Studio.**
+  - The trained `models/slm.gguf` is a GPT-2-architecture GGUF. Run it with each tool, using the exact commands pinned in the Phase 0-G plan:
+    - `llama-cli` (or `llama-completion`) greedy
+    - `ollama create ferrum-tiny -f Modelfile` plus `ollama run`
+    - `lms import` plus a completion
+  - Paste each output. Show that the greedy continuation matches `train_transformer generate --temp 0`.
+  - `cargo run --release -p slm_server -- --model models/slm.gguf &`
   - `curl` every route: `/health`, `/v1/info`, `/v1/loglikelihood` with two continuations, `/v1/loglikelihood_rolling`, `/v1/generate` with `stop`.
   - Show one 400 (an oversized batch) and its error JSON.
   - Note that it binds to loopback and processes one request at a time on a model thread.
@@ -164,6 +169,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ### Task 4: Update ReadMe, Manual, Status, CLAUDE.md/AGENTS.md
 
+- [ ] **FINF → GGUF everywhere:** every mention of FINF, `.bin` model files, the `.fckp`/`.flck` binary formats, and `tok.bpe` becomes GGUF (`.gguf`). Status §7 records the breaking change. ReadMe's pitch says Ferrum's own models run in llama.cpp, Ollama, and LM Studio. It also says Ferrum-ML's tabular models are GGUF but not runnable there, because llama.cpp has no MLP-classifier architecture.
 - [ ] **ReadMe.md:**
   - Rewrite the pitch: Ferrum is pure Rust and CPU-only; replace the "No dependencies" row with one naming the crates actually kept and why.
   - Add `slm_server` and `eval/lighteval` to the layout table, and `Samples.md` to Documentation.
@@ -197,7 +203,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - [ ] **Stale-claim sweep.** This must return nothing still false:
 
 ```bash
-grep -n -i -E "zero[- ]dep|no external|std[- ]only|int8/int4 quantization-aware|O\(context\) per token|lowercases|--verbose.*per-epoch|saves vocab" ReadMe.md Manual.md Status.md CLAUDE.md ferrum_core/src/lib.rs ferrum_core/Cargo.toml slm_cli/src/main.rs
+grep -n -i -E "finf|\.bin\b|relu|zero[- ]dep|no external|std[- ]only|int8/int4 quantization-aware|O\(context\) per token|lowercases|--verbose.*per-epoch|saves vocab" ReadMe.md Manual.md Status.md CLAUDE.md ferrum_core/src/lib.rs ferrum_core/Cargo.toml slm_cli/src/main.rs
 ```
 
 Review each hit and fix it or confirm it is still true. In particular, `ferrum_core/Cargo.toml`'s description says "Zero-dependency" and `lib.rs`/`main.rs` module docs say "zero external dependencies".

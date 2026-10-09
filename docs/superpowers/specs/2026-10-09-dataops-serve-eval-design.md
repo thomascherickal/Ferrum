@@ -1,6 +1,6 @@
 # DataOps, serving, LightEval, speed, and samples — design
 
-_2026-10-09 · branch `feat/dataops-serve-eval` · status: approved in chat, awaiting written-spec review_
+_2026-10-09 · branch `feat/dataops-serve-eval` · status: approved; amended 2026-10-09 (GGUF only, GPT-2-compatible, no unsafe)_
 
 ## 1. Goal
 
@@ -14,6 +14,11 @@ reproducible, servable, and testable with a standard harness:
 4. Add an HTTP inference endpoint (`slm_server`, axum) and a Hugging Face
    LightEval module that evaluates Ferrum models through it.
 5. Write `Samples.md`: 10 detailed, actually-executed walk-throughs.
+6. **GGUF only** (amendment): the FINF format is removed. Every file Ferrum writes — models, training
+   checkpoints, tokenizer files — is GGUF. Ferrum's own trained SLMs are **GPT-2-architecture GGUFs
+   that run unmodified in llama.cpp, Ollama, and LM Studio** (§4.0).
+7. **No unsafe code** in any crate (`#![forbid(unsafe_code)]` everywhere, plus a repo-wide test).
+8. Unit tests land with every feature (test first).
 
 Out of scope: the imported Llama/GGUF stack (`llm`, `llm_train`, `gguf*`,
 `chat_format`) is untouched; streaming the *training* corpus (the trainer still
@@ -29,16 +34,47 @@ loads the prepared train split whole); OpenAI-compatible routes; a DVC remote.
 | Corpus | TinyStories V2 (GPT-4) validation file, pinned (§5.4) |
 | Dependencies | Zero-dependency constraint dropped; crates admitted on measured gain |
 | Samples | New top-level `Samples.md`, 10 samples, every command executed |
+| File formats | GGUF only; FINF removed (breaking: old `.bin` files stop loading; committed ones converted) |
+| Model architecture | Ferrum's own Transformer becomes GPT-2-compatible (GELU FFN, no LM-head bias, GPT-2 pre-tokenizer + byte-to-unicode vocab); saved as `gpt2` GGUF in F32/F16/Q8_0/Q4_0 |
+| Compatibility target | llama.cpp, Ollama, LM Studio run Ferrum GGUFs; verified by automated tests against installed binaries |
+| Unsafe | `#![forbid(unsafe_code)]` in every crate (`deny` only where a third-party proc macro forces it) |
 
 ## 3. Hard invariants (still enforced)
 
 - `#![forbid(unsafe_code)]` in Ferrum's own crates (dependencies may use unsafe internally; we call only safe APIs).
 - Bit-for-bit identical results at `FERRUM_NUM_THREADS=1` vs N, enforced by a test. A crate that breaks this is rejected.
 - `ferrum_core` and `slm_wasm` build and run on `wasm32-unknown-unknown`.
-- FINF v4/v5 files load unchanged. `TransformerConfig` grows only via fields with defaults.
+- All model, checkpoint, and tokenizer files are GGUF v3. FINF is gone (breaking change, recorded in Status §7).
+- A model Ferrum saves and the same file run in llama.cpp produce the same greedy continuation for a fixed prompt (tested).
+- `TransformerConfig` grows only via fields with defaults.
 - Every commit builds and passes its tests.
 
 ## 4. Workstream A — core engine
+
+### 4.0 GGUF everywhere, GPT-2-compatible models (Phase 0-G; runs first)
+
+- **Architecture changes to Ferrum's own Transformer**: FFN activation ReLU → GELU (tanh
+  approximation, as llama.cpp's `ggml_gelu`); the LM head loses its bias; weight tying exports
+  by omitting `output.weight` (llama.cpp falls back to `token_embd`), which also makes `--tie`
+  shrink the file. Everything else (learned positions, pre-LN LayerNorm ε=1e-5 with bias, dense MHA
+  with biases) already matches GPT-2.
+- **Tokenizer**: byte-level BPE pre-splits text with the GPT-2 regex llama.cpp uses for
+  `tokenizer.ggml.pre = "gpt-2"`, and writes tokens/merges in GPT-2's bytes-to-unicode form, so
+  llama.cpp tokenizes prompts exactly as Ferrum does. EOS is `<|endoftext|>`.
+- **Model file** = `general.architecture = "gpt2"` GGUF with llama.cpp's GPT-2 tensor names (fused
+  `attn_qkv`), plus a `ferrum.*` metadata namespace (task, class names, normalizer, quant) that
+  llama.cpp ignores. Tensor types: F32, F16, Q8_0 (int8), Q4_0 (int4). A tensor whose row length is
+  not a multiple of 32 is stored F16 (Q8_0/Q4_0 need 32-element blocks).
+- **QAT simulates Q8_0 exactly** (32-element blocks along each weight row, f16-rounded scale), so an
+  int8 file reloads bit-identically to the trained model. int4 (Q4_0) export stays a lossy option.
+- Loaded Ferrum GGUF weights are dequantized to f32 in memory (small models); the packed
+  int8/int4 kernels remain for imported Llama models.
+- **Non-model files**: training checkpoints and the reusable tokenizer file are GGUF containers
+  with `general.architecture = "ferrum-checkpoint"` / `"ferrum-tokenizer"` (not runnable models).
+- **Non-transformer models** (Ferrum-ML tabular MLPs) are GGUF with `general.architecture = "ferrum-mlp"`
+  (generic layer list) — GGUF, but not runnable in llama.cpp, which has no MLP-classifier architecture.
+- Exact key names, tensor shapes, and the pre-tokenizer regex are pinned from llama.cpp's source in
+  plan `2026-10-09-p0g-gguf-only.md`.
 
 ### 4.1 Scoring API (Phase 0; the shared interface)
 
@@ -129,7 +165,7 @@ impl GenerativeSLM {
 
 - `info` prints the parameter count and labels int4 files as int4.
 - CLI can write int4 models (`--quant int4` on train/save path).
-- `--tie` shares the weights: reported parameter count and saved file shrink by `vocab × embed`.
+- `--tie` shares the weights: reported parameter count and saved file shrink by `vocab × embed` (file: via §4.0's omitted `output.weight`).
 - Resume with `--val` restores the best-so-far validation score from the checkpoint.
 - A resumed mid-epoch run reports the correct epoch/step.
 - The banner shows the token budget instead of "Epochs: 100" when `--tokens` is set.
@@ -182,7 +218,7 @@ train_transformer prepare --input <file|dir>... --out <dir>
 - `dvc.yaml` stages, each a CLI call templated from `params.yaml`:
   - `fetch`: `scripts/fetch.sh <url> <sha256> data/raw/tinystories.txt` (curl, then a sha256 check that fails the stage on mismatch)
   - `prepare` → `data/prepared/` (`outs`), `data/prepared/manifest.json`
-  - `train` → `models/slm.bin`, `models/tokenizer.bpe`
+  - `train` → `models/slm.gguf`, `models/tokenizer.gguf`
   - `eval` → `metrics/eval.json` (`metrics`, cache: false)
   - `lighteval` (optional, `frozen: true` by default) → `metrics/lighteval.json`
 - `dvc.lock` committed. `data/`, `models/` git-ignored and tracked by DVC.
@@ -203,7 +239,7 @@ tokens) for a 500K model, and stories are already separated by
 
 ### 6.1 `slm_server` crate
 
-Binary `ferrum-serve --model <path> [--host 127.0.0.1] [--port 8080]
+Binary `ferrum-serve --model <path.gguf> [--host 127.0.0.1] [--port 8080]
 [--max-batch 64] [--max-chars 65536] [--max-body 8MiB]`.
 
 | Route | Request | Response |
@@ -271,6 +307,8 @@ Also: ReadMe (pitch, layout table with `slm_server`, docs list), Manual
 | Determinism | train/eval/generate identical at 1 vs N threads |
 | CLI | unknown flag, bad value, missing resume file each error |
 | prepare | BOM/zero-width stripped, dedup, split stability on append, multi-book Gutenberg, manifest hashes match files |
+| GGUF / compat | f32/int8/int4 round-trips; QAT int8 reload bit-identical; GPT-2 tokenizer matches the regex on edge cases; greedy output equal in Ferrum and llama.cpp; Ollama and LM Studio load and run the file (tests skip when the binary is absent) |
+| No unsafe | repo-wide source scan test |
 | Server | each route, limits (413/400), error JSON, via `tower::ServiceExt::oneshot` |
 | LightEval | stdlib `unittest` of `FerrumModel` against a stub HTTP server; real `lighteval custom` smoke run with `--max-samples 5` at final verification |
 
@@ -286,6 +324,7 @@ Minor: all listed in §4.6. Data gaps: §5.1, §4.2. Endpoint gaps: §4.1, §4.4
 ## 10. Execution
 
 - Branch `feat/dataops-serve-eval`.
+- **Phase 0-G** (one agent, sequential, first): §4.0 — GGUF everywhere, GPT-2-compatible models, no unsafe.
 - **Phase 0** (one agent, sequential): §4.1, §4.2, §4.3 — the shared surfaces (`slm.rs` API, tokenizer, `main.rs` parser).
 - **Phase 1** (three agents in parallel worktrees branched from Phase 0):
   - A: §4.4, §4.5, §4.6

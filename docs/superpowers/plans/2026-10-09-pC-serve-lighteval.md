@@ -27,11 +27,12 @@
 - LightEval pinned to **0.13.0**, plus `xxhash<4` (xxhash 4.x crashes the details logger). In `FerrumModel`, do not call `super().__init__()` (raises `TypeError` in 0.13.0). Set `self._cache = SampleCache(config)` directly. Leave `loglikelihood_rolling` **un-cached** (0.13.0's PERPLEXITY cache drops results).
 - Python is not in CI (torch is heavy). The stdlib `unittest` must run without LightEval installed by skipping cleanly. The real smoke run is part of this phase's gate.
 - Do not edit `ReadMe.md`, `Manual.md`, `Status.md` (Phase 2).
+- Models are GGUF (`.gguf`). Every feature lands with its unit tests in the same commit.
 - Each Rust commit passes `cargo test --workspace --release`, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`.
 
 ## Contract with Phase 1B
 
-Write `eval/lighteval/run.sh --model <slm.bin> --test <test.txt> --out <metrics.json> [--max-samples N] [--wikitext] [--port P]`. Phase 1B's frozen DVC `lighteval` stage calls it with the first three flags.
+Write `eval/lighteval/run.sh --model <slm.gguf> --test <test.txt> --out <metrics.json> [--max-samples N] [--wikitext] [--port P]`. Phase 1B's frozen DVC `lighteval` stage calls it with the first three flags.
 
 ## Review Focus
 
@@ -199,12 +200,11 @@ pub struct Info {
 
 /// Describe `model`, loaded from `bytes` (hashed for `model_sha256`).
 pub fn info_for(model: &GenerativeSLM, bytes: &[u8]) -> Info {
-    let version = bytes.get(4..8).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
     Info {
         params: model.model.num_params(),
         context_len: model.meta.input_dim,
         vocab: model.meta.output_dim,
-        quant: if version == 5 { "int8/int4".into() } else { "f32".into() },
+        quant: ferrum_core::loader::gguf_quant(bytes).unwrap_or_else(|_| "unknown".into()),
         tokenizer: if model.meta.tokenizer_state.is_empty() { "char".into() } else { "bpe".into() },
         model_sha256: format!("{:x}", Sha256::digest(bytes)),
     }
@@ -423,7 +423,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let model_path: String = flag(&args, "--model", String::new())?;
     if model_path.is_empty() {
-        return Err("usage: ferrum-serve --model <model.bin> [--host H] [--port P]".into());
+        return Err("usage: ferrum-serve --model <model.gguf> [--host H] [--port P]".into());
     }
     let host: String = flag(&args, "--host", "127.0.0.1".to_string())?;
     let port: u16 = flag(&args, "--port", 8080)?;
@@ -1027,7 +1027,8 @@ import re,sys
 t=open('$S/heldout.txt').read()
 docs=[d.strip() for d in re.split(r'\n\s*\n', t) if len(d.strip())>80][:60]
 open('$S/heldout_docs.txt','w').write('\n<|endoftext|>\n'.join(docs))"
-eval/lighteval/run.sh --model $S/model.bin --test $S/heldout_docs.txt --out $S/lighteval.json --max-samples 5
+[ -f $S/ref.gguf ] || ./target/release/train_transformer train $S/train.txt $S/ref.gguf --context 128 --embed 96 --heads 4 --blocks 3 --hidden 320 --vocab 1024 --tokens 1.2e6 --lr 5e-3 --cosine --warmup 30 --clip 1 --tokenizer $S/ref_tok.gguf
+eval/lighteval/run.sh --model $S/ref.gguf --test $S/heldout_docs.txt --out $S/lighteval.json --max-samples 5
 cat $S/lighteval.json
 ```
 
@@ -1035,7 +1036,7 @@ Expected:
 - `ferrum_heldout` reports finite `word_perplexity`, `byte_perplexity` and `bits_per_byte`.
 - `tinystories_cloze` and the `blimp:*`/`arc:easy` tasks report `loglikelihood_acc` (or `acc`) between 0 and 1.
 - The first run downloads the BLiMP and ARC datasets from the Hub.
-- If `$S/model.bin` is missing, `ls $S` and pass the `.bin` that is there.
+- `$S/ref.gguf` is the 507,552-param reference model trained above.
 
 - [ ] **Step 5: Commit**
 
@@ -1043,7 +1044,7 @@ Expected:
 git add eval/lighteval/ferrum_tasks.py eval/lighteval/make_task_data.py eval/lighteval/run.sh
 git commit -m "feat(eval): LightEval custom tasks + run.sh (heldout ppl, cloze, BLiMP, ARC-easy)
 
-Smoke run (--max-samples 5) on the 486,624-param review model:
+Smoke run (--max-samples 5) on the 507,552-param reference model:
 <paste lighteval.json tasks block>
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
