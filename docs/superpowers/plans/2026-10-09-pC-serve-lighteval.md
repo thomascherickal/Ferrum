@@ -993,7 +993,7 @@ trap 'kill $srv 2>/dev/null || true' EXIT
 for _ in $(seq 1 100); do curl -sf "http://127.0.0.1:$port/health" >/dev/null && break; sleep 0.1; done
 curl -sf "http://127.0.0.1:$port/health" >/dev/null || { cat "$work/server.log" >&2; exit 1; }
 
-tasks="ferrum_heldout|0,tinystories_cloze|0,blimp:anaphor_gender_agreement|0,blimp:determiner_noun_agreement_1|0,blimp:regular_plural_subject_verb_agreement_1|0,arc:easy|0"
+tasks="ferrum_heldout|0,tinystories_cloze|0,blimp:anaphor_gender_agreement|0,blimp:anaphor_number_agreement|0,blimp:regular_plural_subject_verb_agreement_1|0,arc:easy|0"
 [ "$wikitext" = 1 ] && tasks="$tasks,wikitext:103:document_level|0"
 extra=(); [ -n "$max" ] && extra=(--max-samples "$max")
 
@@ -1015,7 +1015,7 @@ EOF
 ```
 
 `chmod +x eval/lighteval/run.sh`. Before relying on the task names:
-- check that the `blimp:` and `arc:easy` names exist in 0.13.0 with `eval/lighteval/.venv/bin/lighteval tasks list 2>/dev/null | grep -E "blimp:(anaphor_gender|determiner_noun_agreement_1|regular_plural_subject_verb_agreement_1)|arc:easy"`
+- check that the `blimp:` and `arc:easy` names exist in 0.13.0 with `eval/lighteval/.venv/bin/lighteval tasks list 2>/dev/null | grep -E "blimp:(anaphor_gender|anaphor_number_agreement|regular_plural_subject_verb_agreement_1)|arc:easy"`
 - replace any name that is missing with the listed one
 - check the `custom` CLI syntax with `lighteval custom --help`, and adjust if 0.13.0 names an argument differently
 
