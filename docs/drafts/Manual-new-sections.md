@@ -529,7 +529,7 @@ stops the server, and writes a summary:
 |---|---|---|
 | `ferrum_heldout` | Rolling log-likelihood of the test documents | word and byte perplexity, bits per byte |
 | `tinystories_cloze` | Multiple choice: the true next sentence versus 3 sentences from other stories (fixed seed) | `loglikelihood_acc` (reported as `acc`) |
-| `blimp:anaphor_gender_agreement`, `blimp:determiner_noun_agreement_1`, `blimp:regular_plural_subject_verb_agreement_1` | Grammatical versus ungrammatical sentence pairs | accuracy |
+| `blimp:anaphor_gender_agreement`, `blimp:anaphor_number_agreement`, `blimp:regular_plural_subject_verb_agreement_1` | Grammatical versus ungrammatical sentence pairs | accuracy |
 | `arc:easy` | Science questions | accuracy |
 
 A 500K-parameter model will score near chance on `arc:easy` (25% for four

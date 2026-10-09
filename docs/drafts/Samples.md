@@ -553,7 +553,7 @@ cat metrics/lighteval.json
 |---|---|---|
 | `ferrum_heldout` | word perplexity, byte perplexity, bits per byte | <!-- MEASURE --> |
 | `tinystories_cloze` | `acc` (the `loglikelihood_acc` metric) | <!-- MEASURE --> |
-| `blimp:anaphor_gender_agreement`, `blimp:determiner_noun_agreement_1`, `blimp:regular_plural_subject_verb_agreement_1` | accuracy | <!-- MEASURE --> |
+| `blimp:anaphor_gender_agreement`, `blimp:anaphor_number_agreement`, `blimp:regular_plural_subject_verb_agreement_1` | accuracy | <!-- MEASURE --> |
 | `arc:easy` | accuracy | <!-- MEASURE --> |
 
 **What to look at.**
