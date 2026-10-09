@@ -11,8 +11,8 @@ usage in `Manual.md`, current state / known issues / roadmap in `Status.md`.
 
 Do not break these; they are the product's selling points.
 
-- **`ferrum_core` has zero external dependencies.** Its `[dependencies]` table
-  stays empty — std only. Benchmarks are std-only too (`harness = false`, no
+- **`ferrum_core` has one external dependency**, `unicode-general-category`
+  (the GPT-2 pre-tokenizer's `\p{L}`/`\p{N}` tables); add no others — std only. Benchmarks are std-only too (`harness = false`, no
   Criterion). Only `slm_wasm` (wasm-bindgen) and `ferrum_gui` (Tauri) pull crates.
 - **`#![forbid(unsafe_code)]`** in `ferrum_core`. No `unsafe`, no SIMD intrinsics.
 - **Deterministic at any thread count.** Matmuls split across the persistent

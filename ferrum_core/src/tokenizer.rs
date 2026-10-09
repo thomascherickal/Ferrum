@@ -44,7 +44,7 @@ pub struct ByteBpeTokenizer {
 
 /// Conventional names for the four standard special tokens (K3).
 pub const TOK_BOS: &str = "<bos>";
-pub const TOK_EOS: &str = "<eos>";
+pub const TOK_EOS: &str = "<|endoftext|>";
 pub const TOK_PAD: &str = "<pad>";
 pub const TOK_UNK: &str = "<unk>";
 
@@ -65,24 +65,103 @@ fn merge_pair(ids: &[u32], pair: (u32, u32), new_id: u32) -> Vec<u32> {
     out
 }
 
-/// Pre-tokenize `text` into chunks at whitespace↔non-whitespace boundaries (K2),
-/// so learned merges never span a space/newline (as GPT-2 BPE avoids). The
-/// chunks are a partition of `text` — concatenating them reproduces it exactly,
-/// so encode/decode still round-trips.
-fn pretokenize(text: &str) -> Vec<&str> {
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    let mut prev_ws: Option<bool> = None;
-    for (i, ch) in text.char_indices() {
-        let ws = ch.is_whitespace();
-        if prev_ws.is_some_and(|p| p != ws) {
-            chunks.push(&text[start..i]);
-            start = i;
-        }
-        prev_ws = Some(ws);
+/// GPT-2 byte → unicode char mapping (OpenAI `bytes_to_unicode`, llama.cpp
+/// `unicode_byte_to_utf8_map`): printable Latin-1 bytes map to themselves, the
+/// other 68 bytes to U+0100.. in byte order.
+pub fn byte_to_unicode(b: u8) -> char {
+    let printable = |x: u32| (0x21..=0x7E).contains(&x) || (0xA1..=0xAC).contains(&x) || x >= 0xAE;
+    let b32 = u32::from(b);
+    if printable(b32) {
+        return char::from(b);
     }
-    if start < text.len() {
-        chunks.push(&text[start..]);
+    let n = (0..b32).filter(|&x| !printable(x)).count() as u32;
+    char::from_u32(256 + n).expect("256 + n < 324 is a valid char")
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum CharClass {
+    Letter,
+    Number,
+    Space,
+    Other,
+}
+
+fn char_class(c: char) -> CharClass {
+    use unicode_general_category::{get_general_category as cat, GeneralCategory as G};
+    if c.is_whitespace() {
+        return CharClass::Space;
+    }
+    match cat(c) {
+        G::UppercaseLetter
+        | G::LowercaseLetter
+        | G::TitlecaseLetter
+        | G::ModifierLetter
+        | G::OtherLetter => CharClass::Letter,
+        G::DecimalNumber | G::LetterNumber | G::OtherNumber => CharClass::Number,
+        _ => CharClass::Other,
+    }
+}
+
+/// Pre-tokenize `text` exactly like llama.cpp's `gpt-2` pre-tokenizer
+/// (`unicode_regex_split_custom_gpt2`, b11521):
+/// `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+`.
+/// The chunks are a partition of `text`, so encode/decode still round-trips and
+/// learned merges never span chunks.
+fn pretokenize(text: &str) -> Vec<&str> {
+    let cs: Vec<(usize, char)> = text.char_indices().collect();
+    let n = cs.len();
+    let at = |p: usize| cs.get(p).map(|&(_, c)| c);
+    let class = |p: usize| at(p).map(char_class);
+    let mut chunks = Vec::new();
+    let mut prev = 0; // char index where the current chunk starts
+    let mut pos = 0;
+    while pos < n {
+        let c = cs[pos].1;
+        let mut end = None;
+        // Contractions.
+        if c == '\'' && pos + 1 < n {
+            let (c1, c2) = (cs[pos + 1].1, at(pos + 2));
+            if matches!(c1, 's' | 't' | 'm' | 'd') {
+                end = Some(pos + 2);
+            } else if matches!(
+                (c1, c2),
+                ('r', Some('e')) | ('v', Some('e')) | ('l', Some('l'))
+            ) {
+                end = Some(pos + 3);
+            }
+        }
+        if end.is_none() {
+            // ` ?` then a run of letters / numbers / other.
+            let lead = usize::from(c == ' ');
+            let cl = class(pos + lead);
+            if matches!(
+                cl,
+                Some(CharClass::Letter | CharClass::Number | CharClass::Other)
+            ) {
+                let mut e = pos + lead;
+                while class(e) == cl {
+                    e += 1;
+                }
+                end = Some(e);
+            }
+        }
+        let end = end.unwrap_or_else(|| {
+            // Whitespace run: leave the last one for the next word (`\s+(?!\S)`)
+            // unless the run reaches the end of the text.
+            let mut e = pos;
+            while class(e) == Some(CharClass::Space) {
+                e += 1;
+            }
+            if e - pos > 1 && e < n {
+                e - 1
+            } else {
+                e.max(pos + 1)
+            }
+        });
+        let byte = |i: usize| cs.get(i).map_or(text.len(), |&(b, _)| b);
+        chunks.push(&text[byte(prev)..byte(end)]);
+        prev = end;
+        pos = end;
     }
     chunks
 }
@@ -108,16 +187,18 @@ impl ByteBpeTokenizer {
             .collect();
     }
 
-    /// Learn up to `vocab_size − 256` merges from `corpus`.
+    /// Learn up to `vocab_size − 257` merges from `corpus`, then reserve one id
+    /// for [`TOK_EOS`] (so the result has at most `vocab_size` tokens).
     ///
-    /// The corpus is pre-tokenized at whitespace boundaries (K2) so merges stay
-    /// within words; training then greedily merges the most frequent adjacent
-    /// pair. Stops early when no adjacent pair occurs at least twice.
-    /// `vocab_size` below 256 is an error (the byte base is irreducible).
+    /// The corpus is pre-tokenized like llama.cpp's `gpt-2` splitter so merges
+    /// stay within words; training then greedily merges the most frequent
+    /// adjacent pair. Stops early when no adjacent pair occurs at least twice.
+    /// `vocab_size` below 257 is an error (256 bytes + EOS are irreducible).
     pub fn train(corpus: &str, vocab_size: usize) -> Result<Self> {
-        if vocab_size < BASE_VOCAB {
+        if vocab_size <= BASE_VOCAB {
             return Err(InferError::DimMismatch(format!(
-                "vocab_size {vocab_size} < {BASE_VOCAB} (byte base vocabulary)"
+                "vocab_size {vocab_size} < {} (byte base vocabulary + EOS)",
+                BASE_VOCAB + 1
             )));
         }
         let mut tok = Self::byte_level();
@@ -156,7 +237,7 @@ impl ByteBpeTokenizer {
         let mut heap: BinaryHeap<(i64, Reverse<(u32, u32)>)> =
             counts.iter().map(|(&p, &c)| (c, Reverse(p))).collect();
 
-        while tok.vocab.len() < vocab_size {
+        while tok.vocab.len() < vocab_size - 1 {
             let Some((count, Reverse(pair))) = heap.pop() else {
                 break;
             };
@@ -218,6 +299,9 @@ impl ByteBpeTokenizer {
             }
         }
         tok.rebuild_ranks();
+        // ponytail: EOS is always reserved so every exported GGUF has a real
+        // `eos_token_id`; make it optional only if a no-EOS model is ever needed.
+        tok.add_special_token(TOK_EOS)?;
         vprintln!(
             "[tokenizer::train] done: vocab={}, merges={}",
             tok.vocab.len(),
@@ -352,6 +436,97 @@ impl ByteBpeTokenizer {
         self.vocab.get(id).map(Vec::as_slice)
     }
 
+    // ── GGUF vocab (GPT-2 bytes-to-unicode space) ─────────────────────────────
+
+    /// `tokenizer.ggml.tokens`: each token's bytes mapped through
+    /// [`byte_to_unicode`]; special tokens by name.
+    pub fn gguf_tokens(&self) -> Vec<String> {
+        let n_text = BASE_VOCAB + self.merges.len();
+        (0..self.vocab.len())
+            .map(|i| match i.checked_sub(n_text) {
+                Some(s) => self.special[s].clone(),
+                None => self.vocab[i].iter().map(|&b| byte_to_unicode(b)).collect(),
+            })
+            .collect()
+    }
+
+    /// `tokenizer.ggml.merges` in rank order: `"<left> <right>"`.
+    pub fn gguf_merges(&self) -> Vec<String> {
+        let toks = self.gguf_tokens();
+        self.merges
+            .iter()
+            .map(|&(a, b)| format!("{} {}", toks[a as usize], toks[b as usize]))
+            .collect()
+    }
+
+    /// `tokenizer.ggml.token_type`: 1 = normal, 3 = control (specials).
+    pub fn gguf_token_types(&self) -> Vec<i32> {
+        let n_text = BASE_VOCAB + self.merges.len();
+        (0..self.vocab.len())
+            .map(|i| if i < n_text { 1 } else { 3 })
+            .collect()
+    }
+
+    /// Rebuild from the three GGUF arrays (inverse of the exporters). Expects
+    /// Ferrum's layout: 256 byte tokens, then one token per merge in rank
+    /// order, then control tokens. Errors on any deviation.
+    pub fn from_gguf_vocab(
+        tokens: &[String],
+        merges: &[String],
+        token_types: &[i32],
+    ) -> Result<Self> {
+        let bad = |m: String| InferError::Format(format!("gguf vocab: {m}"));
+        let n_text = BASE_VOCAB + merges.len();
+        if tokens.len() < n_text || token_types.len() != tokens.len() {
+            return Err(bad(format!(
+                "{} tokens / {} types for {} merges",
+                tokens.len(),
+                token_types.len(),
+                merges.len()
+            )));
+        }
+        let ids: HashMap<&str, u32> = tokens[..n_text]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.as_str(), i as u32))
+            .collect();
+        let mut tok = Self::byte_level();
+        for (b, t) in tokens[..BASE_VOCAB].iter().enumerate() {
+            if *t != byte_to_unicode(b as u8).to_string() {
+                return Err(bad(format!("token {b} is not byte {b}")));
+            }
+        }
+        for (i, m) in merges.iter().enumerate() {
+            // llama.cpp: split at the first space searching from index 1.
+            let from = m.chars().next().map_or(0, char::len_utf8);
+            let (l, r) = m[from..]
+                .find(' ')
+                .map(|j| (&m[..from + j], &m[from + j + 1..]))
+                .ok_or_else(|| bad(format!("bad merge {m:?}")))?;
+            let (Some(&a), Some(&b)) = (ids.get(l), ids.get(r)) else {
+                return Err(bad(format!("merge {m:?} has a part that is not a token")));
+            };
+            if a as usize >= BASE_VOCAB + i || b as usize >= BASE_VOCAB + i {
+                return Err(bad(format!("merge {m:?} uses a later token")));
+            }
+            let merged = [tok.vocab[a as usize].clone(), tok.vocab[b as usize].clone()].concat();
+            let want: String = merged.iter().map(|&x| byte_to_unicode(x)).collect();
+            if tokens[BASE_VOCAB + i] != want {
+                return Err(bad(format!("token {} is not merge {m:?}", BASE_VOCAB + i)));
+            }
+            tok.vocab.push(merged);
+            tok.merges.push((a, b));
+        }
+        for (name, ty) in tokens[n_text..].iter().zip(&token_types[n_text..]) {
+            if *ty != 3 {
+                return Err(bad(format!("token {name:?} after merges is not control")));
+            }
+            tok.add_special_token(name)?;
+        }
+        tok.rebuild_ranks();
+        Ok(tok)
+    }
+
     /// Serialise the merge list as `"a,b;c,d;…"`, optionally followed by a
     /// newline and the comma-separated special-token names (K3). An empty string
     /// is byte-level with no specials. Compact enough to embed in FINF metadata.
@@ -467,8 +642,8 @@ mod tests {
     fn training_stops_when_nothing_repeats() {
         // All-distinct bytes: no pair occurs twice, so no merges happen.
         let tok = ByteBpeTokenizer::train("abcdefg", 1000).unwrap();
-        assert_eq!(tok.vocab_size(), 256);
-        assert!(tok.encode_state().is_empty());
+        assert_eq!(tok.vocab_size(), 257); // 256 bytes + reserved EOS
+        assert!(tok.merges.is_empty());
     }
 
     #[test]
@@ -483,7 +658,7 @@ mod tests {
             .map(|c| c.bytes().map(u32::from).collect())
             .collect();
         let mut merges = Vec::new();
-        while BASE_VOCAB + merges.len() < vocab_size {
+        while BASE_VOCAB + merges.len() < vocab_size - 1 {
             let mut counts: HashMap<(u32, u32), usize> = HashMap::new();
             for chunk in &chunks {
                 for w in chunk.windows(2) {
@@ -516,7 +691,7 @@ mod tests {
             "{CORPUS} aaaa aaa abab ababab mississippi banana bandana 🌸🌸 мир мира \n\t {}",
             "the cat sat on the mat with the hat ".repeat(7)
         );
-        for vocab in [256, 270, 300, 400] {
+        for vocab in [257, 270, 300, 400] {
             let fast = ByteBpeTokenizer::train(&corpus, vocab).unwrap();
             assert_eq!(fast.merges, naive_merges(&corpus, vocab), "vocab {vocab}");
         }
@@ -565,9 +740,9 @@ mod tests {
     // ── Pre-tokenization (K2) ─────────────────────────────────────────────────
 
     #[test]
-    fn pretokenize_partitions_on_whitespace_boundaries() {
-        assert_eq!(pretokenize("low lower"), vec!["low", " ", "lower"]);
-        assert_eq!(pretokenize("a\n b"), vec!["a", "\n ", "b"]);
+    fn pretokenize_partitions_text() {
+        assert_eq!(pretokenize("low lower"), vec!["low", " lower"]);
+        assert_eq!(pretokenize("a\n b"), vec!["a", "\n", " b"]);
         assert_eq!(pretokenize(""), Vec::<&str>::new());
         assert_eq!(pretokenize("solid"), vec!["solid"]);
         // The chunks always reconstruct the original text.
@@ -582,7 +757,8 @@ mod tests {
         let tok = ByteBpeTokenizer::train("ab ab ab ab ab", 300).unwrap();
         for (id, bytes) in tok.vocab.iter().enumerate() {
             if id >= BASE_VOCAB {
-                let has_inner_space = bytes.iter().any(|&b| (b as char).is_whitespace());
+                // GPT-2 chunks may carry one leading space, never an inner one.
+                let has_inner_space = bytes.iter().skip(1).any(|&b| (b as char).is_whitespace());
                 assert!(
                     !has_inner_space,
                     "merged token {id} ({bytes:?}) spans whitespace"
@@ -633,15 +809,16 @@ mod tests {
     fn special_tokens_get_reserved_ids_above_vocab() {
         let mut tok = ByteBpeTokenizer::train(CORPUS, 300).unwrap();
         let base = tok.vocab_size();
+        // train() already reserved EOS as the last id; the rest are appended.
         let [bos, eos, pad, unk] = tok.add_standard_special_tokens();
-        assert_eq!([bos, eos, pad, unk], [base, base + 1, base + 2, base + 3]);
-        assert_eq!(tok.vocab_size(), base + 4);
+        assert_eq!([bos, eos, pad, unk], [base, base - 1, base + 1, base + 2]);
+        assert_eq!(tok.vocab_size(), base + 3);
         assert_eq!(tok.eos_id(), Some(eos));
         assert_eq!(tok.bos_id(), Some(bos));
         assert_eq!(tok.num_special(), 4);
         // Adding an existing special is idempotent.
         assert_eq!(tok.add_special_token(TOK_EOS).unwrap(), eos);
-        assert_eq!(tok.vocab_size(), base + 4);
+        assert_eq!(tok.vocab_size(), base + 3);
     }
 
     #[test]
@@ -676,7 +853,7 @@ mod tests {
         assert_eq!(framed.last(), Some(&tok.eos_id().unwrap()));
         assert_eq!(&framed[1..framed.len() - 1], bare.as_slice());
         // Without registered specials, framing is a no-op.
-        let plain = ByteBpeTokenizer::train(CORPUS, 300).unwrap();
+        let plain = ByteBpeTokenizer::byte_level();
         assert_eq!(
             plain.encode_framed("lower", true, true),
             plain.encode("lower")
@@ -709,5 +886,68 @@ mod tests {
         assert!(tok.add_special_token("a;b").is_err());
         assert!(tok.add_special_token("a\nb").is_err());
         assert!(tok.add_special_token(TOK_EOS).is_ok());
+    }
+
+    // ── GPT-2 / llama.cpp compatibility (Task GT) ─────────────────────────────
+
+    #[test]
+    fn pretokenize_matches_gpt2_regex() {
+        let cases: &[(&str, &[&str])] = &[
+            ("Hello world", &["Hello", " world"]),
+            (
+                "I'm here, it's 2024!",
+                &["I", "'m", " here", ",", " it", "'s", " 2024", "!"],
+            ),
+            ("a  b", &["a", " ", " b"]),
+            ("x\n\ny", &["x", "\n", "\n", "y"]),
+            ("end   ", &["end", "   "]),
+            ("naïve café", &["naïve", " café"]),
+            ("<|endoftext|>Once", &["<|", "endoftext", "|>", "Once"]),
+        ];
+        for (text, want) in cases {
+            let got = pretokenize(text);
+            assert_eq!(&got, want, "{text:?}");
+            assert_eq!(got.concat(), *text);
+        }
+    }
+
+    #[test]
+    fn byte_to_unicode_matches_gpt2() {
+        assert_eq!(byte_to_unicode(b'A'), 'A');
+        assert_eq!(byte_to_unicode(b' '), 'Ġ');
+        assert_eq!(byte_to_unicode(b'\n'), 'Ċ');
+        let all: std::collections::HashSet<char> = (0..=255u8).map(byte_to_unicode).collect();
+        assert_eq!(all.len(), 256);
+    }
+
+    #[test]
+    fn training_reserves_eos_and_gguf_vocab_roundtrips() {
+        // Needs enough distinct words that 43 merges exist (re-derived: the
+        // brief's 4-word corpus runs out of repeated pairs at 272 tokens).
+        let corpus: String = (0..200)
+            .map(|i| format!("the cat{i} sat{} on mat{}. ", i % 13, i % 7))
+            .collect::<String>()
+            .repeat(2);
+        let tok = ByteBpeTokenizer::train(&corpus, 300).unwrap();
+        assert_eq!(tok.vocab_size(), 300);
+        assert_eq!(tok.eos_id(), Some(299));
+        let (t, m, ty) = (tok.gguf_tokens(), tok.gguf_merges(), tok.gguf_token_types());
+        assert_eq!(t.len(), 300);
+        assert_eq!(t[b' ' as usize], "Ġ");
+        assert_eq!(t[299], "<|endoftext|>");
+        assert_eq!(ty[299], 3);
+        assert!(m.iter().all(|x| x.matches(' ').count() == 1));
+        let back = ByteBpeTokenizer::from_gguf_vocab(&t, &m, &ty).unwrap();
+        assert_eq!(back.encode_state(), tok.encode_state());
+        let text = "the cat sat. ünïcode 123";
+        assert_eq!(back.encode(text), tok.encode(text));
+    }
+
+    #[test]
+    fn from_gguf_vocab_rejects_bad_merges() {
+        let tok = ByteBpeTokenizer::train(&"abab cdcd ".repeat(10), 280).unwrap();
+        let (t, mut m, ty) = (tok.gguf_tokens(), tok.gguf_merges(), tok.gguf_token_types());
+        m[0] = "zz\u{1F338} yy".into();
+        assert!(ByteBpeTokenizer::from_gguf_vocab(&t, &m, &ty).is_err());
     }
 }

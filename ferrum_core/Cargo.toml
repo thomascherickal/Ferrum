@@ -12,7 +12,9 @@ keywords    = ["transformer", "edge-ai", "neural-network", "wasm", "machine-lear
 categories  = ["science", "algorithms", "wasm", "mathematics"]
 
 [dependencies]
-# intentionally empty — std only, zero external dependencies
+# Only dependency: the Unicode general-category table the GPT-2 pre-tokenizer
+# needs (\p{L}/\p{N}); pure Rust, no transitive deps, builds for wasm32.
+unicode-general-category = "1.1"
 
 # Std-only matmul benchmark (no Criterion): `harness = false` runs its own
 # `fn main()` with `std::time::Instant`, keeping the zero-dependency guarantee.
