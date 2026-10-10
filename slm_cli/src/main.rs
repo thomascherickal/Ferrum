@@ -54,6 +54,8 @@
 
 #![forbid(unsafe_code)]
 
+mod runtime_export;
+
 use ferrum_core::{GenerativeSLM, Rng, TaskType, TransformerConfig, ValidationConfig};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -149,6 +151,8 @@ const EXPORT_FLAGS: Spec = &[
     ("resume", Kind::Str),
     ("force", Kind::Bool),
 ];
+const EXPORT_OLLAMA_FLAGS: Spec = &[("bin", Kind::Str), ("modelfile-only", Kind::Str)];
+const EXPORT_LMSTUDIO_FLAGS: Spec = &[("repo", Kind::Str), ("bin", Kind::Str)];
 const NO_FLAGS: Spec = &[];
 
 /// `run` takes the union of train and generate flags.
@@ -165,6 +169,8 @@ fn spec_for(cmd: &str) -> Option<Spec> {
         "run-gguf" | "gguf" => RUN_GGUF_FLAGS,
         "finetune-gguf" | "finetune" => FINETUNE_FLAGS,
         "export-gguf" | "export" => EXPORT_FLAGS,
+        "export-ollama" => EXPORT_OLLAMA_FLAGS,
+        "export-lmstudio" => EXPORT_LMSTUDIO_FLAGS,
         "eval" | "info" => NO_FLAGS,
         _ => return None,
     })
@@ -352,6 +358,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "run-gguf" | "gguf" => cmd_run_gguf(&args),
         "finetune-gguf" | "finetune" => cmd_finetune_gguf(&args),
         "export-gguf" | "export" => cmd_export_gguf(&args),
+        "export-ollama" => runtime_export::cmd_export_ollama(
+            &args.positional,
+            args.value("bin"),
+            args.value("modelfile-only"),
+        )
+        .map_err(Into::into),
+        "export-lmstudio" => runtime_export::cmd_export_lmstudio(
+            &args.positional,
+            args.value("repo"),
+            args.value("bin"),
+        )
+        .map_err(Into::into),
         "eval" => cmd_eval(&args),
         "info" => cmd_info(&args),
         _ => unreachable!("spec_for covers every command"),
@@ -369,6 +387,8 @@ fn print_usage() {
          \x20 train_transformer run-gguf <model.gguf> [prompt] [options]\n\
          \x20 train_transformer finetune-gguf <model.gguf> <corpus.txt> <out.flck> [options]\n\
          \x20 train_transformer export-gguf <in.gguf> <out.gguf> [options]\n\
+         \x20 train_transformer export-ollama <model.gguf> <name> [--bin P] [--modelfile-only out.Modelfile]\n\
+         \x20 train_transformer export-lmstudio <model.gguf> [--repo ferrum/<stem>] [--bin P]\n\
          \x20 train_transformer eval     <model.bin>  <heldout.txt>\n\
          \x20 train_transformer info     <model.bin>\n\n\
          TRAIN / RUN options:\n\
@@ -1485,6 +1505,8 @@ mod tests {
             "finetune",
             "export-gguf",
             "export",
+            "export-ollama",
+            "export-lmstudio",
             "eval",
             "info",
         ] {
@@ -1579,6 +1601,8 @@ mod tests {
                 ],
             ),
             ("export-gguf", &["quant", "resume", "force"]),
+            ("export-ollama", &["bin", "modelfile-only"]),
+            ("export-lmstudio", &["repo", "bin"]),
         ];
         for (cmd, flags) in cases {
             let spec = spec_for(cmd).unwrap();
