@@ -1310,7 +1310,10 @@ mod tests {
         assert!(info.bytes > 0);
         let junk = dir.join("junk.gguf");
         std::fs::write(&junk, b"FINF\x05\x00\x00\x00").unwrap();
-        assert!(model_info(junk.to_str().unwrap().to_string()).is_err());
+        let err = model_info(junk.to_str().unwrap().to_string())
+            .err()
+            .expect("FINF junk must be rejected");
+        assert!(err.contains("old Ferrum .bin (FINF) model"), "{err}");
         assert!(model_info("/nonexistent/m.gguf".into()).is_err());
     }
 

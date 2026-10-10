@@ -16,9 +16,7 @@
 //! | `ferrum.layer_count` | u32 | number of layers |
 //! | `ferrum.layer.{i}.type` | string | `linear`, `activation`, `flatten`, `embedding`, `layernorm`, `transformer_block` |
 //! | `ferrum.layer.{i}.{dim}` | u32 | `linear`: `in`, `out`; `activation`: `kind`; `embedding`: `vocab`, `seq`, `dim`; `layernorm`: `dim`; `transformer_block`: `context`, `heads`, `dim`, `hidden` |
-//! | `l{i}.{param}` | F32 | GGML dims `[cols, rows]` for a row-major `[rows, cols]` matrix, `[n]` for a vector |
-//! | `l{i}.{param}.q8` / `.q4` | I8 | quantized matrix bytes, GGML dims `[row_bytes, rows]` |
-//! | `l{i}.{param}.scale` | F32 | per-row scales `[rows]` for the `.q8`/`.q4` tensor |
+//! | `l{i}.{param}` | F32 / Q8_0 / Q4_0 | GGML dims `[cols, rows]` for a row-major `[rows, cols]` matrix, `[n]` for a vector; 2-D weights quantized at the requested precision when GGML ne0 % 32 == 0, otherwise F32 |
 //!
 //! Parameter names: `linear`: `weight` `[in,out]`, `bias`; `embedding`:
 //! `token`, `pos`; `layernorm`: `gamma`, `beta`; `transformer_block`: `ln1.*`,
@@ -714,7 +712,7 @@ fn generic_from(r: &GgufIn) -> Result<(Sequential, Normalizer, ModelMetadata)> {
 // ponytail: Q8_0/Q4_0 matrices are expanded to f32 (4×/8× the file's size in
 // RAM); keep them packed once a Q8_0 kernel lands, if large models need it.
 pub fn from_gguf(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata)> {
-    let g = Gguf::parse(bytes.to_vec())?;
+    let g = parse_gguf(bytes)?;
     let r = GgufIn(&g);
     match g.architecture() {
         Some("gpt2") => gpt2_from(&r),
@@ -725,33 +723,47 @@ pub fn from_gguf(bytes: &[u8]) -> Result<(Sequential, Normalizer, ModelMetadata)
     }
 }
 
+/// Parse GGUF bytes, with a pointed error for the removed FINF `.bin` format.
+fn parse_gguf(bytes: &[u8]) -> Result<Gguf> {
+    if bytes.starts_with(b"FINF") {
+        return Err(bad(
+            "old Ferrum .bin (FINF) model — this format was removed; retrain to produce a .gguf"
+                .into(),
+        ));
+    }
+    Gguf::parse(bytes.to_vec())
+}
+
 /// The precision a GGUF model was saved at: `ferrum.quant` ("f32" | "int8" |
 /// "int4"), else derived from `general.file_type` (0 / 1 / 7 / 2 -> f32 / f16 /
 /// int8 / int4). Any other file type is reported as `other(N)`, and a file with
 /// neither key as `unknown`, so `info` never refuses a loadable model.
 pub fn gguf_quant(bytes: &[u8]) -> Result<String> {
-    let g = Gguf::parse(bytes.to_vec())?;
+    Ok(quant_of(&parse_gguf(bytes)?))
+}
+
+fn quant_of(g: &Gguf) -> String {
     if let Some(q) = g.meta("ferrum.quant").and_then(MetaValue::as_str) {
-        return Ok(q.to_string());
+        return q.to_string();
     }
     match g.meta("general.file_type").and_then(MetaValue::as_usize) {
-        Some(0) => Ok("f32".into()),
-        Some(7) => Ok("int8".into()),
-        Some(1) => Ok("f16".into()),
-        Some(2) => Ok("int4".into()),
-        Some(ft) => Ok(format!("other({ft})")),
-        None => Ok("unknown".into()),
+        Some(0) => "f32".into(),
+        Some(7) => "int8".into(),
+        Some(1) => "f16".into(),
+        Some(2) => "int4".into(),
+        Some(ft) => format!("other({ft})"),
+        None => "unknown".into(),
     }
 }
 
 /// One-line description for `info`: `GGUF v3 (gpt2, int8)`.
 pub fn gguf_format(bytes: &[u8]) -> Result<String> {
-    let g = Gguf::parse(bytes.to_vec())?;
+    let g = parse_gguf(bytes)?;
     Ok(format!(
         "GGUF v{} ({}, {})",
         g.version,
         g.architecture().unwrap_or("unknown"),
-        gguf_quant(bytes)?
+        quant_of(&g)
     ))
 }
 
@@ -1076,6 +1088,11 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .sum::<f32>()
             / out_f as f32;
+        // 0.4 tolerance: the sinusoid spans ~5 periods per 32-element input
+        // block, so every Q4_0 block scale is near the global max and the
+        // asymmetric -8..7 grid clips the opposite-sign extreme to 7/8*amax.
+        // Measured MAE ~0.27 (old per-row int4: ~0.05); 0.4 still catches sign
+        // errors (~1.2) and scrambled weights.
         assert!(mae < 0.4, "int4 forward drifted too far: mae={mae}");
     }
 
@@ -1894,7 +1911,7 @@ mod tests {
         assert_eq!(gguf_quant(&mk(Some(1))).unwrap(), "f16");
         assert_eq!(gguf_quant(&mk(Some(15))).unwrap(), "other(15)");
         assert_eq!(gguf_quant(&mk(None)).unwrap(), "unknown");
-        assert!(gguf_quant(b"FINF\x05\x00\x00\x00").is_err());
+        assert!(load_err_of(gguf_quant(b"FINF\x05\x00\x00\x00")).contains(FINF_HINT));
     }
 
     #[test]
@@ -1908,7 +1925,33 @@ mod tests {
         // No architecture key and no quant info.
         let b = GgufBuilder::new().into_bytes();
         assert_eq!(gguf_format(&b).unwrap(), "GGUF v3 (unknown, unknown)");
-        assert!(gguf_format(b"FINF\x05\x00\x00\x00").is_err());
+        assert!(load_err_of(gguf_format(b"FINF\x05\x00\x00\x00")).contains(FINF_HINT));
+        // gguf_format derives quant from the same parse: every arm agrees with gguf_quant.
+        for ft in [Some(0), Some(7), Some(1), Some(2), Some(15), None] {
+            let mut b = GgufBuilder::new();
+            b.meta("general.architecture", MetaValue::String("gpt2".into()));
+            if let Some(ft) = ft {
+                b.meta("general.file_type", MetaValue::U32(ft));
+            }
+            let bytes = b.into_bytes();
+            let q = gguf_quant(&bytes).unwrap();
+            assert_eq!(gguf_format(&bytes).unwrap(), format!("GGUF v3 (gpt2, {q})"));
+        }
+    }
+
+    const FINF_HINT: &str =
+        "old Ferrum .bin (FINF) model — this format was removed; retrain to produce a .gguf";
+
+    fn load_err_of<T>(r: Result<T>) -> String {
+        match r {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn finf_input_gets_removed_format_hint() {
+        assert!(load_err_of(from_gguf(b"FINF\x05\x00\x00\x00")).contains(FINF_HINT));
     }
 
     #[test]
@@ -1917,7 +1960,7 @@ mod tests {
         b.meta("general.architecture", MetaValue::String("llama".into()));
         assert!(load_err(&b.into_bytes()).contains("not a Ferrum-loadable model"));
         assert!(load_err(&GgufBuilder::new().into_bytes()).contains("not a Ferrum-loadable model"));
-        assert!(from_gguf(b"FINF\x05\x00\x00\x00").is_err());
+        assert!(load_err_of(from_gguf(b"FINF\x05\x00\x00\x00")).contains(FINF_HINT));
         for prec in [QPrec::Int8, QPrec::F32] {
             let (m, n, meta) = bpe_parts(32, 64, true);
             let good = to_gguf(&m, &n, &meta, prec).unwrap();

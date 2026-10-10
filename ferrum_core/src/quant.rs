@@ -91,10 +91,10 @@ pub fn fake_quantize_int8_per_channel(data: &mut [f32], channels: usize) -> bool
 // weight once. Storing weights as int8 (¼ the bytes) or int4 (⅛) cuts both the
 // resident footprint *and* the bytes streamed per token, which is the only lever
 // that raises the bandwidth-limited token rate. `QWeight` is the in-memory
-// counterpart of the GGUF Q8_0/Q4_0-style on-disk encodings: symmetric, one scale per
-// **input row** of the `[in_features, out_features]` matrix (the same
-// per-channel convention `int8_scales_per_channel` and the loader already use),
-// so `value ≈ q × scale[row]`.
+// counterpart used for imported Llama models and `qlinear`; it is *not* the
+// GGUF on-disk codec (the loader writes/reads GGUF Q8_0/Q4_0 blocks). Symmetric,
+// one scale per **input row** of the `[in_features, out_features]` matrix, so
+// `value ≈ q × scale[row]`.
 
 /// The 4-bit symmetric grid uses 15 levels (−7..=7); `scale = max|w| / 7`.
 pub const INT4_MAX: f32 = 7.0;

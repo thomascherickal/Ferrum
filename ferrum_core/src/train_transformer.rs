@@ -1314,7 +1314,7 @@ impl TransformerNet {
 
     /// Export to an inference `Sequential`:
     /// `Embedding → blocks → LayerNorm → Linear → Softmax`.
-    /// Serializes to GGUF v4 and is compatible with `TransformerSLMModel`.
+    /// Serializes to GGUF v3 and is compatible with `TransformerSLMModel`.
     pub fn to_inference(&self) -> Result<Sequential> {
         let mut m = Sequential::new();
         m.push(Box::new(Embedding::new(

@@ -174,8 +174,9 @@ fn info_reports_gguf_format_and_rejects_non_gguf() {
 
     let junk = dir.join("junk.gguf");
     std::fs::write(&junk, b"FINF\x05\x00\x00\x00").unwrap();
-    let (code, _) = run(&["info", junk.to_str().unwrap()]);
+    let (code, text) = run(&["info", junk.to_str().unwrap()]);
     assert_ne!(code, 0);
+    assert!(text.contains("old Ferrum .bin (FINF) model"), "{text}");
     let (code, text) = run(&["info"]);
     assert_ne!(code, 0);
     assert!(

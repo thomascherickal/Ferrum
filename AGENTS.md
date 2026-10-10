@@ -20,8 +20,8 @@ Do not break these; they are the product's selling points.
   regardless of `FERRUM_NUM_THREADS`.
 - **WASM-portable.** `ferrum_core` must compile for `wasm32-unknown-unknown`
   (no threads/fs assumptions on that path). CI builds `slm_wasm` for wasm32.
-- **Backward compatibility.** FINF v4 (f32) and v5 (int8/int4) model files must
-  keep loading. `TransformerConfig` is extended with new fields + `Default`;
+- **GGUF only.** Every model, checkpoint and tokenizer file Ferrum writes is GGUF v3. Ferrum's BPE transformer SLMs are `gpt2`-architecture GGUFs that must keep running in llama.cpp, Ollama and LM Studio; other models use the generic `ferrum` architecture. The old FINF `.bin` format is removed (breaking).
+- **Config compatibility.** `TransformerConfig` is extended with new fields + `Default`;
   callers use `..TransformerConfig::default()`. The positional
   `train_transformer*` functions keep stride 1 and their exact results. Record
   any compat change in `Status.md` §7.
@@ -49,7 +49,7 @@ They share only the low-level kernels (`ops`, `parallel`, `quant`).
 | Modules | `train_transformer`, `slm`, `tokenizer`, `meta`, `loader` | `gguf`, `gguf_tokenizer`, `llm`, `llm_train`, `gguf_write`, `chat_format` |
 | Architecture | learned positions, LayerNorm, ReLU MLP, dense MHA | RoPE, RMSNorm, SwiGLU, GQA |
 | Training | from scratch, Adam/AdamW, QAT | AdamW fine-tuning (f32) |
-| Ships as | FINF `.bin` (weights + metadata + tokenizer in one file) | GGUF v3 |
+| Ships as | `gpt2` GGUF (runs in llama.cpp, Ollama, LM Studio) | GGUF v3 |
 
 ## Commands
 
