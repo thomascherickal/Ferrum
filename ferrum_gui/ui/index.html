@@ -173,8 +173,8 @@
         <label title="Linear warmup steps for the cosine schedule">Warmup steps <input type="number" id="trWarmup" value="0" min="0" /></label>
         <label title="Hold out this fraction of the corpus; keeps the best epoch by validation loss. 0 = off">Val fraction (0=off) <input type="number" id="trVal" value="0" step="0.05" min="0" max="0.5" /></label>
         <label title="Stop after this many epochs without validation improvement; 0 = never">Patience <input type="number" id="trPatience" value="0" min="0" /></label>
-        <label title="Reuse this BPE tokenizer file; trained and saved there if missing">Tokenizer file <input type="text" id="trTokenizer" placeholder="optional, e.g. tok.bpe" /></label>
-        <label title="Training checkpoint (weights + optimizer state)">Checkpoint file <input type="text" id="trCkpt" placeholder="optional, e.g. run.fckp" /></label>
+        <label title="Reuse this BPE tokenizer file; trained and saved there if missing">Tokenizer file <input type="text" id="trTokenizer" placeholder="optional, e.g. tok.gguf" /></label>
+        <label title="GGUF checkpoint (weights + optimizer state)">Checkpoint file <input type="text" id="trCkpt" placeholder="optional, e.g. run.fckp" /></label>
         <label title="Save the checkpoint every N optimizer steps (and at the end); 0 = only at the end">Checkpoint every <input type="number" id="trCkptEvery" value="0" min="0" /></label>
       </div>
       <div class="row">

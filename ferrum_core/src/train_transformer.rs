@@ -5,6 +5,7 @@
 //! layers (`Embedding`, `TransformerBlock`, `LayerNorm`, `Linear`) serialize
 //! to GGUF and run in WASM.
 
+use crate::ckpt;
 use crate::error::{InferError, Result};
 use crate::layer::{
     matmul_naive_helper, matmul_transpose_b_helper, ActivationLayer, Embedding, LayerNorm, Linear,
@@ -421,45 +422,6 @@ impl BlockT {
     }
 }
 
-/// Minimal little-endian byte cursor for checkpoint deserialization (T6).
-struct Cur<'a> {
-    b: &'a [u8],
-    pos: usize,
-}
-impl Cur<'_> {
-    fn take(&mut self, n: usize) -> Result<&[u8]> {
-        let end = self.pos.checked_add(n).filter(|&e| e <= self.b.len());
-        match end {
-            Some(end) => {
-                let s = &self.b[self.pos..end];
-                self.pos = end;
-                Ok(s)
-            }
-            None => Err(InferError::Format("checkpoint truncated".into())),
-        }
-    }
-    fn u32(&mut self) -> Result<u32> {
-        let b = self.take(4)?;
-        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-    }
-    fn u64(&mut self) -> Result<u64> {
-        let b = self.take(8)?;
-        Ok(u64::from_le_bytes([
-            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-        ]))
-    }
-    fn u8(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
-    }
-    fn fill_f32(&mut self, dst: &mut [f32]) -> Result<()> {
-        let raw = self.take(dst.len() * 4)?;
-        for (d, c) in dst.iter_mut().zip(raw.chunks_exact(4)) {
-            *d = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-        }
-        Ok(())
-    }
-}
-
 /// Owned gradient tensors for one `BlockT`, produced by
 /// [`TransformerNet::backward_grads`] so a worker can compute gradients without
 /// mutating (or cloning) the shared parameters. Fields mirror `BlockT`.
@@ -814,70 +776,54 @@ impl TransformerNet {
     /// (The learning-rate schedule and grad-clip threshold are training-driver
     /// settings, not weights; re-apply them on the resumed net.)
     pub fn save_checkpoint(&self, rng: &Rng) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(b"FCKP");
-        out.extend_from_slice(&1u32.to_le_bytes());
-        for v in [
-            self.vocab_size,
-            self.context_len,
-            self.embed_dim,
-            self.num_heads,
-            self.hidden_dim(),
-            self.blocks.len(),
+        let mut b = ckpt::begin("ferrum-checkpoint");
+        for (k, v) in [
+            ("vocab", self.vocab_size),
+            ("context", self.context_len),
+            ("embed", self.embed_dim),
+            ("heads", self.num_heads),
+            ("hidden", self.hidden_dim()),
+            ("blocks", self.blocks.len()),
         ] {
-            out.extend_from_slice(&(v as u32).to_le_bytes());
+            ckpt::put_u32(&mut b, k, v);
         }
-        out.push(self.qat as u8);
-        out.push(self.tie_weights as u8);
-        out.extend_from_slice(&self.step_t.to_le_bytes());
-        out.extend_from_slice(&rng.state().to_le_bytes());
-        for p in self.params_all() {
-            for t in [&p.data, &p.m, &p.v] {
-                for &x in &t.data {
-                    out.extend_from_slice(&x.to_le_bytes());
-                }
-            }
+        ckpt::put_bool(&mut b, "qat", self.qat);
+        ckpt::put_bool(&mut b, "tie", self.tie_weights);
+        ckpt::put_u64(&mut b, "step", self.step_t);
+        ckpt::put_u64(&mut b, "rng", rng.state());
+        for (i, p) in self.params_all().into_iter().enumerate() {
+            ckpt::put_param(&mut b, i, &p.data.data, &p.m.data, &p.v.data);
         }
-        out
+        b.into_bytes()
     }
 
     /// Rebuild a net and RNG from [`TransformerNet::save_checkpoint`] bytes,
     /// restoring weights, Adam moments, optimizer timestep, and RNG state so
-    /// training resumes deterministically.
+    /// training resumes deterministically. Pre-GGUF (`FCKP`) checkpoints are
+    /// rejected with a pointed error.
     pub fn load_checkpoint(bytes: &[u8]) -> Result<(Self, Rng)> {
-        let mut c = Cur { b: bytes, pos: 0 };
-        if c.take(4)? != b"FCKP" {
-            return Err(InferError::Format("bad checkpoint magic".into()));
-        }
-        let version = c.u32()?;
-        if version != 1 {
-            return Err(InferError::Format(format!(
-                "unsupported checkpoint version {version}"
-            )));
-        }
-        let vocab = c.u32()? as usize;
-        let ctx = c.u32()? as usize;
-        let embed = c.u32()? as usize;
-        let heads = c.u32()? as usize;
-        let hidden = c.u32()? as usize;
-        let blocks = c.u32()? as usize;
-        let qat = c.u8()? != 0;
-        let tie = c.u8()? != 0;
-        let step_t = c.u64()?;
-        let rng_state = c.u64()?;
-
+        let g = ckpt::open(bytes, b"FCKP", "ferrum-checkpoint")?;
+        let n = |k| ckpt::get_usize(&g, k);
         let mut seed_rng = Rng::new(1); // throwaway: param data is overwritten
-        let mut net = TransformerNet::new(vocab, ctx, embed, heads, hidden, blocks, &mut seed_rng)?;
-        net.qat = qat;
-        net.tie_weights = tie;
-        net.step_t = step_t;
-        for p in net.params_mut_all() {
+        let mut net = TransformerNet::new(
+            n("vocab")?,
+            n("context")?,
+            n("embed")?,
+            n("heads")?,
+            n("hidden")?,
+            n("blocks")?,
+            &mut seed_rng,
+        )?;
+        net.qat = ckpt::get_bool(&g, "qat")?;
+        net.tie_weights = ckpt::get_bool(&g, "tie")?;
+        net.step_t = ckpt::get_u64(&g, "step")?;
+        let rng_state = ckpt::get_u64(&g, "rng")?;
+        for (i, p) in net.params_mut_all().into_iter().enumerate() {
             // m and v share the parameter's shape, so each is the same length.
-            let n = p.data.data.len();
-            c.fill_f32(&mut p.data.data)?;
-            debug_assert_eq!(p.m.data.len(), n);
-            c.fill_f32(&mut p.m.data)?;
-            c.fill_f32(&mut p.v.data)?;
+            let len = p.data.data.len();
+            p.data.data = ckpt::get_f32(&g, &format!("p{i}.data"), len)?;
+            p.m.data = ckpt::get_f32(&g, &format!("p{i}.m"), len)?;
+            p.v.data = ckpt::get_f32(&g, &format!("p{i}.v"), len)?;
         }
         Ok((net, Rng::from_state(rng_state)))
     }
@@ -2425,6 +2371,163 @@ mod tests {
         let bytes = net.save_checkpoint(&r);
         // Truncated payload is rejected, not silently zero-filled.
         assert!(TransformerNet::load_checkpoint(&bytes[..bytes.len() / 2]).is_err());
+    }
+
+    fn trained_net(tie: bool, qat: bool) -> (TransformerNet, Rng) {
+        let mut r = Rng::new(3);
+        let mut net = TransformerNet::new(6, 4, 8, 2, 16, 2, &mut r).unwrap();
+        net.set_qat(qat);
+        net.set_weight_tying(tie);
+        let tokens: Vec<usize> = (0..100).map(|i| (i * 5) % 6).collect();
+        let adam = Adam::new(0.01);
+        let mut rng = Rng::new(11);
+        train_transformer_epoch(&mut net, &tokens, 8, &adam, &mut rng).unwrap();
+        (net, rng)
+    }
+
+    #[test]
+    fn checkpoint_is_gguf_and_roundtrips() {
+        let mut rng = Rng::new(5);
+        let net = TransformerNet::new(30, 8, 16, 2, 32, 1, &mut rng).unwrap();
+        let bytes = net.save_checkpoint(&rng);
+        assert_eq!(&bytes[..4], b"GGUF");
+        let g = crate::gguf::Gguf::parse(bytes.clone()).unwrap();
+        assert_eq!(g.architecture(), Some("ferrum-checkpoint"));
+        let (net2, rng2) = TransformerNet::load_checkpoint(&bytes).unwrap();
+        assert_eq!(net2.save_checkpoint(&rng2), bytes);
+    }
+
+    #[test]
+    fn checkpoint_roundtrips_every_field_bit_exactly() {
+        for (tie, qat) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (net, rng) = trained_net(tie, qat);
+            assert!(net.step_count() > 0);
+            let (net2, rng2) = TransformerNet::load_checkpoint(&net.save_checkpoint(&rng)).unwrap();
+            assert_eq!(net2.qat_enabled(), qat);
+            assert_eq!(net2.weight_tying(), tie);
+            assert_eq!(net2.step_count(), net.step_count());
+            assert_eq!(rng2.state(), rng.state());
+            assert_eq!(net2.hidden_dim(), net.hidden_dim());
+            let (a, b) = (net.params_all(), net2.params_all());
+            assert_eq!(a.len(), b.len());
+            let mut moments = 0.0f32;
+            for (p, q) in a.iter().zip(&b) {
+                for (x, y) in [(&p.data, &q.data), (&p.m, &q.m), (&p.v, &q.v)] {
+                    assert_eq!(x.shape, y.shape);
+                    assert!(x
+                        .data
+                        .iter()
+                        .zip(&y.data)
+                        .all(|(u, w)| u.to_bits() == w.to_bits()));
+                }
+                moments += p.m.data.iter().map(|v| v.abs()).sum::<f32>();
+            }
+            assert!(moments > 0.0, "test must exercise non-zero Adam moments");
+        }
+    }
+
+    #[test]
+    fn old_checkpoint_magic_is_a_clear_error() {
+        let err = TransformerNet::load_checkpoint(b"FCKP\x01\x00\x00\x00")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("pre-GGUF checkpoint (FCKP)"), "{err}");
+        assert!(err.contains("retrain or start a new checkpoint"), "{err}");
+    }
+
+    #[test]
+    fn checkpoint_rejects_foreign_truncated_and_wrong_architecture() {
+        for junk in [&b""[..], b"XXXXjunkdata", b"GGUF"] {
+            assert!(TransformerNet::load_checkpoint(junk).is_err());
+        }
+        let (net, rng) = trained_net(false, false);
+        let bytes = net.save_checkpoint(&rng);
+        for cut in [bytes.len() / 2, bytes.len() - 1, 100] {
+            assert!(
+                TransformerNet::load_checkpoint(&bytes[..cut]).is_err(),
+                "cut {cut}"
+            );
+        }
+        let other = crate::ckpt::rewrite(
+            &bytes,
+            |m| {
+                m.insert(
+                    "general.architecture".into(),
+                    crate::gguf::MetaValue::String("gpt2".into()),
+                );
+            },
+            None,
+        );
+        let err = TransformerNet::load_checkpoint(&other)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("not a ferrum-checkpoint"), "{err}");
+    }
+
+    #[test]
+    fn checkpoint_rejects_inconsistent_headers_and_tensors() {
+        use crate::gguf::MetaValue;
+        let (net, rng) = trained_net(true, true);
+        let bytes = net.save_checkpoint(&rng);
+        let key = |k: &str| format!("ferrum.ckpt.{k}");
+        // A missing or mistyped scalar names its key.
+        for k in [
+            "vocab", "context", "embed", "heads", "hidden", "blocks", "step", "rng",
+        ] {
+            let kk = key(k);
+            let b = crate::ckpt::rewrite(&bytes, |m| drop(m.remove(&kk)), None);
+            let e = TransformerNet::load_checkpoint(&b)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(e.contains(&kk), "{k}: {e}");
+        }
+        for k in ["qat", "tie"] {
+            let kk = key(k);
+            let b = crate::ckpt::rewrite(&bytes, |m| drop(m.remove(&kk)), None);
+            assert!(TransformerNet::load_checkpoint(&b).is_err(), "{k}");
+            let b = crate::ckpt::rewrite(
+                &bytes,
+                |m| {
+                    m.insert(kk.clone(), MetaValue::U32(1));
+                },
+                None,
+            );
+            assert!(TransformerNet::load_checkpoint(&b).is_err(), "{k} type");
+        }
+        // Header says a different shape than the tensors hold.
+        let b = crate::ckpt::rewrite(
+            &bytes,
+            |m| {
+                m.insert(key("embed"), MetaValue::U32(16));
+            },
+            None,
+        );
+        let e = TransformerNet::load_checkpoint(&b)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("expected"), "{e}");
+        // Invalid architecture numbers are rejected by the constructor.
+        for (k, v) in [("vocab", 0), ("heads", 3)] {
+            let b = crate::ckpt::rewrite(
+                &bytes,
+                |m| {
+                    m.insert(key(k), MetaValue::U32(v));
+                },
+                None,
+            );
+            assert!(TransformerNet::load_checkpoint(&b).is_err(), "{k}");
+        }
+        // A dropped moment tensor is a clear error, never zero-filled.
+        let b = crate::ckpt::rewrite(&bytes, |_| {}, Some("p3.v"));
+        let e = TransformerNet::load_checkpoint(&b)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("missing tensor 'p3.v'"), "{e}");
     }
 
     // ─────────────────────────────────────────────────────────────────────────

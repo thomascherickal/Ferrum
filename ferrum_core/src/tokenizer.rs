@@ -14,6 +14,8 @@
 //! assert_eq!(tok.decode(&ids), "lowest");
 //! ```
 use crate::error::{InferError, Result};
+use crate::gguf::{Gguf, MetaValue};
+use crate::gguf_write::GgufBuilder;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 
@@ -559,6 +561,90 @@ impl ByteBpeTokenizer {
             }
         }
         tok.rebuild_ranks();
+        Ok(tok)
+    }
+
+    /// The reusable tokenizer file: a vocab-only GGUF (`ferrum-tokenizer`) whose
+    /// `tokenizer.ggml.{model,tokens,merges,token_type}` arrays are also a valid
+    /// llama.cpp vocab, plus `tokenizer.ferrum.state` = [`encode_state`](Self::encode_state)
+    /// as the lossless source of truth.
+    pub fn to_gguf_bytes(&self) -> Vec<u8> {
+        let strings =
+            |v: Vec<String>| MetaValue::Array(v.into_iter().map(MetaValue::String).collect());
+        let types = self.gguf_token_types().into_iter().map(MetaValue::I32);
+        let mut b = GgufBuilder::new();
+        b.meta(
+            "general.architecture",
+            MetaValue::String("ferrum-tokenizer".into()),
+        )
+        .meta("tokenizer.ggml.model", MetaValue::String("gpt2".into()))
+        .meta("tokenizer.ggml.tokens", strings(self.gguf_tokens()))
+        .meta("tokenizer.ggml.merges", strings(self.gguf_merges()))
+        .meta(
+            "tokenizer.ggml.token_type",
+            MetaValue::Array(types.collect()),
+        )
+        .meta(
+            "tokenizer.ferrum.state",
+            MetaValue::String(self.encode_state()),
+        );
+        b.into_bytes()
+    }
+
+    /// Read a [`to_gguf_bytes`](Self::to_gguf_bytes) file. The state string is
+    /// authoritative and is cross-checked against the vocab arrays; a file
+    /// without it is rebuilt from the arrays alone. The pre-GGUF text form is
+    /// rejected with a pointed error.
+    pub fn from_gguf_bytes(bytes: &[u8]) -> Result<Self> {
+        let bad = |m: String| InferError::Format(m);
+        if !bytes.starts_with(b"GGUF") {
+            return Err(bad(
+                "old tokenizer file (pre-GGUF); delete it to retrain the tokenizer".into(),
+            ));
+        }
+        let g = Gguf::parse(bytes.to_vec())?;
+        if g.architecture() != Some("ferrum-tokenizer") {
+            return Err(bad(format!(
+                "not a ferrum-tokenizer file (general.architecture = {:?})",
+                g.architecture()
+            )));
+        }
+        let array = |key: &str| match g.meta(key) {
+            Some(MetaValue::Array(a)) => Ok(a),
+            _ => Err(bad(format!(
+                "tokenizer file key '{key}' missing or not an array"
+            ))),
+        };
+        let strings = |key: &str| -> Result<Vec<String>> {
+            array(key)?
+                .iter()
+                .map(|v| v.as_str().map(str::to_string))
+                .collect::<Option<_>>()
+                .ok_or_else(|| bad(format!("tokenizer file key '{key}' is not a string array")))
+        };
+        let tokens = strings("tokenizer.ggml.tokens")?;
+        let merges = strings("tokenizer.ggml.merges")?;
+        let types: Vec<i32> = array("tokenizer.ggml.token_type")?
+            .iter()
+            .map(|v| match v {
+                MetaValue::I32(x) => Some(*x),
+                _ => None,
+            })
+            .collect::<Option<_>>()
+            .ok_or_else(|| bad("tokenizer file token_type is not an i32 array".into()))?;
+        let Some(state) = g.meta("tokenizer.ferrum.state").and_then(MetaValue::as_str) else {
+            return Self::from_gguf_vocab(&tokens, &merges, &types);
+        };
+        let tok = Self::from_state(state)?;
+        if tok.gguf_tokens() != tokens
+            || tok.gguf_merges() != merges
+            || tok.gguf_token_types() != types
+        {
+            return Err(bad(
+                "tokenizer file is corrupt: tokenizer.ferrum.state and the tokenizer.ggml.* arrays disagree"
+                    .into(),
+            ));
+        }
         Ok(tok)
     }
 
@@ -1336,5 +1422,162 @@ mod tests {
         assert!(mg.iter().any(|m| m.starts_with('Ġ')), "{mg:?}");
         let back = ByteBpeTokenizer::from_gguf_vocab(&tk, &mg, &ty).unwrap();
         assert_eq!(back.encode(" the the"), t.encode(" the the"));
+    }
+    fn trained_tok() -> ByteBpeTokenizer {
+        let mut tok = ByteBpeTokenizer::train("low lower lowest low low", 300).unwrap();
+        tok.add_special_token(TOK_EOS).unwrap();
+        tok
+    }
+
+    #[test]
+    fn tokenizer_file_is_gguf_and_roundtrips() {
+        let tok = trained_tok();
+        let b = tok.to_gguf_bytes();
+        assert_eq!(&b[..4], b"GGUF");
+        let back = ByteBpeTokenizer::from_gguf_bytes(&b).unwrap();
+        assert_eq!(back.encode_state(), tok.encode_state());
+        assert_eq!(back.gguf_tokens(), tok.gguf_tokens());
+        assert!(ByteBpeTokenizer::from_gguf_bytes(b"256;257").is_err());
+        let g = crate::gguf::Gguf::parse(b).unwrap();
+        assert_eq!(g.architecture(), Some("ferrum-tokenizer"));
+        assert_eq!(
+            g.meta("tokenizer.ggml.model").and_then(|v| v.as_str()),
+            Some("gpt2")
+        );
+        for k in ["tokens", "merges", "token_type"] {
+            assert!(g.meta(&format!("tokenizer.ggml.{k}")).is_some(), "{k}");
+        }
+        assert_eq!(
+            g.meta("tokenizer.ferrum.state").and_then(|v| v.as_str()),
+            Some(tok.encode_state().as_str())
+        );
+    }
+
+    #[test]
+    fn tokenizer_file_roundtrips_byte_level_and_no_specials() {
+        for tok in [
+            ByteBpeTokenizer::byte_level(),
+            ByteBpeTokenizer::train("low lower lowest low low", 300).unwrap(),
+        ] {
+            let back = ByteBpeTokenizer::from_gguf_bytes(&tok.to_gguf_bytes()).unwrap();
+            assert_eq!(back.encode_state(), tok.encode_state());
+            assert_eq!(back.encode("low lowest"), tok.encode("low lowest"));
+        }
+    }
+
+    #[test]
+    fn tokenizer_file_old_text_form_is_a_clear_error() {
+        let old = trained_tok().encode_state();
+        for bytes in [old.as_bytes(), b"", b"256;257"] {
+            let e = ByteBpeTokenizer::from_gguf_bytes(bytes)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(e.contains("old tokenizer file (pre-GGUF)"), "{e}");
+            assert!(e.contains("delete it to retrain the tokenizer"), "{e}");
+        }
+    }
+
+    #[test]
+    fn tokenizer_file_rejects_truncation_wrong_architecture_and_bad_state() {
+        use crate::gguf::MetaValue;
+        let b = trained_tok().to_gguf_bytes();
+        assert!(ByteBpeTokenizer::from_gguf_bytes(&b[..b.len() / 2]).is_err());
+        assert!(ByteBpeTokenizer::from_gguf_bytes(b"GGUF").is_err());
+        let set = |k: &str, v: MetaValue| {
+            let k = k.to_string();
+            crate::ckpt::rewrite(
+                &b,
+                move |m| {
+                    m.insert(k, v);
+                },
+                None,
+            )
+        };
+        let e = ByteBpeTokenizer::from_gguf_bytes(&set(
+            "general.architecture",
+            MetaValue::String("gpt2".into()),
+        ))
+        .err()
+        .unwrap();
+        assert!(e.to_string().contains("not a ferrum-tokenizer"), "{e}");
+        let mut no_arch = b.clone();
+        no_arch = crate::ckpt::rewrite(&no_arch, |m| drop(m.remove("general.architecture")), None);
+        assert!(ByteBpeTokenizer::from_gguf_bytes(&no_arch).is_err());
+        // A state string that does not parse.
+        let e = ByteBpeTokenizer::from_gguf_bytes(&set(
+            "tokenizer.ferrum.state",
+            MetaValue::String("not-a-pair".into()),
+        ));
+        assert!(e.is_err());
+        // A state that disagrees with the arrays (different merge count).
+        let other = ByteBpeTokenizer::train("abab abab abab", 270)
+            .unwrap()
+            .encode_state();
+        let e = ByteBpeTokenizer::from_gguf_bytes(&set(
+            "tokenizer.ferrum.state",
+            MetaValue::String(other),
+        ))
+        .err()
+        .unwrap();
+        assert!(e.to_string().contains("disagree"), "{e}");
+        // Arrays edited while the state is intact.
+        for key in ["tokens", "merges", "token_type"] {
+            let key = format!("tokenizer.ggml.{key}");
+            let bad = crate::ckpt::rewrite(
+                &b,
+                |m| {
+                    if let Some(MetaValue::Array(a)) = m.get_mut(&key) {
+                        a.pop();
+                    }
+                },
+                None,
+            );
+            let e = ByteBpeTokenizer::from_gguf_bytes(&bad).err().unwrap();
+            assert!(e.to_string().contains("disagree"), "{key}: {e}");
+        }
+        // Arrays removed or mistyped.
+        for key in ["tokens", "merges", "token_type"] {
+            let key = format!("tokenizer.ggml.{key}");
+            let gone = crate::ckpt::rewrite(&b, |m| drop(m.remove(&key)), None);
+            assert!(
+                ByteBpeTokenizer::from_gguf_bytes(&gone).is_err(),
+                "{key} gone"
+            );
+            let wrong = crate::ckpt::rewrite(
+                &b,
+                |m| {
+                    m.insert(key.clone(), MetaValue::Array(vec![MetaValue::U32(1)]));
+                },
+                None,
+            );
+            assert!(
+                ByteBpeTokenizer::from_gguf_bytes(&wrong).is_err(),
+                "{key} type"
+            );
+        }
+    }
+
+    #[test]
+    fn tokenizer_file_without_state_falls_back_to_the_arrays() {
+        let tok = trained_tok();
+        let b = crate::ckpt::rewrite(
+            &tok.to_gguf_bytes(),
+            |m| drop(m.remove("tokenizer.ferrum.state")),
+            None,
+        );
+        let back = ByteBpeTokenizer::from_gguf_bytes(&b).unwrap();
+        assert_eq!(back.encode_state(), tok.encode_state());
+        // Without state, broken arrays are rejected by the vocab parser.
+        let broken = crate::ckpt::rewrite(
+            &b,
+            |m| {
+                if let Some(crate::gguf::MetaValue::Array(a)) = m.get_mut("tokenizer.ggml.merges") {
+                    a[0] = crate::gguf::MetaValue::String("zz zz".into());
+                }
+            },
+            None,
+        );
+        assert!(ByteBpeTokenizer::from_gguf_bytes(&broken).is_err());
     }
 }

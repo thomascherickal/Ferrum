@@ -474,7 +474,7 @@ train_transformer run   <corpus.txt> <model.bin> <seed text> [options]   # train
   same context window, handle any language, and usually win on real text. Start
   with 512–4096. Larger vocabularies need more data to learn. Values from 1 to
   255 are rejected because the 256-byte base is irreducible.
-- **Train once, reuse.** `--tokenizer tok.bpe` writes the learned merge list on
+- **Train once, reuse.** `--tokenizer tok.gguf` writes the learned merge list on
   the first run and loads it on every later run, so tokenizer training is
   skipped and the vocabulary stays stable across experiments and resumes. The
   trainer counts each distinct word once and updates pair counts
@@ -533,7 +533,7 @@ replaying the exact remaining batches.
 ```bash
 train_transformer train big.txt model.bin --context 128 --embed 128 --heads 4 --blocks 4 \
     --hidden 512 --vocab 2048 --lr 0.003 --tokens 5e7 --cosine --warmup 200 --clip 1 --tie \
-    --tokenizer tok.bpe --checkpoint run.fckp --checkpoint-every 500
+    --tokenizer tok.gguf --checkpoint run.fckp --checkpoint-every 500
 # …power cut at step 9,000…
 train_transformer train big.txt model.bin <same flags> --resume run.fckp
 ```

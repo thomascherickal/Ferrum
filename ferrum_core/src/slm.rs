@@ -1700,13 +1700,13 @@ fn tokenize_for_lm_cfg(corpus: &str, cfg: &TransformerConfig) -> Result<LmTokens
     }
     let tok = if path.exists() {
         vprintln!("[slm::tokenize] reusing tokenizer {}", path.display());
-        ByteBpeTokenizer::from_state(&std::fs::read_to_string(path)?)?
+        ByteBpeTokenizer::from_gguf_bytes(&std::fs::read(path)?)?
     } else {
         let tok = ByteBpeTokenizer::train_with_docs(corpus, cfg.vocab_size)?;
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, tok.encode_state())?;
+        std::fs::write(path, tok.to_gguf_bytes())?;
         tok
     };
     lm_tokens_from_bpe(&tok, corpus, cfg.context_len)
@@ -2951,7 +2951,7 @@ mod tests {
     fn tokenizer_path_is_created_then_reused_and_short_corpus_errors() {
         let dir = std::env::temp_dir().join(format!("ferrum_tokpath_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("nested").join("tok.txt");
+        let path = dir.join("nested").join("tok.gguf");
         let corpus = "the cat sat.<|endoftext|>the dog ran.<|endoftext|>".repeat(30);
         let cfg = TransformerConfig {
             context_len: 8,
@@ -2965,9 +2965,24 @@ mod tests {
         let again = tokenize_for_lm_cfg(&corpus, &cfg).unwrap();
         assert_eq!(first.tokens, again.tokens);
         assert_eq!(first.tokenizer_state, again.tokenizer_state);
-        // A bare file name has no parent component to create.
+        // The saved file is a GGUF container, not the old text form.
+        assert_eq!(&std::fs::read(&path).unwrap()[..4], b"GGUF");
+        // An old text-form tokenizer file is a clear error, not silent retraining.
+        let old = dir.join("old.gguf");
+        std::fs::write(&old, "256,257;258,259").unwrap();
+        let old_cfg = TransformerConfig {
+            tokenizer_path: old.to_str().unwrap().into(),
+            ..cfg.clone()
+        };
+        let err = match tokenize_for_lm_cfg(&corpus, &old_cfg) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("old text tokenizer must be rejected"),
+        };
+        assert!(err.contains("old tokenizer file (pre-GGUF)"), "{err}");
+        assert_eq!(std::fs::read(&old).unwrap(), b"256,257;258,259"); // untouched
+                                                                      // A bare file name has no parent component to create.
         let bare_cfg = TransformerConfig {
-            tokenizer_path: dir.join("bare.txt").to_str().unwrap().into(),
+            tokenizer_path: dir.join("bare.gguf").to_str().unwrap().into(),
             ..cfg.clone()
         };
         assert!(tokenize_for_lm_cfg(&corpus, &bare_cfg).is_ok());

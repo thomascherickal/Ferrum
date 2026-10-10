@@ -35,6 +35,7 @@
 //! that stays bounded by compute and RAM (see Manual.md §13.5). It adds
 //! the missing capability (gradients + a real optimizer), not a claim about scale.
 
+use crate::ckpt;
 use crate::error::{InferError, Result};
 use crate::layer::Linear;
 use crate::llm::{Attention, FeedForward, LlamaBlock, LlamaConfig, LlamaModel, RopeType};
@@ -1382,32 +1383,39 @@ impl LlamaTrainer {
     /// both Adam moments. Pair with [`LlamaTrainer::load_checkpoint_into`] on a
     /// freshly-loaded base model of the same shape to resume exactly.
     pub fn save_checkpoint(&self, rng: &Rng) -> Vec<u8> {
-        let c = &self.model.cfg;
-        let mut out = Vec::new();
-        out.extend_from_slice(b"FLCK");
-        out.extend_from_slice(&1u32.to_le_bytes());
-        for v in [
-            c.vocab_size,
-            c.model_dim,
-            c.n_layers,
-            c.n_heads,
-            c.n_kv_heads,
-            c.head_dim,
-            c.ffn_dim,
-        ] {
-            out.extend_from_slice(&(v as u32).to_le_bytes());
+        let mut b = ckpt::begin("ferrum-llama-checkpoint");
+        for (k, v) in self.shape_keys() {
+            ckpt::put_u32(&mut b, k, v);
         }
-        out.push(self.qat as u8);
-        out.extend_from_slice(&self.step_t.to_le_bytes());
-        out.extend_from_slice(&rng.state().to_le_bytes());
-        for flat in [self.model_flat(), self.m.to_flat(), self.v.to_flat()] {
-            for &x in &flat {
-                out.extend_from_slice(&x.to_le_bytes());
-            }
+        ckpt::put_bool(&mut b, "qat", self.qat);
+        ckpt::put_u64(&mut b, "step", self.step_t);
+        ckpt::put_u64(&mut b, "rng", rng.state());
+        let (data, m, v) = (
+            param_data_ref(&self.model),
+            self.m.slices(),
+            self.v.slices(),
+        );
+        for (i, ((d, m), v)) in data.into_iter().zip(m).zip(v).enumerate() {
+            ckpt::put_param(&mut b, i, d, m, v);
         }
-        out
+        b.into_bytes()
     }
 
+    /// The model shape recorded in (and checked against) a checkpoint.
+    fn shape_keys(&self) -> [(&'static str, usize); 7] {
+        let c = &self.model.cfg;
+        [
+            ("vocab", c.vocab_size),
+            ("model_dim", c.model_dim),
+            ("layers", c.n_layers),
+            ("heads", c.n_heads),
+            ("kv_heads", c.n_kv_heads),
+            ("head_dim", c.head_dim),
+            ("ffn", c.ffn_dim),
+        ]
+    }
+
+    #[cfg(test)]
     fn model_flat(&self) -> Vec<f32> {
         let mut out = Vec::new();
         for s in param_data_ref(&self.model) {
@@ -1418,95 +1426,45 @@ impl LlamaTrainer {
 
     /// Restore weights, Adam moments, step counter, QAT flag, and RNG state from
     /// [`LlamaTrainer::save_checkpoint`] bytes into `self` (which must already
-    /// hold a model of the matching shape). Returns the restored RNG.
+    /// hold a model of the matching shape). Returns the restored RNG. Nothing is
+    /// modified unless the whole checkpoint validates.
     pub fn load_checkpoint_into(&mut self, bytes: &[u8]) -> Result<Rng> {
-        let mut cur = Cur { b: bytes, pos: 0 };
-        if cur.take(4)? != b"FLCK" {
-            return Err(InferError::Format("bad checkpoint magic".into()));
-        }
-        if cur.u32()? != 1 {
-            return Err(InferError::Format("unsupported checkpoint version".into()));
-        }
-        let c = &self.model.cfg;
-        let want = [
-            c.vocab_size,
-            c.model_dim,
-            c.n_layers,
-            c.n_heads,
-            c.n_kv_heads,
-            c.head_dim,
-            c.ffn_dim,
-        ];
-        for &w in &want {
-            if cur.u32()? as usize != w {
+        let g = ckpt::open(bytes, b"FLCK", "ferrum-llama-checkpoint")?;
+        for (k, want) in self.shape_keys() {
+            if ckpt::get_usize(&g, k)? != want {
                 return Err(InferError::Format(
                     "checkpoint shape does not match this model".into(),
                 ));
             }
         }
-        self.qat = cur.u8()? != 0;
-        self.step_t = cur.u64()?;
-        let rng_state = cur.u64()?;
+        let qat = ckpt::get_bool(&g, "qat")?;
+        let step_t = ckpt::get_u64(&g, "step")?;
+        let rng_state = ckpt::get_u64(&g, "rng")?;
 
-        // Weights, then m, then v — same canonical order as the save.
-        let total: usize = self.num_params();
-        let mut wflat = vec![0.0f32; total];
-        cur.fill_f32(&mut wflat)?;
-        {
-            let mut off = 0usize;
-            for s in param_data_mut(&mut self.model) {
-                let n = s.len();
-                s.copy_from_slice(&wflat[off..off + n]);
-                off += n;
+        let lens: Vec<usize> = param_data_ref(&self.model)
+            .iter()
+            .map(|s| s.len())
+            .collect();
+        let read = |suffix: &str| -> Result<Vec<f32>> {
+            let mut flat = Vec::with_capacity(self.num_params());
+            for (i, &n) in lens.iter().enumerate() {
+                flat.extend(ckpt::get_f32(&g, &format!("p{i}.{suffix}"), n)?);
             }
+            Ok(flat)
+        };
+        let (wflat, mflat, vflat) = (read("data")?, read("m")?, read("v")?);
+
+        self.qat = qat;
+        self.step_t = step_t;
+        let mut off = 0usize;
+        for s in param_data_mut(&mut self.model) {
+            let n = s.len();
+            s.copy_from_slice(&wflat[off..off + n]);
+            off += n;
         }
-        let mut mflat = vec![0.0f32; total];
-        cur.fill_f32(&mut mflat)?;
         self.m.load_flat(&mflat);
-        let mut vflat = vec![0.0f32; total];
-        cur.fill_f32(&mut vflat)?;
         self.v.load_flat(&vflat);
-
         Ok(Rng::from_state(rng_state))
-    }
-}
-
-/// Minimal little-endian byte cursor for checkpoint deserialization.
-struct Cur<'a> {
-    b: &'a [u8],
-    pos: usize,
-}
-impl Cur<'_> {
-    fn take(&mut self, n: usize) -> Result<&[u8]> {
-        let end = self.pos.checked_add(n).filter(|&e| e <= self.b.len());
-        match end {
-            Some(end) => {
-                let s = &self.b[self.pos..end];
-                self.pos = end;
-                Ok(s)
-            }
-            None => Err(InferError::Format("checkpoint truncated".into())),
-        }
-    }
-    fn u32(&mut self) -> Result<u32> {
-        let b = self.take(4)?;
-        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-    }
-    fn u64(&mut self) -> Result<u64> {
-        let b = self.take(8)?;
-        Ok(u64::from_le_bytes([
-            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-        ]))
-    }
-    fn u8(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
-    }
-    fn fill_f32(&mut self, dst: &mut [f32]) -> Result<()> {
-        let raw = self.take(dst.len() * 4)?;
-        for (d, c) in dst.iter_mut().zip(raw.chunks_exact(4)) {
-            *d = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-        }
-        Ok(())
     }
 }
 
@@ -2045,6 +2003,121 @@ mod tests {
         for (x, y) in a.model_flat().iter().zip(&c.model_flat()) {
             assert!((x - y).abs() < 1e-5, "resumed run diverged: {x} vs {y}");
         }
+    }
+
+    fn trained_trainer(qat: bool) -> (LlamaTrainer, Rng) {
+        let mut t = LlamaTrainer::new(tiny(6, 8, 2, 2, 16, 2)).unwrap();
+        t.set_lr(0.02);
+        t.set_qat(qat);
+        let tokens: Vec<usize> = (0..100).map(|i| (i * 7) % 6).collect();
+        let mut rng = Rng::new(77);
+        t.finetune_epoch(&tokens, 6, 16, &mut rng).unwrap();
+        (t, rng)
+    }
+
+    #[test]
+    fn checkpoint_is_gguf_and_roundtrips_every_field_bit_exactly() {
+        for qat in [false, true] {
+            let (t, rng) = trained_trainer(qat);
+            let bytes = t.save_checkpoint(&rng);
+            assert_eq!(&bytes[..4], b"GGUF");
+            let g = crate::gguf::Gguf::parse(bytes.clone()).unwrap();
+            assert_eq!(g.architecture(), Some("ferrum-llama-checkpoint"));
+            let mut u = LlamaTrainer::new(tiny(6, 8, 2, 2, 16, 2)).unwrap();
+            let rng2 = u.load_checkpoint_into(&bytes).unwrap();
+            assert_eq!(rng2.state(), rng.state());
+            assert_eq!(u.qat_enabled(), qat);
+            assert_eq!(u.step_count(), t.step_count());
+            assert!(u.step_count() > 0);
+            let bits = |v: Vec<f32>| v.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+            assert_eq!(bits(u.model_flat()), bits(t.model_flat()));
+            assert_eq!(bits(u.m.to_flat()), bits(t.m.to_flat()));
+            assert_eq!(bits(u.v.to_flat()), bits(t.v.to_flat()));
+            assert!(t.m.to_flat().iter().any(|&x| x != 0.0), "moments exercised");
+            assert_eq!(u.save_checkpoint(&rng2), bytes);
+        }
+    }
+
+    #[test]
+    fn old_checkpoint_magic_is_a_clear_error() {
+        let mut tr = LlamaTrainer::new(tiny(6, 8, 2, 2, 16, 1)).unwrap();
+        let err = tr
+            .load_checkpoint_into(b"FLCK\x01\x00\x00\x00")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("pre-GGUF checkpoint (FLCK)"), "{err}");
+        assert!(err.contains("retrain or start a new checkpoint"), "{err}");
+    }
+
+    #[test]
+    fn checkpoint_rejects_wrong_architecture_truncation_and_tampering() {
+        use crate::gguf::MetaValue;
+        let (t, rng) = trained_trainer(true);
+        let bytes = t.save_checkpoint(&rng);
+        let mut fresh = LlamaTrainer::new(tiny(6, 8, 2, 2, 16, 2)).unwrap();
+        for cut in [0, 4, 100, bytes.len() / 2, bytes.len() - 1] {
+            assert!(
+                fresh.load_checkpoint_into(&bytes[..cut]).is_err(),
+                "cut {cut}"
+            );
+        }
+        // A TransformerNet checkpoint is not a Llama checkpoint.
+        let mut r = Rng::new(1);
+        let net = crate::train_transformer::TransformerNet::new(6, 4, 8, 2, 16, 1, &mut r).unwrap();
+        let e = fresh
+            .load_checkpoint_into(&net.save_checkpoint(&r))
+            .err()
+            .unwrap();
+        assert!(
+            e.to_string().contains("not a ferrum-llama-checkpoint"),
+            "{e}"
+        );
+        let key = |k: &str| format!("ferrum.ckpt.{k}");
+        for k in [
+            "vocab",
+            "model_dim",
+            "layers",
+            "heads",
+            "kv_heads",
+            "head_dim",
+            "ffn",
+            "step",
+            "rng",
+            "qat",
+        ] {
+            let kk = key(k);
+            let b = crate::ckpt::rewrite(&bytes, |m| drop(m.remove(&kk)), None);
+            let e = fresh.load_checkpoint_into(&b).err().unwrap().to_string();
+            assert!(e.contains(&kk), "{k}: {e}");
+        }
+        // Every shape key is cross-checked against the model it loads into.
+        for k in [
+            "vocab",
+            "model_dim",
+            "layers",
+            "heads",
+            "kv_heads",
+            "head_dim",
+            "ffn",
+        ] {
+            let b = crate::ckpt::rewrite(
+                &bytes,
+                |m| {
+                    m.insert(key(k), MetaValue::U32(99));
+                },
+                None,
+            );
+            let e = fresh.load_checkpoint_into(&b).err().unwrap().to_string();
+            assert!(e.contains("does not match this model"), "{k}: {e}");
+        }
+        // Tensors that disagree with the model's parameter sizes.
+        let b = crate::ckpt::rewrite(&bytes, |_| {}, Some("p2.m"));
+        let e = fresh.load_checkpoint_into(&b).err().unwrap().to_string();
+        assert!(e.contains("missing tensor 'p2.m'"), "{e}");
+        // A failed load leaves the target trainer untouched.
+        assert_eq!(fresh.step_count(), 0);
+        assert!(!fresh.qat_enabled());
     }
 
     #[test]

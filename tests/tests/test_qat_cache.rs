@@ -1,7 +1,7 @@
 //! Integration tests for int8 QAT training, quantized save/load, and the
 //! train-once / load-from-disk weight cache.
 
-use ferrum_core::{GenerativeSLM, Rng, TaskType, TransformerConfig};
+use ferrum_core::{ByteBpeTokenizer, GenerativeSLM, Rng, TaskType, TransformerConfig};
 
 const CORPUS: &str = "the quick brown fox jumps over the lazy dog. \
 the quick brown fox jumps over the lazy dog. \
@@ -430,7 +430,11 @@ fn tokenizer_file_is_written_once_then_reused() {
     };
     let a = GenerativeSLM::train_transformer_config(BPE_CORPUS, &cfg, &mut Rng::new(5), |_, _| {})
         .unwrap();
-    let saved = std::fs::read_to_string(&tok).unwrap();
+    let saved = std::fs::read(&tok).unwrap();
+    assert_eq!(&saved[..4], b"GGUF", "tokenizer file is a GGUF container");
+    let saved = ByteBpeTokenizer::from_gguf_bytes(&saved)
+        .unwrap()
+        .encode_state();
     assert_eq!(saved, a.meta.tokenizer_state);
 
     // Second run on different text reuses the saved merges instead of retraining.

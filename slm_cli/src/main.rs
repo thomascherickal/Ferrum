@@ -399,9 +399,9 @@ fn print_usage() {
          \x20 --tokens N   (token budget, e.g. 5e7; overrides --epochs)\n\
          \x20 --cosine  --warmup N   (warmup + cosine LR decay)   --clip F (grad clip)\n\
          \x20 --tie   (tie LM head to embedding)   --no-qat   (plain fp32 training)\n\
-         \x20 --tokenizer tok.bpe  (reuse this BPE tokenizer; trained + saved if missing)\n\
-         \x20 --checkpoint ck.fckp  --checkpoint-every N   (save training state)\n\
-         \x20 --resume ck.fckp      (continue an interrupted run from its checkpoint)\n\
+         \x20 --tokenizer tok.gguf  (reuse this BPE tokenizer GGUF; trained + saved if missing)\n\
+         \x20 --checkpoint ck.fckp  --checkpoint-every N   (save a GGUF checkpoint: weights + optimizer state)\n\
+         \x20 --resume ck.fckp      (continue from a GGUF checkpoint)\n\
          \x20 --val F  --patience N (hold out fraction F; keep best epoch; early stop)\n\
          \x20 --threads N  --force    --sample   --verbose|-v\n\
          \x20 (--vocab 0 = character-level; >=256 = byte-level BPE, default 512)\n\
@@ -435,7 +435,7 @@ fn print_usage() {
          \x20 train_transformer train corpus.txt model.gguf --epochs 20\n\
          \x20 train_transformer train big.txt model.gguf --context 128 --embed 128 --heads 4\n\
          \x20     --blocks 4 --hidden 512 --lr 0.003 --tokens 5e7 --cosine --warmup 200\n\
-         \x20     --clip 1 --tie --tokenizer tok.bpe --checkpoint run.fckp --checkpoint-every 500\n\
+         \x20     --clip 1 --tie --tokenizer tok.gguf --checkpoint run.fckp --checkpoint-every 500\n\
          \x20 train_transformer run   corpus.txt model.gguf \"Once upon a time\" --chars 300\n\
          \x20 train_transformer generate model.gguf \"Once upon a time\" --temp 0.7"
     );

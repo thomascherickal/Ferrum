@@ -120,7 +120,7 @@ embedded, or air-gapped builds.
 train_transformer train corpus.txt model.bin \
     --context 128 --embed 128 --heads 4 --blocks 4 --hidden 512 \
     --vocab 2048 --lr 0.003 --tokens 5e7 --cosine --warmup 200 --clip 1 --tie \
-    --tokenizer tok.bpe --checkpoint run.fckp --checkpoint-every 500 --val 0.05
+    --tokenizer tok.gguf --checkpoint run.fckp --checkpoint-every 500 --val 0.05
 
 # Interrupted? Pick up exactly where the checkpoint left off.
 train_transformer train corpus.txt model.bin ...same flags... --resume run.fckp

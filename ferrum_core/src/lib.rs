@@ -54,6 +54,7 @@ pub mod verbose;
 
 pub mod activation;
 pub mod chat_format;
+mod ckpt;
 pub mod dataset;
 pub mod error;
 pub mod gguf;
