@@ -181,12 +181,18 @@ pub fn export_ollama(model: &Path, name: &str, bin: Option<&str>) -> Result<(), 
     ))
 }
 
-/// First `"key":"value"` string value in `obj`.
+/// First `"key": "value"` string value in `obj` (whitespace after the colon is optional).
 fn json_str<'a>(obj: &'a str, key: &str) -> Option<&'a str> {
-    let pat = format!("\"{key}\":\"");
-    let start = obj.find(&pat)? + pat.len();
-    let len = obj[start..].find('"')?;
-    Some(&obj[start..start + len])
+    let pat = format!("\"{key}\":");
+    let rest = obj[obj.find(&pat)? + pat.len()..].trim_start();
+    let rest = rest.strip_prefix('"')?;
+    Some(&rest[..rest.find('"')?])
+}
+
+/// `path` ends with `suffix` on a `/` boundary (`xferrum/m` does not match `ferrum/m`).
+fn path_matches(path: &str, suffix: &str) -> bool {
+    path.strip_suffix(suffix)
+        .is_some_and(|head| head.is_empty() || head.ends_with('/'))
 }
 
 /// `modelKey` of the `lms ls --json` entry whose `path` ends with `suffix`.
@@ -216,7 +222,7 @@ fn model_key_for(json: &str, suffix: &str) -> Option<String> {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
                     let obj = &json[start..=i];
-                    if json_str(obj, "path").is_some_and(|p| p.ends_with(suffix)) {
+                    if json_str(obj, "path").is_some_and(|p| path_matches(p, suffix)) {
                         return json_str(obj, "modelKey").map(String::from);
                     }
                 }
@@ -552,6 +558,19 @@ mod tests {
             None,
             "match without a modelKey"
         );
+        // Pretty-printed JSON (space after the colon) and a non-boundary suffix.
+        let pretty = "[{\n \"modelKey\": \"p/k\",\n \"path\": \"pub/repo/f.gguf\"\n}]";
+        assert_eq!(model_key_for(pretty, "repo/f.gguf").as_deref(), Some("p/k"));
+        assert_eq!(
+            model_key_for(pretty, "po/f.gguf"),
+            None,
+            "not on a / boundary"
+        );
+        assert_eq!(
+            model_key_for(pretty, "pub/repo/f.gguf").as_deref(),
+            Some("p/k")
+        );
+        assert_eq!(model_key_for(r#"{"path": 5}"#, "x"), None);
         assert_eq!(model_key_for("", "x"), None);
         assert_eq!(model_key_for("[]", "x"), None);
         assert_eq!(model_key_for("} stray", "x"), None);

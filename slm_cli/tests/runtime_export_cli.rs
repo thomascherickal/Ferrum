@@ -2,14 +2,16 @@
 //!
 //! Tool-gated: a missing tool skips the test unless `FERRUM_REQUIRE_RUNTIMES=1`.
 //! Run with:
-//! `FERRUM_REQUIRE_RUNTIMES=1 cargo test -p slm_cli --release --test runtime_export_cli -- --nocapture --test-threads 1`
+//! `FERRUM_REQUIRE_RUNTIMES=1 cargo test -p slm_cli --release --test runtime_export_cli -- --nocapture`
+//! (tests that touch a runtime share one lock, so default parallel threads are fine).
 //!
 //! ponytail: the model under test is llama.cpp's GPT-2 124M Q8_0 GGUF until Ferrum's
 //! own GPT-2 GGUF writer (G1) merges; the 0.1M Ferrum-trained model fixture then replaces it.
+//! Override the model file with `FERRUM_TEST_GGUF=/path/to/gpt2.gguf`.
 
 mod common;
 
-use common::{require_or_skip, require_or_skip_with, tool};
+use common::{is_required, require_or_skip, require_or_skip_with, tool};
 use ferrum_core::{GgufBuilder, MetaValue};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -18,8 +20,16 @@ const DEV: &str = "/home/thomas/Projects/ferrum-cpu/.ferrum-dev";
 const PROMPT: &str = "Hello, my name is";
 const N: usize = 8;
 
+/// One lock for everything that touches Ollama, LM Studio or their ports.
+static RUNTIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    RUNTIME.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn gpt2() -> PathBuf {
-    let p = Path::new(DEV).join("gpt2gguf/gpt2-q8_0.gguf");
+    let p = std::env::var_os("FERRUM_TEST_GGUF")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(DEV).join("gpt2gguf/gpt2-q8_0.gguf"));
     assert!(p.is_file(), "missing test model {}", p.display());
     p
 }
@@ -148,17 +158,19 @@ impl Ollama {
             .stderr(Stdio::null())
             .spawn()
             .expect("ollama serve");
+        // Owning `me` before waiting means Drop kills the child if the port never answers.
+        let me = Self {
+            host,
+            bin,
+            child: Some(child),
+        };
         for _ in 0..100 {
-            if answers(&host) {
-                return Self {
-                    host,
-                    bin,
-                    child: Some(child),
-                };
+            if answers(&me.host) {
+                return me;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        panic!("ollama serve did not come up on {host}");
+        panic!("ollama serve did not come up on {}", me.host);
     }
     fn rm(&self, name: &str) {
         let _ = Command::new(&self.bin)
@@ -193,23 +205,32 @@ fn lms_tool() -> Option<PathBuf> {
 }
 
 /// A path with a space in it, pointing at the model.
-fn spaced_link(tag: &str) -> PathBuf {
+/// Removes its directory on drop.
+struct TmpDir(PathBuf);
+impl Drop for TmpDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn spaced_link(tag: &str) -> (TmpDir, PathBuf) {
     let dir = std::env::temp_dir().join(format!("ferrum e1 {tag} {}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    let guard = TmpDir(dir.clone());
     let link = dir.join("gpt2 q8.gguf");
-    let _ = std::fs::remove_file(&link);
     std::os::unix::fs::symlink(gpt2(), &link).unwrap();
-    link
+    (guard, link)
 }
 
 #[test]
 fn export_ollama_then_generate() {
+    let _serial = serial();
     let Some(bin) = ollama_tool() else { return };
     let Some(want) = llama_reference(&gpt2()) else {
         return;
     };
     let srv = Ollama::start(bin);
-    let model = spaced_link("gen");
+    let (_tmp, model) = spaced_link("gen");
     let _guard = OllamaModel(&srv, "ferrum-e1-gen");
     let (ok, text) = exporter(
         &["export-ollama", model.to_str().unwrap(), "ferrum-e1-gen"],
@@ -228,19 +249,44 @@ fn export_ollama_then_generate() {
     assert_eq!(got.trim_end(), want.trim_end()); // llama-completion appends newlines
 }
 
-struct LmStudioImport<'a>(&'a Path, &'a str);
+/// Cleans up only what this test did: the import under `~/.lmstudio/models/<repo>`,
+/// the identifier it loaded, and the server it started.
+struct LmStudioImport<'a> {
+    lms: &'a Path,
+    repo: &'a str,
+    loaded: Option<&'a str>,
+    server_started: bool,
+}
+impl<'a> LmStudioImport<'a> {
+    fn new(lms: &'a Path, repo: &'a str) -> Self {
+        Self {
+            lms,
+            repo,
+            loaded: None,
+            server_started: false,
+        }
+    }
+}
 impl Drop for LmStudioImport<'_> {
     fn drop(&mut self) {
-        let _ = Command::new(self.0).args(["unload", self.1]).output();
-        let _ = Command::new(self.0).args(["server", "stop"]).output();
+        if let Some(id) = self.loaded {
+            let _ = Command::new(self.lms).args(["unload", id]).output();
+        }
+        if self.server_started {
+            let _ = Command::new(self.lms).args(["server", "stop"]).output();
+        }
         let home = std::env::var("HOME").unwrap();
-        let _ =
-            std::fs::remove_dir_all(Path::new(&home).join(".lmstudio/models/ferrum-test/e1gen"));
+        let models = Path::new(&home).join(".lmstudio/models");
+        let _ = std::fs::remove_dir_all(models.join(self.repo));
+        if let Some((publisher, _)) = self.repo.split_once('/') {
+            let _ = std::fs::remove_dir(models.join(publisher)); // only if now empty
+        }
     }
 }
 
 #[test]
 fn export_lmstudio_then_generate() {
+    let _serial = serial();
     let Some(lms) = lms_tool() else { return };
     let Some(want) = llama_reference(&gpt2()) else {
         return;
@@ -256,7 +302,7 @@ fn export_lmstudio_then_generate() {
         &[],
     );
     let id = "ferrum-e1-gen";
-    let _guard = LmStudioImport(&lms, id);
+    let mut guard = LmStudioImport::new(&lms, "ferrum-test/e1gen");
     assert!(ok, "{text}");
     let key = text
         .split("modelKey '")
@@ -275,6 +321,11 @@ fn export_lmstudio_then_generate() {
         "{}",
         String::from_utf8_lossy(&load.stderr)
     );
+    guard.loaded = Some(id);
+    assert!(
+        !answers("127.0.0.1:1234"),
+        "port 1234 is already in use by a server this test did not start; stop it and rerun"
+    );
     let srv = Command::new(&lms)
         .args(["server", "start", "-p", "1234"])
         .output()
@@ -284,6 +335,7 @@ fn export_lmstudio_then_generate() {
         "{}",
         String::from_utf8_lossy(&srv.stderr)
     );
+    guard.server_started = true;
     let body = format!(
         r#"{{"model":"{id}","prompt":"{PROMPT}","max_tokens":{},"temperature":0,"repeat_penalty":1.0}}"#,
         N + 1
@@ -299,6 +351,7 @@ fn export_lmstudio_then_generate() {
 
 #[test]
 fn export_is_idempotent() {
+    let _serial = serial();
     if let Some(bin) = ollama_tool() {
         let srv = Ollama::start(bin);
         let _guard = OllamaModel(&srv, "ferrum-e1-idem");
@@ -312,7 +365,7 @@ fn export_is_idempotent() {
         }
     }
     if let Some(lms) = lms_tool() {
-        let _guard = LmStudioImport(&lms, "none");
+        let _guard = LmStudioImport::new(&lms, "ferrum-test/e1idem");
         let model = gpt2();
         for round in 0..2 {
             let (ok, text) = exporter(
@@ -320,7 +373,7 @@ fn export_is_idempotent() {
                     "export-lmstudio",
                     model.to_str().unwrap(),
                     "--repo",
-                    "ferrum-test/e1gen",
+                    "ferrum-test/e1idem",
                 ],
                 &[],
             );
@@ -331,6 +384,7 @@ fn export_is_idempotent() {
 
 #[test]
 fn ollama_down_gives_actionable_error() {
+    let _serial = serial();
     let Some(bin) = ollama_tool() else { return };
     let (ok, text) = exporter(
         &[
@@ -382,6 +436,7 @@ fn cli_refuses_non_runnable_gguf_and_writes_modelfile() {
     );
     let (ok, text) = exporter(&["export-ollama", "only-one-arg"], &[]);
     assert!(!ok && text.contains("usage:"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -397,14 +452,9 @@ fn require_runtimes_turns_skip_into_failure() {
         r.is_err(),
         "a missing tool must fail when FERRUM_REQUIRE_RUNTIMES=1"
     );
-    // The env-reading wrapper and the finder.
+    // The env-var reader (pure, so no process-wide env mutation) and the finder.
+    assert!(is_required(Some("1")));
+    assert!(!is_required(Some("0")) && !is_required(Some("")) && !is_required(None));
     assert!(tool("FERRUM_NO_SUCH_ENV", "no-such-tool-xyz", "nowhere").is_err());
     assert!(tool("FERRUM_NO_SUCH_ENV", "sh", "nowhere").is_ok());
-    let missing = std::panic::catch_unwind(|| {
-        std::env::set_var("FERRUM_REQUIRE_RUNTIMES", "1");
-        require_or_skip(Err::<u8, _>("gone".into()))
-    });
-    std::env::remove_var("FERRUM_REQUIRE_RUNTIMES");
-    assert!(missing.is_err());
-    assert_eq!(require_or_skip(Err::<u8, _>("gone".into())), None);
 }

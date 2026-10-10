@@ -18,8 +18,13 @@ pub fn require_or_skip_with<T>(tool: Result<T, String>, require: bool) -> Option
 /// `Some(tool)` when found. When missing: print `skip: …` and return `None`,
 /// or panic if `FERRUM_REQUIRE_RUNTIMES=1`.
 pub fn require_or_skip<T>(tool: Result<T, String>) -> Option<T> {
-    let require = std::env::var("FERRUM_REQUIRE_RUNTIMES").is_ok_and(|v| v == "1");
-    require_or_skip_with(tool, require)
+    let v = std::env::var("FERRUM_REQUIRE_RUNTIMES").ok();
+    require_or_skip_with(tool, is_required(v.as_deref()))
+}
+
+/// Whether the value of `FERRUM_REQUIRE_RUNTIMES` turns a skip into a failure.
+pub fn is_required(v: Option<&str>) -> bool {
+    v == Some("1")
 }
 
 /// Locate a tool: `$env`, then `PATH`, then `~/<home_rel>`.
