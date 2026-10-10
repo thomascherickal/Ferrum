@@ -6,7 +6,7 @@ use std::str::FromStr;
 
 pub const USAGE: &str =
     "usage: ferrum-serve --model <model.gguf> [--host 127.0.0.1] [--port 8080] \
-[--max-batch 64] [--max-chars 65536] [--max-body 8388608]";
+[--max-batch 64] [--max-chars 65536] [--max-body 8388608] [--max-tokens 4096] [--help]";
 
 const KNOWN: &[&str] = &[
     "--model",
@@ -15,6 +15,7 @@ const KNOWN: &[&str] = &[
     "--max-batch",
     "--max-chars",
     "--max-body",
+    "--max-tokens",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,39 +30,68 @@ fn parse_value<T: FromStr>(name: &str, v: &str) -> Result<T, String> {
     v.parse().map_err(|_| format!("{name}: cannot parse '{v}'"))
 }
 
-/// Parse `--flag value` pairs (program name already stripped).
-pub fn parse_args(args: &[String]) -> Result<Config, String> {
+/// What the command line asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Parsed {
+    Help,
+    Run(Config),
+}
+
+/// Parse `--flag value` pairs (program name already stripped). A flag given
+/// twice takes its last value. `--help`/`-h` anywhere in flag position wins.
+pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut model = String::new();
     let mut host = "127.0.0.1".to_string();
     let mut port = 8080u16;
     let mut limits = Limits::default();
     let mut it = args.iter();
     while let Some(name) = it.next() {
+        if name == "--help" || name == "-h" {
+            return Ok(Parsed::Help);
+        }
         if !name.starts_with("--") {
             return Err(format!("unexpected argument '{name}'"));
         }
         if !KNOWN.contains(&name.as_str()) {
             return Err(format!("unknown flag {name} (valid: {})", KNOWN.join(" ")));
         }
-        let v = it.next().ok_or(format!("{name} needs a value"))?;
+        let v = it
+            .next()
+            .filter(|v| !v.starts_with("--"))
+            .ok_or(format!("{name} needs a value"))?;
         match name.as_str() {
             "--model" => model = v.clone(),
             "--host" => host = v.clone(),
             "--port" => port = parse_value(name, v)?,
             "--max-batch" => limits.max_batch = parse_value(name, v)?,
             "--max-chars" => limits.max_chars = parse_value(name, v)?,
-            _ => limits.max_body = parse_value(name, v)?,
+            "--max-body" => limits.max_body = parse_value(name, v)?,
+            _ => limits.max_tokens = parse_value(name, v)?,
         }
     }
     if model.is_empty() {
         return Err(USAGE.into());
     }
-    Ok(Config {
+    Ok(Parsed::Run(Config {
         model,
         host,
         port,
         limits,
-    })
+    }))
+}
+
+/// Entry point behind `main`: parse `args`, print usage for `--help`, else serve.
+pub async fn start(
+    args: &[String],
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), String> {
+    match parse_args(args)? {
+        Parsed::Help => {
+            println!("{USAGE}");
+            Ok(())
+        }
+        Parsed::Run(cfg) => run(cfg, shutdown).await,
+    }
 }
 
 /// Load the model, bind, and serve until `shutdown` resolves.
@@ -92,6 +122,14 @@ pub async fn run(
 mod tests {
     use super::*;
     use ferrum_core::{GenerativeSLM, Rng, TransformerConfig};
+
+    /// Config-returning view of the real `parse_args` (`--help` becomes Err("help")).
+    fn parse_args(args: &[String]) -> Result<Config, String> {
+        match super::parse_args(args)? {
+            Parsed::Run(c) => Ok(c),
+            Parsed::Help => Err("help".into()),
+        }
+    }
 
     fn a(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
@@ -126,6 +164,8 @@ mod tests {
             "3",
             "--max-body",
             "4",
+            "--max-tokens",
+            "5",
         ]))
         .unwrap();
         assert_eq!((c.host.as_str(), c.port), ("0.0.0.0", 9));
@@ -134,7 +174,8 @@ mod tests {
             Limits {
                 max_batch: 2,
                 max_chars: 3,
-                max_body: 4
+                max_body: 4,
+                max_tokens: 5
             }
         );
     }
@@ -170,12 +211,60 @@ mod tests {
 
     #[test]
     fn bad_value_for_each_numeric_flag() {
-        for f in ["--port", "--max-batch", "--max-chars", "--max-body"] {
+        for f in [
+            "--port",
+            "--max-batch",
+            "--max-chars",
+            "--max-body",
+            "--max-tokens",
+        ] {
             let e = parse_args(&a(&["--model", "m", f, "x"])).unwrap_err();
             assert_eq!(e, format!("{f}: cannot parse 'x'"));
         }
         // out of range for u16
         assert!(parse_args(&a(&["--model", "m", "--port", "70000"])).is_err());
+    }
+
+    #[test]
+    fn flag_value_starting_with_dashes_is_missing_value() {
+        let e = parse_args(&a(&["--model", "--port", "1"])).unwrap_err();
+        assert_eq!(e, "--model needs a value");
+    }
+
+    #[test]
+    fn help_flags() {
+        for h in ["--help", "-h"] {
+            assert_eq!(super::parse_args(&a(&[h])), Ok(Parsed::Help));
+            assert_eq!(
+                super::parse_args(&a(&["--model", "m", h])),
+                Ok(Parsed::Help)
+            );
+        }
+        assert_eq!(parse_args(&a(&["-h"])).unwrap_err(), "help");
+        // a lone `-x` is not a flag
+        assert!(parse_args(&a(&["-x"])).unwrap_err().contains("unexpected"));
+    }
+
+    #[test]
+    fn duplicate_flag_last_wins() {
+        let c = parse_args(&a(&[
+            "--model", "a", "--model", "b", "--port", "1", "--port", "2",
+        ]))
+        .unwrap();
+        assert_eq!((c.model.as_str(), c.port), ("b", 2));
+    }
+
+    #[tokio::test]
+    async fn start_help_and_errors_and_serve() {
+        assert_eq!(start(&a(&["--help"]), async {}).await, Ok(()));
+        assert!(start(&a(&["--bogus", "1"]), async {}).await.is_err());
+        let path = model_file("start");
+        let r = start(&a(&["--model", &path, "--port", "0"]), async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await
+        })
+        .await;
+        std::fs::remove_file(path).ok();
+        assert_eq!(r, Ok(()));
     }
 
     fn model_file(name: &str) -> String {

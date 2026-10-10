@@ -95,20 +95,33 @@ async fn health_and_info() {
 }
 
 #[tokio::test]
-async fn unknown_route_is_404_and_wrong_method_405() {
+async fn unknown_route_is_404_and_wrong_method_405_as_json() {
     let r = router();
-    assert_eq!(
-        call(&r, "GET", "/nope", None).await.0,
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        call(&r, "POST", "/health", None).await.0,
-        StatusCode::METHOD_NOT_ALLOWED
-    );
-    assert_eq!(
-        call(&r, "GET", "/v1/generate", None).await.0,
-        StatusCode::METHOD_NOT_ALLOWED
-    );
+    for (m, u, want) in [
+        ("GET", "/nope", StatusCode::NOT_FOUND),
+        ("POST", "/health", StatusCode::METHOD_NOT_ALLOWED),
+        ("GET", "/v1/generate", StatusCode::METHOD_NOT_ALLOWED),
+    ] {
+        let (s, v) = call(&r, m, u, None).await;
+        assert_eq!(s, want, "{m} {u}");
+        assert!(v["error"].is_string(), "{m} {u}: {v}");
+    }
+}
+
+#[tokio::test]
+async fn invalid_sampling_params_are_400() {
+    let r = router();
+    for (field, val) in [
+        ("temperature", json!(-1.0)),
+        ("top_p", json!(0.0)),
+        ("top_p", json!(1.5)),
+    ] {
+        let mut req = json!({"prompt": "the"});
+        req[field] = val;
+        let (s, v) = post(&r, "/v1/generate", json!({"requests": [req]})).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{field}");
+        assert!(v["error"].as_str().unwrap().contains(field), "{v}");
+    }
 }
 
 #[test]
@@ -278,6 +291,7 @@ async fn limits_are_enforced() {
         max_batch: 2,
         max_chars: 50,
         max_body: 1024,
+        max_tokens: 40,
     });
     let rolling = "/v1/loglikelihood_rolling";
     let (s, v) = post(&r, rolling, json!({"texts": ["a", "b", "c"]})).await;
@@ -317,11 +331,18 @@ async fn limits_are_enforced() {
     let (s, v) = post(
         &r,
         "/v1/generate",
-        json!({"requests": [{"prompt": "a", "max_tokens": 51}]}),
+        json!({"requests": [{"prompt": "a", "max_tokens": 41}]}),
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
     assert!(v["error"].as_str().unwrap().contains("max_tokens"));
+    let (s, _) = post(
+        &r,
+        "/v1/generate",
+        json!({"requests": [{"prompt": "a", "max_tokens": 40}]}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
     // ... and the server still answers afterwards
     assert_eq!(call(&r, "GET", "/health", None).await.0, StatusCode::OK);
 }

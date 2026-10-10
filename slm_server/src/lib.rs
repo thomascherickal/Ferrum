@@ -15,7 +15,8 @@ use ferrum_core::{GenerativeSLM, Rng, SamplingParams};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::sync::{mpsc, Arc};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::{mpsc, Arc, Weak};
 use tokio::sync::oneshot;
 
 /// Request limits, enforced before any model compute.
@@ -24,6 +25,8 @@ pub struct Limits {
     pub max_batch: usize,
     pub max_chars: usize,
     pub max_body: usize,
+    /// Cap on `max_tokens` per generate request.
+    pub max_tokens: usize,
 }
 
 impl Default for Limits {
@@ -32,6 +35,7 @@ impl Default for Limits {
             max_batch: 64,
             max_chars: 65_536,
             max_body: 8 << 20,
+            max_tokens: 4096,
         }
     }
 }
@@ -81,14 +85,20 @@ enum Job {
     Score(Vec<(String, String)>, Reply),
     Rolling(Vec<String>, Reply),
     Generate(Vec<GenRequest>, Reply),
+    /// Test hook: panics on the model thread.
+    #[cfg(test)]
+    Panic(Reply),
 }
 
 #[derive(Clone)]
 struct AppState {
     jobs: mpsc::Sender<Job>,
     info: Arc<Info>,
+    /// Dead once the model thread has exited (it holds the only strong ref).
+    alive: Weak<()>,
     max_batch: usize,
     max_chars: usize,
+    max_tokens: usize,
 }
 
 /// Apply `f` to every item, stopping at the first model error.
@@ -103,57 +113,91 @@ fn collect<T>(
         .map_err(|e| e.to_string())
 }
 
+/// Turn a panic payload into a message (`&str`/`String` payloads only).
+fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".into())
+}
+
+/// Run `f`, converting a panic into an error so the model thread survives.
+fn guarded(f: impl FnOnce() -> Result<Vec<Value>, String>) -> Result<Vec<Value>, String> {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|p| {
+        Err(format!(
+            "internal error: model panicked: {}",
+            panic_message(&*p)
+        ))
+    })
+}
+
 /// Answer one job on the model thread.
 fn handle(model: &GenerativeSLM, job: Job) {
-    match job {
-        Job::Score(reqs, reply) => {
-            let r = collect(&reqs, |(c, k)| {
-                model.score(c, k).map(
-                    |s| json!({"logprob": s.logprob, "n_tokens": s.n_tokens, "greedy": s.greedy}),
-                )
-            });
-            let _ = reply.send(r);
-        }
-        Job::Rolling(texts, reply) => {
-            let r = collect(&texts, |t| {
-                model
-                    .score_rolling(t)
-                    .map(|s| json!({"logprob": s.logprob, "n_tokens": s.n_tokens}))
-            });
-            let _ = reply.send(r);
-        }
-        Job::Generate(reqs, reply) => {
-            let r = collect(&reqs, |g| {
-                let params = SamplingParams {
-                    temperature: g.temperature,
-                    top_k: g.top_k,
-                    top_p: g.top_p,
-                    repetition_penalty: 1.0,
-                };
-                model
-                    .generate_tokens(
-                        &g.prompt,
-                        g.max_tokens,
-                        &g.stop,
-                        &params,
-                        &mut Rng::new(g.seed),
+    let (reply, result) = match job {
+        Job::Score(reqs, reply) => (
+            reply,
+            guarded(|| {
+                collect(&reqs, |(c, k)| {
+                    model.score(c, k).map(
+                        |s| json!({"logprob": s.logprob, "n_tokens": s.n_tokens, "greedy": s.greedy}),
                     )
-                    .map(|o| json!({"text": o.text, "n_tokens": o.n_tokens}))
-            });
-            let _ = reply.send(r);
-        }
-    }
+                })
+            }),
+        ),
+        Job::Rolling(texts, reply) => (
+            reply,
+            guarded(|| {
+                collect(&texts, |t| {
+                    model
+                        .score_rolling(t)
+                        .map(|s| json!({"logprob": s.logprob, "n_tokens": s.n_tokens}))
+                })
+            }),
+        ),
+        Job::Generate(reqs, reply) => (
+            reply,
+            guarded(|| {
+                collect(&reqs, |g| {
+                    let params = SamplingParams {
+                        temperature: g.temperature,
+                        top_k: g.top_k,
+                        top_p: g.top_p,
+                        repetition_penalty: 1.0,
+                    };
+                    model
+                        .generate_tokens(
+                            &g.prompt,
+                            g.max_tokens,
+                            &g.stop,
+                            &params,
+                            &mut Rng::new(g.seed),
+                        )
+                        .map(|o| json!({"text": o.text, "n_tokens": o.n_tokens}))
+                })
+            }),
+        ),
+        #[cfg(test)]
+        Job::Panic(reply) => (reply, guarded(|| panic!("boom"))),
+    };
+    let _ = reply.send(result);
 }
 
 /// Load the model from `bytes` on a dedicated thread and answer jobs there
 /// until every sender is dropped. The thread must build the model itself:
 /// `GenerativeSLM` is not `Send`. Returns the job channel and the model's info.
-fn spawn_model_thread(bytes: Vec<u8>) -> Result<(mpsc::Sender<Job>, Info), String> {
+type Spawned = (mpsc::Sender<Job>, Info, Weak<()>);
+
+fn spawn_model_thread(bytes: Vec<u8>) -> Result<Spawned, String> {
+    // ponytail: unbounded job queue; fine for a loopback server with one serial
+    // client (LightEval). Use a bounded channel + 503 if exposed to many clients.
     let (tx, rx) = mpsc::channel::<Job>();
+    let alive = Arc::new(());
+    let weak = Arc::downgrade(&alive);
     let (ready_tx, ready_rx) = mpsc::channel::<Result<Info, String>>();
     std::thread::Builder::new()
         .name("ferrum-model".into())
         .spawn(move || {
+            let _alive = alive;
             let model = match GenerativeSLM::from_bytes(&bytes) {
                 Ok(m) => m,
                 Err(e) => {
@@ -171,21 +215,23 @@ fn spawn_model_thread(bytes: Vec<u8>) -> Result<(mpsc::Sender<Job>, Info), Strin
     let info = ready_rx
         .recv()
         .map_err(|_| "model thread died while loading".to_string())??;
-    Ok((tx, info))
+    Ok((tx, info, weak))
 }
 
 /// Load the model in `bytes` (a model file) and build the router, spawning the
 /// model thread. Also returns the model's [`Info`].
 pub fn app(bytes: Vec<u8>, limits: Limits) -> Result<(Router, Info), String> {
-    let (jobs, info) = spawn_model_thread(bytes)?;
+    let (jobs, info, alive) = spawn_model_thread(bytes)?;
     let state = AppState {
         jobs,
         info: Arc::new(info.clone()),
+        alive,
         max_batch: limits.max_batch,
         max_chars: limits.max_chars,
+        max_tokens: limits.max_tokens,
     };
     let router = Router::new()
-        .route("/health", get(|| async { Json("ok") }))
+        .route("/health", get(health))
         .route(
             "/v1/info",
             get(|State(s): State<AppState>| async move { Json((*s.info).clone()) }),
@@ -194,8 +240,23 @@ pub fn app(bytes: Vec<u8>, limits: Limits) -> Result<(Router, Info), String> {
         .route("/v1/loglikelihood_rolling", post(loglikelihood_rolling))
         .route("/v1/generate", post(generate))
         .layer(DefaultBodyLimit::max(limits.max_body))
+        .fallback(|| async { ApiError(StatusCode::NOT_FOUND, "not found".into()) })
+        .method_not_allowed_fallback(|| async {
+            ApiError(StatusCode::METHOD_NOT_ALLOWED, "method not allowed".into())
+        })
         .with_state(state);
     Ok((router, info))
+}
+
+/// Liveness: 503 once the model thread is gone.
+async fn health(State(s): State<AppState>) -> Result<Json<&'static str>, ApiError> {
+    if s.alive.strong_count() == 0 {
+        return Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "model thread stopped".into(),
+        ));
+    }
+    Ok(Json("ok"))
 }
 
 /// JSON error response.
@@ -322,6 +383,27 @@ struct GenBody {
     requests: Vec<GenRequest>,
 }
 
+/// Boundary checks for one generate request.
+fn validate_gen(r: &GenRequest, max_tokens: usize) -> Result<(), ApiError> {
+    let bad = |m: String| Err(ApiError(StatusCode::BAD_REQUEST, m));
+    if r.max_tokens > max_tokens {
+        return bad(format!(
+            "max_tokens {} exceeds max_tokens limit {max_tokens}",
+            r.max_tokens
+        ));
+    }
+    if !(r.temperature.is_finite() && r.temperature >= 0.0) {
+        return bad(format!(
+            "temperature must be finite and >= 0, got {}",
+            r.temperature
+        ));
+    }
+    if !(r.top_p > 0.0 && r.top_p <= 1.0) {
+        return bad(format!("top_p must be in (0, 1], got {}", r.top_p));
+    }
+    Ok(())
+}
+
 async fn generate(
     State(s): State<AppState>,
     body: Result<Json<GenBody>, JsonRejection>,
@@ -332,15 +414,9 @@ async fn generate(
         b.requests.len(),
         b.requests.iter().map(|r| r.prompt.chars().count()),
     )?;
-    if let Some(r) = b.requests.iter().find(|r| r.max_tokens > s.max_chars) {
-        return Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "max_tokens {} exceeds max_chars {}",
-                r.max_tokens, s.max_chars
-            ),
-        ));
-    }
+    b.requests
+        .iter()
+        .try_for_each(|r| validate_gen(r, s.max_tokens))?;
     submit(&s, |tx| Job::Generate(b.requests, tx)).await
 }
 
@@ -373,8 +449,8 @@ mod tests {
     fn limits_default_values() {
         let d = Limits::default();
         assert_eq!(
-            (d.max_batch, d.max_chars, d.max_body),
-            (64, 65_536, 8 << 20)
+            (d.max_batch, d.max_chars, d.max_body, d.max_tokens),
+            (64, 65_536, 8 << 20, 4096)
         );
     }
 
@@ -436,8 +512,10 @@ mod tests {
         AppState {
             jobs,
             info: Arc::new(info_for(&model(0), b"")),
+            alive: Weak::new(),
             max_batch: 2,
             max_chars: 3,
+            max_tokens: 5,
         }
     }
 
@@ -528,7 +606,9 @@ mod tests {
             for job in rx {
                 let (texts, reply) = match job {
                     Job::Rolling(t, r) => (t, r),
-                    Job::Score(_, r) | Job::Generate(_, r) => (vec!["other".into()], r),
+                    Job::Score(_, r) | Job::Generate(_, r) | Job::Panic(r) => {
+                        (vec!["other".into()], r)
+                    }
                 };
                 let _ = reply.send(if texts.is_empty() {
                     Ok(vec![json!(1)])
@@ -562,7 +642,7 @@ mod tests {
     fn spawn_model_thread_rejects_bad_bytes_and_serves_good() {
         assert!(spawn_model_thread(b"nope".to_vec()).is_err());
         let m = model(0);
-        let (tx, info) = spawn_model_thread(m.to_bytes_quantized().unwrap()).unwrap();
+        let (tx, info, _alive) = spawn_model_thread(m.to_bytes_quantized().unwrap()).unwrap();
         assert_eq!(info.tokenizer, "char");
         let (rtx, rrx) = oneshot::channel();
         tx.send(Job::Score(vec![("abc".into(), " abc".into())], rtx))
@@ -590,5 +670,89 @@ mod tests {
     #[test]
     fn default_helpers() {
         assert_eq!((default_max_tokens(), default_top_p()), (64, 1.0));
+    }
+
+    #[test]
+    fn panic_message_variants() {
+        assert_eq!(panic_message(&"lit"), "lit");
+        assert_eq!(panic_message(&String::from("owned")), "owned");
+        assert_eq!(panic_message(&42u8), "unknown panic");
+    }
+
+    #[test]
+    fn guarded_passes_through_and_catches() {
+        assert_eq!(guarded(|| Ok(vec![json!(1)])).unwrap(), vec![json!(1)]);
+        assert_eq!(guarded(|| Err("e".into())).unwrap_err(), "e");
+        let e = guarded(|| panic!("kaboom")).unwrap_err();
+        assert_eq!(e, "internal error: model panicked: kaboom");
+        let e = guarded(|| std::panic::panic_any(7u8)).unwrap_err();
+        assert!(e.ends_with("unknown panic"));
+    }
+
+    #[tokio::test]
+    async fn model_thread_survives_a_panicking_job() {
+        let m = model(0);
+        let (tx, _info, alive) = spawn_model_thread(m.to_bytes_quantized().unwrap()).unwrap();
+        let mut s = state(tx);
+        s.alive = alive;
+        let e = submit(&s, Job::Panic).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(e.1.contains("model panicked: boom"), "{}", e.1);
+        // next request still served, and health still ok
+        let Json(v) = submit(&s, |r| Job::Rolling(vec!["abc".into()], r))
+            .await
+            .unwrap();
+        assert_eq!(v["results"].as_array().unwrap().len(), 1);
+        assert!(health(State(s)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn health_is_503_when_model_thread_gone() {
+        let (tx, _rx) = mpsc::channel();
+        let e = health(State(state(tx))).await.unwrap_err();
+        assert_eq!(
+            (e.0, e.1.as_str()),
+            (StatusCode::SERVICE_UNAVAILABLE, "model thread stopped")
+        );
+    }
+
+    #[test]
+    fn health_alive_flag_drops_with_thread() {
+        let m = model(0);
+        let (tx, _info, alive) = spawn_model_thread(m.to_bytes_quantized().unwrap()).unwrap();
+        assert!(alive.strong_count() > 0);
+        drop(tx);
+        while alive.strong_count() > 0 {
+            std::thread::yield_now();
+        }
+    }
+
+    fn gen_req(max_tokens: usize, temperature: f32, top_p: f32) -> GenRequest {
+        GenRequest {
+            prompt: String::new(),
+            max_tokens,
+            stop: vec![],
+            temperature,
+            top_k: 0,
+            top_p,
+            seed: 0,
+        }
+    }
+
+    #[test]
+    fn validate_gen_boundaries() {
+        assert!(validate_gen(&gen_req(5, 0.0, 1.0), 5).is_ok());
+        assert!(validate_gen(&gen_req(0, 2.0, 0.001), 5).is_ok());
+        let e = validate_gen(&gen_req(6, 0.0, 1.0), 5).unwrap_err();
+        assert!(e.1.contains("max_tokens 6") && e.1.contains("limit 5"));
+        for t in [-0.1, f32::NAN, f32::INFINITY] {
+            let e = validate_gen(&gen_req(1, t, 1.0), 5).unwrap_err();
+            assert!(e.1.contains("temperature"), "{}", e.1);
+        }
+        for p in [0.0, -1.0, 1.01, f32::NAN] {
+            let e = validate_gen(&gen_req(1, 0.0, p), 5).unwrap_err();
+            assert_eq!(e.0, StatusCode::BAD_REQUEST);
+            assert!(e.1.contains("top_p"), "{}", e.1);
+        }
     }
 }
