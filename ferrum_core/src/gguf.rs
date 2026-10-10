@@ -664,8 +664,8 @@ impl Gguf {
     /// Build a runnable [`LlamaModel`] from a `llama`- or `qwen2`-architecture
     /// GGUF, packing weight matrices to `kind` (int4/int8) in memory.
     ///
-    /// RoPE uses [`RopeType::Norm`] — the convention llama.cpp's GGUF conversion
-    /// permutes Q/K for. Other architectures are rejected. Bit-exact parity with
+    /// RoPE is [`RopeType::Norm`] for llama (llama.cpp's conversion permutes Q/K
+    /// for it) and [`RopeType::Neox`] for qwen2 (as in llama.cpp). Other architectures are rejected. Bit-exact parity with
     /// llama.cpp on a real checkpoint is not asserted (it needs the actual file),
     /// but the metadata/tensor mapping, the transpose, and the dequant are all
     /// unit-covered, and the resulting model's cached decode matches its own full
@@ -687,6 +687,12 @@ impl Gguf {
                 "architecture '{arch}' is not supported by load_llama (llama / qwen2 only)"
             )));
         }
+        // llama.cpp: qwen2 is a NEOX-rope arch (its Q/K are not permuted at conversion).
+        let rope_type = if arch == "qwen2" {
+            RopeType::Neox
+        } else {
+            RopeType::Norm
+        };
         let dim = self.meta_usize(&format!("{arch}.embedding_length"))?;
         let n_layers = self.meta_usize(&format!("{arch}.block_count"))?;
         let n_heads = self.meta_usize(&format!("{arch}.attention.head_count"))?;
@@ -756,16 +762,7 @@ impl Gguf {
             )?;
             let wo = self.linear_from(&format!("{p}.attn_output.weight"), None, prec)?;
             let attn = Attention::new(
-                wq,
-                wk,
-                wv,
-                wo,
-                n_heads,
-                n_kv,
-                head_dim,
-                rope_dim,
-                rope_base,
-                RopeType::Norm,
+                wq, wk, wv, wo, n_heads, n_kv, head_dim, rope_dim, rope_base, rope_type,
             )?;
             let ffn_norm = RmsNorm::new(self.dequant_named(&format!("{p}.ffn_norm.weight"))?, eps);
             let gate = self.linear_from(&format!("{p}.ffn_gate.weight"), None, prec)?;
@@ -813,7 +810,7 @@ impl Gguf {
             ffn_dim: ffn,
             rope_dim,
             rope_base,
-            rope_type: RopeType::Norm,
+            rope_type,
             norm_eps: eps,
             context_len: ctx,
         };
@@ -1594,6 +1591,25 @@ mod tests {
         let model = g.load_llama(QKind::Int4).unwrap();
         let logits = model.forward_tokens(&[0, 5, 9]).unwrap();
         assert!(logits.data.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn qwen2_uses_neox_rope_and_llama_uses_norm() {
+        // llama.cpp: LLM_ARCH_QWEN2 -> LLAMA_ROPE_TYPE_NEOX, LLM_ARCH_LLAMA -> NORM.
+        let q = Gguf::parse(synth_llama_cfg("qwen2", false, false)).unwrap();
+        let l = Gguf::parse(synth_llama_cfg("llama", false, false)).unwrap();
+        let (mq, ml) = (
+            q.load_llama(QKind::Int8).unwrap(),
+            l.load_llama(QKind::Int8).unwrap(),
+        );
+        assert_eq!(mq.cfg.rope_type, RopeType::Neox);
+        assert_eq!(ml.cfg.rope_type, RopeType::Norm);
+        // and the attention actually rotates that way: same weights, different logits
+        let (a, b) = (
+            mq.forward_tokens(&[0, 5, 9]).unwrap(),
+            ml.forward_tokens(&[0, 5, 9]).unwrap(),
+        );
+        assert_ne!(a.data, b.data);
     }
 
     #[test]

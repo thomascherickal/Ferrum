@@ -38,3 +38,11 @@ path = "tests/test_no_unsafe.rs"
 
 [dependencies]
 ferrum_core = { path = "../ferrum_core" }
+
+[[test]]
+name = "probe_gguf"
+path = "tests/probe_gguf.rs"
+
+[[test]]
+name = "gap_gguf"
+path = "tests/gap_gguf.rs"
