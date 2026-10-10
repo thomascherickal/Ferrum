@@ -160,6 +160,7 @@ const SCORE_BATCH: usize = 32;
 /// unchanged.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SamplingParams {
+    /// Softmax temperature; `<= 0` selects greedy argmax decoding.
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
@@ -186,6 +187,28 @@ impl SamplingParams {
             ..Self::default()
         }
     }
+}
+
+/// Why [`GenerativeSLM::generate_tokens`] stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// `max_tokens` tokens were generated.
+    MaxTokens,
+    /// A stop string appeared (it is excluded from the text).
+    Stop,
+    /// The model emitted the EOS token.
+    Eos,
+}
+
+/// Output of [`GenerativeSLM::generate_tokens`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Generation {
+    /// The continuation only (prompt excluded, stop string excluded).
+    pub text: String,
+    /// Tokens generated (including the one that completed a stop string; EOS
+    /// itself is not counted).
+    pub n_tokens: usize,
+    pub stop_reason: StopReason,
 }
 
 /// Validation-aware training controls (T5): an internal held-out split, early
@@ -1280,6 +1303,102 @@ impl GenerativeSLM {
         Ok(finish_evaluation(-s.logprob, s.n_tokens))
     }
 
+    /// Generate up to `max_tokens` tokens after `prompt`, returning only the
+    /// continuation. Stops early at the first of `stops` to appear (excluded
+    /// from the text) or when the model emits EOS. Any prompt length works: a
+    /// prompt longer than the context keeps its most recent tokens; an empty
+    /// prompt starts from [`GenerativeSLM::bos_id`].
+    ///
+    /// When the KV cache fills, it is re-primed from the most recent
+    /// `context_len / 2` tokens, so the cost is one re-prime per
+    /// `context_len / 2` generated tokens rather than one per token (learned
+    /// absolute positions rule out sliding the cache by one).
+    pub fn generate_tokens(
+        &self,
+        prompt: &str,
+        max_tokens: usize,
+        stops: &[String],
+        params: &SamplingParams,
+        rng: &mut Rng,
+    ) -> Result<Generation> {
+        self.require_token_id_model()?;
+        let bpe = if self.meta.tokenizer_state.is_empty() {
+            None
+        } else {
+            Some(ByteBpeTokenizer::from_state(&self.meta.tokenizer_state)?)
+        };
+        let eos = bpe.as_ref().and_then(|t| t.eos_id());
+        let mut cached = CachedTransformer::try_new(&self.model).ok_or_else(|| {
+            InferError::DimMismatch("generate_tokens needs a transformer model".into())
+        })?;
+        let cap = cached.capacity().max(2);
+        let keep = cap / 2;
+
+        let mut window = self.encode_text(prompt)?;
+        if window.is_empty() {
+            window.push(self.bos_id());
+        }
+        if window.len() > cap {
+            window.drain(..window.len() - cap);
+        }
+        let mut dist = cached.prime(&window)?;
+
+        let mut text = String::new();
+        let mut pending: Vec<u8> = Vec::new();
+        let max_stop = stops.iter().map(|s| s.len()).max().unwrap_or(0);
+        let mut n_tokens = 0;
+        let mut reason = StopReason::MaxTokens;
+
+        while n_tokens < max_tokens {
+            let logits: Vec<f32> = dist.iter().map(|&p| p.max(1e-12).ln()).collect();
+            let next = sample_with_params(&logits, params, &window, rng);
+            if Some(next) == eos {
+                reason = StopReason::Eos;
+                break;
+            }
+            n_tokens += 1;
+            let before = text.len();
+            match &bpe {
+                Some(tok) => {
+                    pending.extend_from_slice(tok.token_bytes(next).unwrap_or(&[]));
+                    drain_utf8(&mut pending, &mut text);
+                }
+                None => text.push(hex_to_char(&self.meta.class_names[next])),
+            }
+            // Only the tail can contain a newly completed stop string.
+            let from = before.saturating_sub(max_stop);
+            let from = (0..=from)
+                .rev()
+                .find(|&i| text.is_char_boundary(i))
+                .unwrap_or(0);
+            if let Some(cut) = stops
+                .iter()
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| text[from..].find(s.as_str()).map(|i| from + i))
+                .min()
+            {
+                text.truncate(cut);
+                reason = StopReason::Stop;
+                break;
+            }
+            window.push(next);
+            if window.len() > cap {
+                window.drain(..window.len() - keep);
+                dist = cached.prime(&window)?;
+            } else {
+                dist = cached.feed(next)?;
+            }
+        }
+        if reason != StopReason::Stop && !pending.is_empty() {
+            text.push_str(&String::from_utf8_lossy(&pending));
+        }
+        Ok(Generation {
+            text,
+            n_tokens,
+            stop_reason: reason,
+        })
+    }
+
     /// The conditioning token placed before the first scored or generated
     /// token: the tokenizer's EOS id when it has one (document boundary), else 0.
     pub fn bos_id(&self) -> usize {
@@ -1477,6 +1596,35 @@ fn finish_evaluation(total_nll: f64, count: usize) -> Evaluation {
         cross_entropy: ce,
         bits_per_token: ce / std::f32::consts::LN_2,
         perplexity: ce.exp(),
+    }
+}
+
+/// Move the longest valid UTF-8 prefix of `pending` onto `out`, replacing
+/// invalid sequences with U+FFFD exactly like `String::from_utf8_lossy`, and
+/// leave an incomplete trailing sequence in `pending` for the next token.
+fn drain_utf8(pending: &mut Vec<u8>, out: &mut String) {
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(s) => {
+                out.push_str(s);
+                pending.clear();
+                return;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                out.push_str(&String::from_utf8_lossy(&pending[..valid]));
+                match e.error_len() {
+                    Some(bad) => {
+                        out.push('\u{FFFD}');
+                        pending.drain(..valid + bad);
+                    }
+                    None => {
+                        pending.drain(..valid);
+                        return;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1890,7 +2038,6 @@ pub(crate) fn sample_with_params(
     rng: &mut Rng,
 ) -> usize {
     let n = logits.len();
-    let t = params.temperature.max(0.01);
 
     // 1. Repetition penalty on the raw logits of already-seen tokens.
     let mut work: Vec<f32> = logits.to_vec();
@@ -1905,6 +2052,14 @@ pub(crate) fn sample_with_params(
             }
         }
     }
+
+    // Temperature <= 0 is exact argmax (greedy decoding); no RNG draw.
+    if params.temperature <= 0.0 {
+        return (0..n)
+            .max_by(|&a, &b| work[a].total_cmp(&work[b]))
+            .unwrap_or(0);
+    }
+    let t = params.temperature.max(0.01);
 
     // 2. Temperature softmax (numerically stable).
     let max = work.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -2804,6 +2959,367 @@ mod tests {
         slm.meta.task = TaskType::Classification;
         let err = slm.encode_text("abc").unwrap_err().to_string();
         assert!(err.contains("not a token-ID SLM"), "{err}");
+    }
+
+    #[test]
+    fn tokenizer_path_is_created_then_reused_and_short_corpus_errors() {
+        let dir = std::env::temp_dir().join(format!("ferrum_tokpath_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nested").join("tok.txt");
+        let corpus = "the cat sat.<|endoftext|>the dog ran.<|endoftext|>".repeat(30);
+        let cfg = TransformerConfig {
+            context_len: 8,
+            vocab_size: 280,
+            tokenizer_path: path.to_str().unwrap().into(),
+            ..TransformerConfig::default()
+        };
+        let first = tokenize_for_lm_cfg(&corpus, &cfg).unwrap();
+        assert!(path.exists(), "tokenizer file created (with parent dirs)");
+        // Second call reuses the saved tokenizer: identical result.
+        let again = tokenize_for_lm_cfg(&corpus, &cfg).unwrap();
+        assert_eq!(first.tokens, again.tokens);
+        assert_eq!(first.tokenizer_state, again.tokenizer_state);
+        // A bare file name has no parent component to create.
+        let bare_cfg = TransformerConfig {
+            tokenizer_path: dir.join("bare.txt").to_str().unwrap().into(),
+            ..cfg.clone()
+        };
+        assert!(tokenize_for_lm_cfg(&corpus, &bare_cfg).is_ok());
+        // Corpus no longer than the context window is rejected.
+        let tiny = TransformerConfig {
+            context_len: 10_000,
+            ..cfg.clone()
+        };
+        let err = match tokenize_for_lm_cfg(&corpus, &tiny) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("short corpus must be rejected"),
+        };
+        assert!(err.contains("longer than the context window"), "{err}");
+        // Char-level / no path falls through to tokenize_for_lm.
+        let no_path = TransformerConfig {
+            tokenizer_path: String::new(),
+            ..cfg
+        };
+        assert!(!tokenize_for_lm_cfg(&corpus, &no_path)
+            .unwrap()
+            .tokenizer_state
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── generate_tokens (Phase 0 Task 4) ──────────────────────────────────────
+
+    fn greedy() -> SamplingParams {
+        SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        }
+    }
+
+    /// Trained on short documents so greedy decoding reaches EOS.
+    fn tiny_eos_slm() -> GenerativeSLM {
+        let corpus = "the cat sat.<|endoftext|>".repeat(60);
+        let cfg = TransformerConfig {
+            context_len: 16,
+            embed_dim: 16,
+            num_heads: 2,
+            num_blocks: 1,
+            hidden_dim: 32,
+            epochs: 30,
+            vocab_size: 270,
+            ..TransformerConfig::default()
+        };
+        GenerativeSLM::train_transformer_config(&corpus, &cfg, &mut Rng::new(5), |_, _| {}).unwrap()
+    }
+
+    /// Byte-level model (no merges) trained on a two-byte UTF-8 character, so
+    /// generation emits partial UTF-8 sequences token by token.
+    fn tiny_utf8_slm() -> GenerativeSLM {
+        let corpus = "\u{e9}".repeat(200);
+        let cfg = TransformerConfig {
+            context_len: 8,
+            embed_dim: 16,
+            num_heads: 2,
+            num_blocks: 1,
+            hidden_dim: 32,
+            epochs: 30,
+            vocab_size: 257,
+            ..TransformerConfig::default()
+        };
+        GenerativeSLM::train_transformer_config(&corpus, &cfg, &mut Rng::new(5), |_, _| {}).unwrap()
+    }
+
+    #[test]
+    fn generate_tokens_respects_budget_and_is_deterministic() {
+        let slm = tiny_bpe_slm();
+        let p = greedy();
+        let a = slm
+            .generate_tokens("the cat", 12, &[], &p, &mut Rng::new(1))
+            .unwrap();
+        let b = slm
+            .generate_tokens("the cat", 12, &[], &p, &mut Rng::new(99))
+            .unwrap();
+        assert_eq!(a, b, "temperature 0 is argmax: the seed must not matter");
+        assert_eq!(a.n_tokens, 12);
+        assert_eq!(a.stop_reason, StopReason::MaxTokens);
+        // Sampling at temperature 1 is deterministic for a fixed seed.
+        let sp = SamplingParams::default();
+        let s1 = slm
+            .generate_tokens("the cat", 12, &[], &sp, &mut Rng::new(4))
+            .unwrap();
+        let s2 = slm
+            .generate_tokens("the cat", 12, &[], &sp, &mut Rng::new(4))
+            .unwrap();
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn generate_tokens_zero_budget_returns_empty() {
+        let slm = tiny_bpe_slm();
+        let g = slm
+            .generate_tokens("the cat", 0, &[], &greedy(), &mut Rng::new(1))
+            .unwrap();
+        assert_eq!(
+            g,
+            Generation {
+                text: String::new(),
+                n_tokens: 0,
+                stop_reason: StopReason::MaxTokens
+            }
+        );
+    }
+
+    #[test]
+    fn generate_tokens_stops_at_first_stop_and_excludes_it() {
+        let slm = tiny_bpe_slm();
+        let p = greedy();
+        let free = slm
+            .generate_tokens("the cat", 40, &[], &p, &mut Rng::new(1))
+            .unwrap();
+        // Pick a stop string that greedy decoding is known to produce.
+        let stop = free.text.chars().skip(3).take(2).collect::<String>();
+        let g = slm
+            .generate_tokens(
+                "the cat",
+                40,
+                &["#never#".into(), String::new(), stop.clone()],
+                &p,
+                &mut Rng::new(1),
+            )
+            .unwrap();
+        assert_eq!(g.stop_reason, StopReason::Stop);
+        assert!(
+            !g.text.contains(&stop),
+            "stop string must be excluded: {:?}",
+            g.text
+        );
+        assert!(free.text.starts_with(&g.text));
+        // Only empty stops: they never fire.
+        let none = slm
+            .generate_tokens("the cat", 10, &[String::new()], &p, &mut Rng::new(1))
+            .unwrap();
+        assert_eq!(none.stop_reason, StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn generate_tokens_stop_spanning_tokens_and_earliest_wins() {
+        let slm = tiny_char_slm(); // one token per char
+        let p = greedy();
+        let free = slm
+            .generate_tokens("ab", 12, &[], &p, &mut Rng::new(1))
+            .unwrap();
+        // One token per char, so a 2-char stop always spans two tokens.
+        let early: String = free.text.chars().skip(1).take(2).collect();
+        let late: String = free.text.chars().skip(6).take(2).collect();
+        let at = free.text.find(&early).unwrap();
+        let g = slm
+            .generate_tokens("ab", 12, std::slice::from_ref(&early), &p, &mut Rng::new(1))
+            .unwrap();
+        assert_eq!(g.stop_reason, StopReason::Stop);
+        assert_eq!(g.text, &free.text[..at]);
+        assert_eq!(
+            g.n_tokens,
+            at + 2,
+            "the token completing the stop is counted"
+        );
+        // Several stops: the earliest position in the text wins, whatever the list order.
+        let cut = free
+            .text
+            .find(&early)
+            .unwrap()
+            .min(free.text.find(&late).unwrap());
+        let g2 = slm
+            .generate_tokens(
+                "ab",
+                12,
+                &[late.clone(), early.clone()],
+                &p,
+                &mut Rng::new(1),
+            )
+            .unwrap();
+        assert_eq!(g2.text, &free.text[..cut]);
+        let g3 = slm
+            .generate_tokens("ab", 12, &[early, late], &p, &mut Rng::new(1))
+            .unwrap();
+        assert_eq!(g3, g2);
+    }
+
+    #[test]
+    fn generate_tokens_char_level_paths() {
+        let slm = tiny_char_slm();
+        let p = greedy();
+        // Empty prompt starts from BOS.
+        let g = slm
+            .generate_tokens("", 5, &[], &p, &mut Rng::new(1))
+            .unwrap();
+        assert_eq!(g.n_tokens, 5);
+        assert_eq!(g.text.chars().count(), 5);
+        // Unknown prompt chars are an error, not id 0.
+        assert!(slm
+            .generate_tokens("xyz", 5, &[], &p, &mut Rng::new(1))
+            .is_err());
+    }
+
+    #[test]
+    fn generate_tokens_stops_at_eos() {
+        let slm = tiny_eos_slm();
+        let g = slm
+            .generate_tokens("the cat", 60, &[], &greedy(), &mut Rng::new(1))
+            .unwrap();
+        assert_eq!(g.stop_reason, StopReason::Eos, "{g:?}");
+        assert!(g.n_tokens < 60);
+        assert!(!g.text.contains("endoftext"));
+    }
+
+    #[test]
+    fn generate_tokens_accepts_prompt_longer_than_context() {
+        let slm = tiny_bpe_slm();
+        let long = "the dog sat on the log. ".repeat(10);
+        let p = greedy();
+        let g = slm
+            .generate_tokens(&long, 30, &[], &p, &mut Rng::new(1))
+            .unwrap();
+        assert_eq!(g.n_tokens, 30);
+        let empty = slm
+            .generate_tokens("", 5, &[], &p, &mut Rng::new(1))
+            .unwrap();
+        assert_eq!(empty.n_tokens, 5);
+        // Generation beyond several cache windows re-primes without error.
+        let far = slm
+            .generate_tokens("the", 100, &[], &p, &mut Rng::new(1))
+            .unwrap();
+        assert_eq!(far.n_tokens, 100);
+    }
+
+    #[test]
+    fn generate_tokens_flushes_incomplete_utf8_at_budget() {
+        let slm = tiny_utf8_slm();
+        let p = greedy();
+        let full = slm
+            .generate_tokens("\u{e9}", 4, &[], &p, &mut Rng::new(1))
+            .unwrap();
+        assert_eq!(full.text, "\u{e9}\u{e9}", "premise: model learned the char");
+        // An odd budget ends mid-character: the dangling lead byte is flushed
+        // lossily instead of being dropped.
+        let odd = slm
+            .generate_tokens("\u{e9}", 3, &[], &p, &mut Rng::new(1))
+            .unwrap();
+        assert_eq!(odd.text, "\u{e9}\u{fffd}");
+        // A multi-byte stop string straddles two byte tokens.
+        let stopped = slm
+            .generate_tokens("\u{e9}", 8, &["\u{e9}".into()], &p, &mut Rng::new(1))
+            .unwrap();
+        assert_eq!(stopped.stop_reason, StopReason::Stop);
+        assert_eq!(stopped.text, "");
+        let late = slm
+            .generate_tokens("\u{e9}", 8, &["\u{e9}\u{e9}".into()], &p, &mut Rng::new(1))
+            .unwrap();
+        assert_eq!(late.stop_reason, StopReason::Stop);
+        assert_eq!(late.text, "");
+    }
+
+    #[test]
+    fn generate_tokens_rejects_non_transformer_and_legacy_models() {
+        let slm = bias_only_slm();
+        let err = slm
+            .generate_tokens("ab", 3, &[], &greedy(), &mut Rng::new(1))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needs a transformer model"), "{err}");
+        let mut legacy = tiny_char_slm();
+        legacy.meta.task = TaskType::Classification;
+        assert!(legacy
+            .generate_tokens("ab", 3, &[], &greedy(), &mut Rng::new(1))
+            .is_err());
+        let mut bad = tiny_bpe_slm();
+        bad.meta.tokenizer_state = "1,2,3".into();
+        assert!(bad
+            .generate_tokens("ab", 3, &[], &greedy(), &mut Rng::new(1))
+            .is_err());
+    }
+
+    #[test]
+    fn zero_temperature_is_argmax() {
+        let logits = [0.1f32, 2.0, 1.9, -1.0];
+        for t in [0.0, -1.0] {
+            let p = SamplingParams {
+                temperature: t,
+                ..SamplingParams::default()
+            };
+            for s in 0..20 {
+                assert_eq!(sample_with_params(&logits, &p, &[], &mut Rng::new(s)), 1);
+            }
+        }
+        // Greedy still honours the repetition penalty (applied to raw logits).
+        let p = SamplingParams {
+            temperature: 0.0,
+            repetition_penalty: 2.0,
+            ..SamplingParams::default()
+        };
+        assert_eq!(sample_with_params(&logits, &p, &[1], &mut Rng::new(0)), 2);
+        // Greedy draws nothing from the RNG.
+        let mut r = Rng::new(3);
+        let before = r.next_u64();
+        let mut r2 = Rng::new(3);
+        sample_with_params(&logits, &greedy(), &[], &mut r2);
+        assert_eq!(r2.next_u64(), before);
+    }
+
+    #[test]
+    fn drain_utf8_handles_valid_invalid_and_incomplete() {
+        let drain = |bytes: &[u8]| {
+            let mut pending = bytes.to_vec();
+            let mut out = String::new();
+            drain_utf8(&mut pending, &mut out);
+            (out, pending)
+        };
+        assert_eq!(drain(b""), (String::new(), vec![]));
+        assert_eq!(drain(b"abc"), ("abc".into(), vec![]));
+        assert_eq!(
+            drain("h\u{e9}llo".as_bytes()),
+            ("h\u{e9}llo".into(), vec![])
+        );
+        // Incomplete trailing sequence waits for the next token.
+        assert_eq!(drain(&[0xC3]), (String::new(), vec![0xC3]));
+        assert_eq!(drain(b"a\xE2\x82"), ("a".into(), vec![0xE2, 0x82]));
+        // Invalid bytes become U+FFFD like from_utf8_lossy.
+        assert_eq!(drain(&[0xFF, b'a']), ("\u{fffd}a".into(), vec![]));
+        assert_eq!(
+            drain(&[b'a', 0xFF, 0xFF, b'b']),
+            ("a\u{fffd}\u{fffd}b".into(), vec![])
+        );
+        // Invalid followed by an incomplete tail: replace, keep the tail.
+        assert_eq!(drain(&[0xFF, 0xC3]), ("\u{fffd}".into(), vec![0xC3]));
+        // A lead byte followed by a non-continuation is invalid, the next char is kept.
+        assert_eq!(drain(&[0xC3, b'a']), ("\u{fffd}a".into(), vec![]));
+        // Appending: existing output is preserved.
+        let mut pending = "\u{e9}".as_bytes()[1..].to_vec();
+        let mut out = String::from("x");
+        drain_utf8(&mut pending, &mut out);
+        assert_eq!(out, "x\u{fffd}");
+        // Equivalent to lossy decoding for complete input.
+        let bytes = [b'a', 0xF0, 0x9F, 0x98, 0x80, 0xC0, b'z'];
+        assert_eq!(drain(&bytes).0, String::from_utf8_lossy(&bytes));
     }
 
     #[test]
