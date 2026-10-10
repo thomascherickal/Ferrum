@@ -229,6 +229,8 @@ fn every_crate_root_forbids_or_denies_unsafe_code() {
         "ferrum_core/benches/gemm.rs",
         "slm_cli/src/main.rs",
         "slm_wasm/src/lib.rs",
+        "slm_server/src/lib.rs",
+        "slm_server/src/main.rs",
         "ferrum_gui/src/lib.rs",
         "ferrum_gui/src/main.rs",
         "ferrum_gui/build.rs",
