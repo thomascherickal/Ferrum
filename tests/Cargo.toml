@@ -46,3 +46,7 @@ path = "tests/probe_gguf.rs"
 [[test]]
 name = "gap_gguf"
 path = "tests/gap_gguf.rs"
+
+[[test]]
+name = "gap_eos"
+path = "tests/gap_eos.rs"

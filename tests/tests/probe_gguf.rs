@@ -32,6 +32,13 @@ fn probe_export() {
         println!("FERRUM[{tag}] {:?}", g);
     }
     let p = SamplingParams::with_temperature(0.0);
+    let g = slm
+        .generate_tokens(&prompt, 400, &[], &p_greedy(), &mut Rng::new(1))
+        .unwrap();
+    println!(
+        "FERRUM_TOKENS {:?} n={} reason={:?}",
+        g.text, g.n_tokens, g.stop_reason
+    );
     println!(
         "FERRUM[bin] {:?}",
         slm.generate_with(&prompt, n, &p, &mut Rng::new(1)).unwrap()
@@ -60,4 +67,8 @@ fn probe_load() {
         }
         Err(e) => println!("LOAD-ERROR {e}"),
     }
+}
+
+fn p_greedy() -> SamplingParams {
+    SamplingParams::with_temperature(0.0)
 }
