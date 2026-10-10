@@ -92,8 +92,8 @@ pub use llm::{
 };
 pub use llm_train::LlamaTrainer;
 pub use loader::{
-    from_bytes, load, save, save_quantized, save_quantized_int4, to_bytes, to_bytes_quantized,
-    to_bytes_quantized_int4,
+    from_bytes, from_gguf, gguf_quant, load, save, save_quantized, save_quantized_int4, to_bytes,
+    to_bytes_quantized, to_bytes_quantized_int4, to_gguf, QPrec,
 };
 pub use loss::{mse, softmax_cross_entropy};
 pub use meta::{ModelMetadata, Normalizer, TaskType};

@@ -828,7 +828,7 @@ impl Gguf {
 }
 
 /// Transpose a row-major `[rows, cols]` matrix to `[cols, rows]`.
-fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+pub(crate) fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; rows * cols];
     for r in 0..rows {
         for c in 0..cols {

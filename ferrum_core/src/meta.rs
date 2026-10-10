@@ -141,7 +141,8 @@ impl ModelMetadata {
             Some(s[start..].trim_start())
         }
         fn str_val(s: &str) -> Option<String> {
-            let s = s.trim_start_matches('"');
+            // Strip only the opening quote: `""` is an empty string, not `","…`.
+            let s = s.strip_prefix('"')?;
             let end = s.find('"')?;
             Some(s[..end].to_string())
         }
@@ -397,6 +398,24 @@ mod tests {
         meta.tokenizer_state = String::new();
         let back2 = ModelMetadata::from_json(&meta.to_json()).unwrap();
         assert!(back2.tokenizer_state.is_empty());
+    }
+
+    #[test]
+    fn empty_string_fields_survive_json_roundtrip() {
+        let meta = ModelMetadata {
+            dataset_name: String::new(),
+            target_name: String::new(),
+            ..Default::default()
+        };
+        let back = ModelMetadata::from_json(&meta.to_json()).unwrap();
+        assert_eq!(back.dataset_name, "");
+        assert_eq!(back.target_name, "");
+        assert_eq!(back.to_json(), meta.to_json());
+        // A non-string where a string belongs is treated as absent.
+        let json = meta
+            .to_json()
+            .replace("\"target_name\":\"\"", "\"target_name\":7");
+        assert_eq!(ModelMetadata::from_json(&json).unwrap().target_name, "");
     }
 
     #[test]
