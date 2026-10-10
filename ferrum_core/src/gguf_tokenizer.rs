@@ -63,6 +63,8 @@ pub struct GgufTokenizer {
     byte_decoder: HashMap<char, u8>,
     bos: Option<u32>,
     eos: Option<u32>,
+    /// `tokenizer.ggml.add_bos_token` (llama.cpp default: true for SPM, false for BPE).
+    add_bos: bool,
 }
 
 /// Build GPT-2's byte→unicode table (and its inverse). Printable byte ranges map
@@ -179,6 +181,29 @@ impl GgufTokenizer {
             .and_then(|v| v.as_usize())
             .map(|u| u as u32);
 
+        let add_bos = match g.meta("tokenizer.ggml.add_bos_token") {
+            Some(MetaValue::Bool(b)) => *b,
+            // llama.cpp's per-pre-tokenizer defaults (llama-vocab.cpp, b11521)
+            _ => {
+                model == TokModel::Spm
+                    || matches!(
+                        g.meta("tokenizer.ggml.pre").and_then(|v| v.as_str()),
+                        Some(
+                            "llama3"
+                                | "llama-v3"
+                                | "llama-bpe"
+                                | "falcon3"
+                                | "falcon-h1"
+                                | "pixtral"
+                                | "midm-2.0"
+                                | "lfm2"
+                                | "jina-v5-nano"
+                                | "tekken"
+                                | "chameleon"
+                        )
+                    )
+            }
+        };
         let (byte_encoder, byte_decoder) = gpt2_byte_tables();
         Ok(Self {
             model,
@@ -191,6 +216,7 @@ impl GgufTokenizer {
             byte_decoder,
             bos,
             eos,
+            add_bos,
         })
     }
 
@@ -202,6 +228,12 @@ impl GgufTokenizer {
     }
     pub fn bos(&self) -> Option<usize> {
         self.bos.map(|x| x as usize)
+    }
+    /// The BOS id to prepend to a prompt: `bos()` only when the file asks for it
+    /// (`add_bos_token`, defaulting like llama.cpp). Prepending an unwanted BOS changes
+    /// the model's output (e.g. SmolLM2 has a BOS id but `add_bos_token = false`).
+    pub fn prefix_bos(&self) -> Option<usize> {
+        self.bos().filter(|_| self.add_bos)
     }
     pub fn eos(&self) -> Option<usize> {
         self.eos.map(|x| x as usize)
@@ -443,6 +475,11 @@ mod tests {
         put_u32(o, 4); // VT_U32
         put_u32(o, v);
     }
+    fn kv_bool(o: &mut Vec<u8>, key: &str, v: bool) {
+        put_str(o, key);
+        put_u32(o, 7); // VT_BOOL
+        o.push(v as u8);
+    }
     fn kv_str_array(o: &mut Vec<u8>, key: &str, items: &[&str]) {
         put_str(o, key);
         put_u32(o, 9); // VT_ARRAY
@@ -514,6 +551,39 @@ mod tests {
         // " a" → leading space attaches: 'Ġ'+'a' merges to "Ġa" (id 6).
         assert_eq!(tk.encode(" a"), vec![6]);
         assert_eq!(tk.decode(&tk.encode("abc")), "abc");
+    }
+
+    #[test]
+    fn prefix_bos_follows_add_bos_token_with_llama_cpp_defaults() {
+        let toks = ["<s>", "a", "b", "\u{2581}"];
+        let build = |model: &str, flag: Option<bool>| {
+            let mut kvs = Vec::new();
+            kv_str(&mut kvs, "tokenizer.ggml.model", model);
+            kv_str_array(&mut kvs, "tokenizer.ggml.tokens", &toks);
+            kv_u32(&mut kvs, "tokenizer.ggml.bos_token_id", 0);
+            let mut n = 3;
+            if let Some(f) = flag {
+                kv_bool(&mut kvs, "tokenizer.ggml.add_bos_token", f);
+                n += 1;
+            }
+            GgufTokenizer::from_gguf(&tok_gguf(&kvs, n)).unwrap()
+        };
+        // BPE: no BOS unless asked; SPM: BOS unless disabled
+        assert_eq!(build("gpt2", None).prefix_bos(), None);
+        assert_eq!(build("gpt2", Some(false)).prefix_bos(), None);
+        assert_eq!(build("gpt2", Some(true)).prefix_bos(), Some(0));
+        assert_eq!(build("llama", None).prefix_bos(), Some(0));
+        assert_eq!(build("llama", Some(false)).prefix_bos(), None);
+        // llama-3 style BPE pre-tokenizers default to adding BOS
+        let mut kvs = Vec::new();
+        kv_str(&mut kvs, "tokenizer.ggml.model", "gpt2");
+        kv_str(&mut kvs, "tokenizer.ggml.pre", "llama-bpe");
+        kv_str_array(&mut kvs, "tokenizer.ggml.tokens", &toks);
+        kv_u32(&mut kvs, "tokenizer.ggml.bos_token_id", 0);
+        let tk = GgufTokenizer::from_gguf(&tok_gguf(&kvs, 4)).unwrap();
+        assert_eq!(tk.prefix_bos(), Some(0));
+        // bos() itself is unchanged
+        assert_eq!(build("gpt2", Some(false)).bos(), Some(0));
     }
 
     #[test]

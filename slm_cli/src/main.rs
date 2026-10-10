@@ -994,7 +994,7 @@ fn cmd_run_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             )
         };
         let mut ids = Vec::new();
-        if let Some(bos) = t.bos() {
+        if let Some(bos) = t.prefix_bos() {
             ids.push(bos);
         }
         match fmt {
@@ -1145,7 +1145,7 @@ fn cmd_finetune_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let text = std::fs::read_to_string(corpus_path)
         .map_err(|e| format!("cannot read corpus {corpus_path}: {e}"))?;
     let mut tokens: Vec<usize> = Vec::new();
-    if let Some(bos) = tok.bos() {
+    if let Some(bos) = tok.prefix_bos() {
         tokens.push(bos);
     }
     tokens.extend(tok.encode(&text));
