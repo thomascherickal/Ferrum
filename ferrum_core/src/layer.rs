@@ -212,7 +212,7 @@ impl Layer for ActivationLayer {
 ///
 /// Used between `Embedding` and `Linear` in embedded-MLP language models so
 /// the per-position embeddings become one flat feature vector. Serialised in
-/// FINF v5 as tag 5 with no payload.
+/// Ferrum GGUF as a `flatten` layer with no tensors.
 #[derive(Default)]
 pub struct Flatten;
 

@@ -558,7 +558,7 @@ impl ByteBpeTokenizer {
 
     /// Serialise the merge list as `"a,b;c,d;…"`, optionally followed by a
     /// newline and the comma-separated special-token names (K3). An empty string
-    /// is byte-level with no specials. Compact enough to embed in FINF metadata.
+    /// is byte-level with no specials. Compact enough to embed in GGUF metadata.
     pub fn encode_state(&self) -> String {
         let merges = self
             .merges

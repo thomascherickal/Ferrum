@@ -149,7 +149,7 @@
         <button class="ghost browse" data-target="trCorpus">Browse…</button>
       </div>
       <div class="row">
-        <label>Model output <input type="text" id="trModel" placeholder="/path/to/model.bin" /></label>
+        <label>Model output <input type="text" id="trModel" placeholder="/path/to/model.gguf" /></label>
         <button class="ghost browse-save" data-target="trModel">Browse…</button>
       </div>
 
@@ -199,7 +199,7 @@
     <section class="panel" id="panel-generate">
       <h2>Generate (with live streaming)</h2>
       <div class="row">
-        <label>Model <input type="text" id="genModel" placeholder="/path/to/model.bin" /></label>
+        <label>Model <input type="text" id="genModel" placeholder="/path/to/model.gguf" /></label>
         <button class="ghost browse" data-target="genModel">Browse…</button>
       </div>
       <label>Seed text
@@ -227,7 +227,7 @@
         on. Lower perplexity is better; a model that learned nothing scores its
         vocabulary size.</p>
       <div class="row">
-        <label>Model <input type="text" id="evModel" placeholder="/path/to/model.bin" /></label>
+        <label>Model <input type="text" id="evModel" placeholder="/path/to/model.gguf" /></label>
         <button class="ghost browse" data-target="evModel">Browse…</button>
       </div>
       <div class="row">
@@ -256,7 +256,7 @@
     <section class="panel" id="panel-models">
       <h2>Models — inspect / load from disk</h2>
       <div class="row">
-        <label>Model file <input type="text" id="miPath" placeholder="/path/to/model.bin" /></label>
+        <label>Model file <input type="text" id="miPath" placeholder="/path/to/model.gguf" /></label>
         <button class="ghost browse" data-target="miPath">Browse…</button>
         <button id="miInspect" class="primary">Inspect / reload</button>
       </div>

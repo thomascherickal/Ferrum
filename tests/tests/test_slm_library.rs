@@ -463,7 +463,7 @@ fn test_evaluate_works_for_char_and_bpe() {
 }
 
 #[test]
-fn test_evaluate_survives_finf_roundtrip() {
+fn test_evaluate_survives_gguf_roundtrip() {
     // A reloaded model must score identically to the in-memory one.
     let corpus = "abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc";
     let mut rng = Rng::new(7);

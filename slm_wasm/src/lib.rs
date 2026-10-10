@@ -1,6 +1,6 @@
 //! WASM bindings for ferrum Transformer SLMs.
 //!
-//! `TransformerSLMModel` loads a FINF transformer SLM and exposes next-token
+//! `TransformerSLMModel` loads a GGUF transformer SLM and exposes next-token
 //! prediction (full forward or KV-cached), sampling helpers, and the last
 //! attention map for visualization — so a trained model runs in any browser.
 
@@ -14,7 +14,7 @@ use wasm_bindgen::prelude::*;
 ///
 /// JavaScript usage:
 /// ```js
-/// const resp = await fetch('model.bin');
+/// const resp = await fetch('model.gguf');
 /// const bytes = new Uint8Array(await resp.arrayBuffer());
 /// const slm = new TransformerSLMModel(bytes);
 ///
@@ -47,7 +47,7 @@ pub struct TransformerSLMModel {
 
 #[wasm_bindgen]
 impl TransformerSLMModel {
-    /// Construct from FINF v4 bytes.
+    /// Construct from GGUF bytes.
     #[wasm_bindgen(constructor)]
     pub fn new(bytes: &[u8]) -> Result<TransformerSLMModel, JsValue> {
         let (model, _norm, meta) =

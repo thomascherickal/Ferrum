@@ -1,9 +1,9 @@
 //! Model metadata, task type, and input normalizer — the descriptive half of
-//! every FINF model file.
+//! every GGUF model file.
 //!
 //! `ModelMetadata` embeds everything a UI needs to build itself dynamically:
 //! feature names, ranges, class names, task type, and (for BPE models) the
-//! tokenizer state. It serialises to compact JSON and is stored inside the FINF
+//! tokenizer state. It serialises to compact JSON and is stored inside the GGUF
 //! model file, so a model never needs a separate config file.
 
 use crate::error::{InferError, Result};
@@ -42,7 +42,7 @@ impl TaskType {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Model metadata  (serialised to JSON, embedded in the FINF file)
+// Model metadata  (serialised to JSON, embedded in the GGUF file)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Everything the browser UI needs to build itself for an arbitrary dataset.

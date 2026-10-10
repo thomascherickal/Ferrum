@@ -1086,7 +1086,7 @@ impl LlamaTrainer {
         }
     }
     /// Snap every weight **matrix** onto the int8 grid in place, per output-row,
-    /// matching the per-channel quantization the FINF/GGUF writers use.
+    /// matching the per-channel quantization the GGUF writers use.
     fn fake_quantize_weights(&mut self) {
         let meta = param_meta(&self.model);
         for (s, (rows, is_matrix)) in param_data_mut(&mut self.model).into_iter().zip(meta) {

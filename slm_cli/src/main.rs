@@ -3,7 +3,7 @@
 //! Trains a character-level decoder-only **causal Transformer** Small
 //! Language Model from any raw text corpus — entirely on CPU, zero external
 //! dependencies. Training is int8 quantization-aware (QAT) and models are
-//! always exported as int8-quantized FINF v5 (≈4× smaller than f32).
+//! always exported as int8 GGUF (≈4× smaller than f32).
 //!
 //! Trained weights are cached on disk: if the model file already exists,
 //! `train` and `run` load it instead of retraining (use `--force` to retrain).
@@ -11,13 +11,13 @@
 //! ## Usage
 //!
 //! ```text
-//! train_transformer train    <corpus.txt> <model.bin> [options]
-//! train_transformer run      <corpus.txt> <model.bin> <seed text> [options]
-//! train_transformer generate <model.bin>  <seed text> [options]
+//! train_transformer train    <corpus.txt> <model.gguf> [options]
+//! train_transformer run      <corpus.txt> <model.gguf> <seed text> [options]
+//! train_transformer generate <model.gguf>  <seed text> [options]
 //! train_transformer run-gguf  <model.gguf> [prompt] [--resume ckpt.flck] [options]
 //! train_transformer finetune-gguf <model.gguf> <corpus.txt> <out.flck> [options]
 //! train_transformer export-gguf <in.gguf> <out.gguf> [--quant q8_0|q4_0|q4_k|…] [--resume ckpt.flck]
-//! train_transformer info     <model.bin>
+//! train_transformer info     <model.gguf>
 //! ```
 //!
 //! ### `train` / `run` options
@@ -381,16 +381,16 @@ fn print_usage() {
         "train_transformer — ferrum causal transformer SLM trainer & generator\n\
          (int8 quantization-aware training; weights cached on disk)\n\n\
          USAGE:\n\
-         \x20 train_transformer train    <corpus.txt> <model.bin> [options]\n\
-         \x20 train_transformer run      <corpus.txt> <model.bin> <seed text> [options]\n\
-         \x20 train_transformer generate <model.bin>  <seed text> [options]\n\
+         \x20 train_transformer train    <corpus.txt> <model.gguf> [options]\n\
+         \x20 train_transformer run      <corpus.txt> <model.gguf> <seed text> [options]\n\
+         \x20 train_transformer generate <model.gguf>  <seed text> [options]\n\
          \x20 train_transformer run-gguf <model.gguf> [prompt] [options]\n\
          \x20 train_transformer finetune-gguf <model.gguf> <corpus.txt> <out.flck> [options]\n\
          \x20 train_transformer export-gguf <in.gguf> <out.gguf> [options]\n\
          \x20 train_transformer export-ollama <model.gguf> <name> [--bin P] [--modelfile-only out.Modelfile]\n\
          \x20 train_transformer export-lmstudio <model.gguf> [--repo ferrum/<stem>] [--bin P]\n\
-         \x20 train_transformer eval     <model.bin>  <heldout.txt>\n\
-         \x20 train_transformer info     <model.bin>\n\n\
+         \x20 train_transformer eval     <model.gguf>  <heldout.txt>\n\
+         \x20 train_transformer info     <model.gguf>\n\n\
          TRAIN / RUN options:\n\
          \x20 --context N  --embed N  --heads N  --blocks N  --hidden N\n\
          \x20 --epochs N   --lr F     --batch N  --vocab N  --seed N\n\
@@ -429,15 +429,15 @@ fn print_usage() {
          \x20 --quant q8_0|q4_0|q4_1|q8_1|q4_k|q5_k|q6_k|f16|f32  (output precision; default q8_0)\n\
          \x20 --resume ckpt.flck  (apply a fine-tune checkpoint's f32 masters before export)\n\
          \x20 --force        (write even if the memory estimate exceeds available RAM)\n\n\
-         If <model.bin> already exists, train/run load the saved weights from\n\
+         If <model.gguf> already exists, train/run load the saved weights from\n\
          disk instead of retraining. Pass --force to retrain from scratch.\n\n\
          EXAMPLES:\n\
-         \x20 train_transformer train corpus.txt model.bin --epochs 20\n\
-         \x20 train_transformer train big.txt model.bin --context 128 --embed 128 --heads 4\n\
+         \x20 train_transformer train corpus.txt model.gguf --epochs 20\n\
+         \x20 train_transformer train big.txt model.gguf --context 128 --embed 128 --heads 4\n\
          \x20     --blocks 4 --hidden 512 --lr 0.003 --tokens 5e7 --cosine --warmup 200\n\
          \x20     --clip 1 --tie --tokenizer tok.bpe --checkpoint run.fckp --checkpoint-every 500\n\
-         \x20 train_transformer run   corpus.txt model.bin \"Once upon a time\" --chars 300\n\
-         \x20 train_transformer generate model.bin \"Once upon a time\" --temp 0.7"
+         \x20 train_transformer run   corpus.txt model.gguf \"Once upon a time\" --chars 300\n\
+         \x20 train_transformer generate model.gguf \"Once upon a time\" --temp 0.7"
     );
 }
 
@@ -570,7 +570,7 @@ fn train_and_save(
 
     slm.save(model_path)?;
     let size = std::fs::metadata(model_path)?.len();
-    println!("Saved {size} bytes → {model_path} (int8-quantized FINF v5)");
+    println!("Saved {size} bytes → {model_path} (int8 GGUF)");
 
     // Verify the file roundtrips.
     let reloaded = GenerativeSLM::load(model_path)?;
@@ -593,7 +593,7 @@ fn print_sample(slm: &GenerativeSLM, corpus: &str) -> Result<(), Box<dyn std::er
 
 fn cmd_train(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.positional.len() < 2 {
-        return Err("usage: train_transformer train <corpus.txt> <model.bin> [options]".into());
+        return Err("usage: train_transformer train <corpus.txt> <model.gguf> [options]".into());
     }
     let corpus_path = &args.positional[0];
     let model_path = &args.positional[1];
@@ -621,7 +621,7 @@ fn cmd_train(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 fn cmd_run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.positional.len() < 3 {
         return Err(
-            "usage: train_transformer run <corpus.txt> <model.bin> <seed text> [options]".into(),
+            "usage: train_transformer run <corpus.txt> <model.gguf> <seed text> [options]".into(),
         );
     }
     let corpus_path = &args.positional[0];
@@ -646,7 +646,7 @@ fn cmd_run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
 fn cmd_generate(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.positional.len() < 2 {
-        return Err("usage: train_transformer generate <model.bin> <seed text> [options]".into());
+        return Err("usage: train_transformer generate <model.gguf> <seed text> [options]".into());
     }
     let model_path = &args.positional[0];
     // Join remaining positionals so multi-word seeds work without quoting.
@@ -709,7 +709,7 @@ fn generate_text(
 
 fn cmd_eval(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.positional.len() < 2 {
-        return Err("usage: train_transformer eval <model.bin> <heldout.txt>".into());
+        return Err("usage: train_transformer eval <model.gguf> <heldout.txt>".into());
     }
     let model_path = &args.positional[0];
     let text_path = &args.positional[1];
@@ -733,27 +733,15 @@ fn cmd_eval(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
 fn cmd_info(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.positional.is_empty() {
-        return Err("usage: train_transformer info <model.bin>".into());
+        return Err("usage: train_transformer info <model.gguf>".into());
     }
     let model_path = &args.positional[0];
     let bytes =
         std::fs::read(model_path).map_err(|e| format!("cannot read model {model_path}: {e}"))?;
-    let version = if bytes.len() >= 8 {
-        u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]])
-    } else {
-        0
-    };
     let slm = GenerativeSLM::from_bytes(&bytes)?;
     let m = &slm.meta;
     println!("Model     : {model_path}  ({} bytes)", bytes.len());
-    println!(
-        "Format    : FINF v{version}{}",
-        if version == 5 {
-            " (int8-quantized)"
-        } else {
-            " (f32)"
-        }
-    );
+    println!("Format    : {}", ferrum_core::loader::gguf_format(&bytes)?);
     println!("Name      : {}", m.dataset_name);
     println!("Task      : {:?}", m.task);
     println!("Input dim : {}", m.input_dim);
@@ -1374,9 +1362,9 @@ mod tests {
 
     #[test]
     fn bool_and_positionals_mix() {
-        let a = Args::parse(&s(&["m.bin", "--stream", "hello", "-v"]), SPEC).unwrap();
+        let a = Args::parse(&s(&["m.gguf", "--stream", "hello", "-v"]), SPEC).unwrap();
         assert!(a.has("stream") && a.verbose);
-        assert_eq!(a.positional, vec!["m.bin", "hello"]);
+        assert_eq!(a.positional, vec!["m.gguf", "hello"]);
     }
 
     #[test]

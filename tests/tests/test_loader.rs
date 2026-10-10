@@ -50,7 +50,7 @@ fn roundtrip_restores_identical_outputs() {
 
 #[test]
 fn wrong_magic_fails() {
-    assert!(from_bytes(b"NOT_FINF").is_err());
+    assert!(from_bytes(b"NOT_GGUF").is_err());
 }
 
 #[test]

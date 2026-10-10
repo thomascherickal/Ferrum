@@ -19,7 +19,7 @@
 //!
 //! Sequential ──► ordered pipeline of Layers
 //!
-//! loader     ──► FINF v4/v5 binary format (save / load, int8 quantized)
+//! loader     ──► Ferrum GGUF model files (save / load, int8/int4 quantized)
 //! quant      ──► int8 fake-quantization for QAT and serialization
 //! tokenizer  ──► ByteBpeTokenizer (byte-level BPE; char-level fallback)
 //! meta       ──► ModelMetadata, Normalizer, TaskType
@@ -37,8 +37,8 @@
 //! use ferrum_core::layer::{Embedding, LayerNorm, TransformerBlock};
 //! use ferrum_core::model::Sequential;
 //!
-//! // Load a pre-trained model from FINF v4 bytes
-//! let bytes = std::fs::read("model.bin").unwrap();
+//! // Load a pre-trained model from GGUF bytes
+//! let bytes = std::fs::read("model.gguf").unwrap();
 //! let (model, _norm, meta) = from_bytes(&bytes).unwrap();
 //!
 //! // Build a context of token IDs and run one forward pass
@@ -92,8 +92,8 @@ pub use llm::{
 };
 pub use llm_train::LlamaTrainer;
 pub use loader::{
-    from_bytes, from_gguf, gguf_quant, load, save, save_quantized, save_quantized_int4, to_bytes,
-    to_bytes_quantized, to_bytes_quantized_int4, to_gguf, QPrec,
+    from_bytes, from_gguf, gguf_format, gguf_quant, load, save, save_quantized,
+    save_quantized_int4, to_bytes, to_bytes_quantized, to_bytes_quantized_int4, to_gguf, QPrec,
 };
 pub use loss::{mse, softmax_cross_entropy};
 pub use meta::{ModelMetadata, Normalizer, TaskType};

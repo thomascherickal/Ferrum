@@ -45,7 +45,7 @@ fn tiny_bpe_config() -> TransformerConfig {
 /// Unique temp path per test so parallel test runs don't collide.
 fn temp_model_path(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("ferrum_test_{}_{}.bin", name, std::process::id()));
+    p.push(format!("ferrum_test_{}_{}.gguf", name, std::process::id()));
     let _ = std::fs::remove_file(&p);
     p
 }
@@ -74,17 +74,17 @@ fn train_transformer_config_trains_a_generating_model() {
 }
 
 #[test]
-fn save_writes_int8_finf_v5_and_load_roundtrips() {
+fn save_writes_int8_gguf_and_load_roundtrips() {
     let path = temp_model_path("save_load");
     let mut rng = Rng::new(3);
     let slm = GenerativeSLM::train_transformer_config(CORPUS, &tiny_config(), &mut rng, |_, _| {})
         .unwrap();
     slm.save(path.to_str().unwrap()).unwrap();
 
-    // Saved file must be int8-quantized FINF v5.
+    // Saved file must be int8 GGUF.
     let bytes = std::fs::read(&path).unwrap();
-    assert_eq!(&bytes[0..4], b"FINF");
-    assert_eq!(&bytes[4..8], &5u32.to_le_bytes());
+    assert_eq!(&bytes[0..4], b"GGUF");
+    assert_eq!(ferrum_core::loader::gguf_quant(&bytes).unwrap(), "int8");
 
     // Loading restores a working model with the same metadata, and generation
     // from the loaded model is deterministic given the same RNG seed.
@@ -107,7 +107,7 @@ fn save_writes_int8_finf_v5_and_load_roundtrips() {
 fn save_creates_parent_directories() {
     let mut dir = std::env::temp_dir();
     dir.push(format!("ferrum_test_nested_{}", std::process::id()));
-    let path = dir.join("deep").join("model.bin");
+    let path = dir.join("deep").join("model.gguf");
     let mut rng = Rng::new(4);
     let slm = GenerativeSLM::train_transformer_config(CORPUS, &tiny_config(), &mut rng, |_, _| {})
         .unwrap();
@@ -244,10 +244,10 @@ fn bpe_save_load_roundtrips_and_is_deterministic() {
     .unwrap();
     slm.save(path.to_str().unwrap()).unwrap();
 
-    // Saved file is int8-quantized FINF v5 (QAT path), exactly like char models.
+    // Saved file is int8 GGUF (QAT path), exactly like char models.
     let bytes = std::fs::read(&path).unwrap();
-    assert_eq!(&bytes[0..4], b"FINF");
-    assert_eq!(&bytes[4..8], &5u32.to_le_bytes());
+    assert_eq!(&bytes[0..4], b"GGUF");
+    assert_eq!(ferrum_core::loader::gguf_quant(&bytes).unwrap(), "int8");
 
     let loaded = GenerativeSLM::load(path.to_str().unwrap()).unwrap();
     // The tokenizer survives serialization.

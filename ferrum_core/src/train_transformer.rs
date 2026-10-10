@@ -3,7 +3,7 @@
 //! optimised with Adam. Mirrors the `train.rs` pattern: a dedicated trainable
 //! struct (`TransformerNet`) that exports to an inference `Sequential` whose
 //! layers (`Embedding`, `TransformerBlock`, `LayerNorm`, `Linear`) serialize
-//! to FINF and run in WASM.
+//! to GGUF and run in WASM.
 
 use crate::error::{InferError, Result};
 use crate::layer::{
@@ -522,7 +522,7 @@ pub struct FwdCache {
 /// `Embedding → [TransformerBlock × N] → LayerNorm → Linear(vocab)`.
 ///
 /// Train with `forward` / `backward` / `step` (Adam), then `to_inference()`
-/// to obtain a `Sequential` that serializes to FINF and runs anywhere
+/// to obtain a `Sequential` that serializes to GGUF and runs anywhere
 /// (including WASM with KV-cached generation).
 ///
 /// `Clone` produces a deep copy of every weight, gradient, and Adam moment
@@ -1314,7 +1314,7 @@ impl TransformerNet {
 
     /// Export to an inference `Sequential`:
     /// `Embedding → blocks → LayerNorm → Linear → Softmax`.
-    /// Serializes to FINF v4 and is compatible with `TransformerSLMModel`.
+    /// Serializes to GGUF v4 and is compatible with `TransformerSLMModel`.
     pub fn to_inference(&self) -> Result<Sequential> {
         let mut m = Sequential::new();
         m.push(Box::new(Embedding::new(
@@ -1975,7 +1975,7 @@ mod tests {
     }
 
     #[test]
-    fn exported_model_roundtrips_finf() {
+    fn exported_model_roundtrips_gguf() {
         use crate::loader::{from_bytes, to_bytes};
         use crate::meta::{ModelMetadata, Normalizer, TaskType};
         let mut rng = Rng::new(33);

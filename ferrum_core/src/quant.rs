@@ -1,4 +1,4 @@
-//! Int8 quantization primitives shared by FINF serialization (post-training
+//! Int8 quantization primitives shared by GGUF serialization (post-training
 //! quantization on save) and Quantization Aware Training (QAT).
 //!
 //! Quantization is symmetric per-tensor: `value ≈ i8 × scale` with
@@ -8,7 +8,7 @@
 //! model will run with, while the optimizer keeps updating full-precision
 //! master weights (straight-through estimator).
 
-/// Tensors shorter than this stay f32 both in quantized FINF files and during
+/// Tensors shorter than this stay f32 both in quantized GGUF files and during
 /// QAT: biases and LayerNorm parameters are small (no size win) and
 /// accuracy-sensitive.
 pub const QUANT_MIN_LEN: usize = 64;
@@ -20,7 +20,7 @@ pub fn int8_scale(data: &[f32]) -> f32 {
 
 /// Snap `data` onto the symmetric int8 grid in place (quantize → dequantize).
 ///
-/// Mirrors the FINF v5 serialization rules: tensors shorter than
+/// Mirrors the GGUF serialization rules: tensors shorter than
 /// [`QUANT_MIN_LEN`] or containing non-finite values are left untouched.
 /// Returns `true` if the tensor was quantized.
 pub fn fake_quantize_int8(data: &mut [f32]) -> bool {
@@ -91,7 +91,7 @@ pub fn fake_quantize_int8_per_channel(data: &mut [f32], channels: usize) -> bool
 // weight once. Storing weights as int8 (¼ the bytes) or int4 (⅛) cuts both the
 // resident footprint *and* the bytes streamed per token, which is the only lever
 // that raises the bandwidth-limited token rate. `QWeight` is the in-memory
-// counterpart of the FINF int8/int4 on-disk encodings: symmetric, one scale per
+// counterpart of the GGUF Q8_0/Q4_0-style on-disk encodings: symmetric, one scale per
 // **input row** of the `[in_features, out_features]` matrix (the same
 // per-channel convention `int8_scales_per_channel` and the loader already use),
 // so `value ≈ q × scale[row]`.

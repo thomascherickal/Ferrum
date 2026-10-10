@@ -269,7 +269,7 @@ impl GenerativeSLM {
     /// Unlike [`GenerativeSLM::train`] (a flat one-hot MLP), this trains
     /// token + positional embeddings, `num_blocks` causal multi-head attention
     /// blocks, and an LM head end-to-end with Adam, using next-token loss at
-    /// every position. The exported model serializes to FINF v4 and runs in
+    /// every position. The exported model serializes to Ferrum GGUF and runs in
     /// WASM via `TransformerSLMModel` (including KV-cached generation).
     ///
     /// `vocab_size` selects the tokenizer: `0` is character-level (the corpus's
@@ -445,7 +445,7 @@ impl GenerativeSLM {
         Ok(Self { model, norm, meta })
     }
 
-    /// Serialize the trained Generative SLM model to self-contained FINF v4 bytes.
+    /// Serialize the trained Generative SLM model to self-contained GGUF bytes.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         vprintln!("[slm::GenerativeSLM::to_bytes] Serializing model...");
         let bytes = to_bytes(&self.model, &self.norm, &self.meta)?;
@@ -456,7 +456,7 @@ impl GenerativeSLM {
         Ok(bytes)
     }
 
-    /// Serialize to FINF v5 with int8-quantised weights (≈4× smaller files).
+    /// Serialize to Ferrum GGUF with int8-quantised weights (≈4× smaller files).
     pub fn to_bytes_quantized(&self) -> Result<Vec<u8>> {
         vprintln!("[slm::GenerativeSLM::to_bytes_quantized] Serializing quantized model...");
         let bytes = crate::loader::to_bytes_quantized(&self.model, &self.norm, &self.meta)?;
@@ -467,10 +467,9 @@ impl GenerativeSLM {
         Ok(bytes)
     }
 
-    /// Serialize to FINF v5 with **int4** weights (~8× smaller than f32). The
-    /// recommended on-disk format for large (≥1B) models: the loader keeps the
-    /// weight matrices packed in memory (int4), so a model both *fits* and
-    /// *streams ⅛ the bytes per token* on the decode hot path.
+    /// Serialize to Ferrum GGUF with **int4** weights (~8× smaller than f32). The
+    /// recommended on-disk format for large (≥1B) models: files are ⅛ the
+    /// size on disk (weights are dequantized to f32 on load).
     pub fn to_bytes_quantized_int4(&self) -> Result<Vec<u8>> {
         vprintln!("[slm::GenerativeSLM::to_bytes_quantized_int4] Serializing int4 model...");
         let bytes = crate::loader::to_bytes_quantized_int4(&self.model, &self.norm, &self.meta)?;
@@ -616,7 +615,7 @@ impl GenerativeSLM {
         best.ok_or_else(|| InferError::DimMismatch("training ran zero epochs".into()))
     }
 
-    /// Save the trained model to `model_path` as int8-quantized FINF v5
+    /// Save the trained model to `model_path` as int8-quantized Ferrum GGUF
     /// (the default on-disk format — ≈4× smaller than f32). Parent
     /// directories are created as needed.
     pub fn save(&self, model_path: &str) -> Result<()> {
@@ -635,13 +634,12 @@ impl GenerativeSLM {
         Ok(())
     }
 
-    /// Save as **int4** FINF v5 (~8× smaller than f32; the matrices load back
-    /// packed in memory). Recommended for large or GGUF-imported models. Note:
+    /// Save as **int4** Ferrum GGUF (~8× smaller than f32; the matrices load back
+    /// as f32). Note:
     /// for the small QAT-trained SLMs produced here, weights are int8-snapped
     /// during training, so [`GenerativeSLM::save`] (int8) is bit-faithful to the
     /// in-memory model whereas int4 adds extra quantization drift — int4 pays off
-    /// at scale, where fitting in RAM and streaming fewer bytes per token matter
-    /// more than the last bit of small-model accuracy.
+    /// where file size matters more than the last bit of small-model accuracy.
     pub fn save_int4(&self, model_path: &str) -> Result<()> {
         let bytes = self.to_bytes_quantized_int4()?;
         if let Some(parent) = std::path::Path::new(model_path).parent() {
@@ -658,7 +656,7 @@ impl GenerativeSLM {
         Ok(())
     }
 
-    /// Load a previously saved model (FINF v4 or v5) from `model_path`.
+    /// Load a previously saved model (Ferrum GGUF) from `model_path`.
     pub fn load(model_path: &str) -> Result<Self> {
         let bytes = std::fs::read(model_path)?;
         Self::from_bytes(&bytes)
@@ -692,7 +690,7 @@ impl GenerativeSLM {
         Ok((slm, false))
     }
 
-    /// Load a trained Generative SLM model from self-contained FINF v4 bytes.
+    /// Load a trained Generative SLM model from self-contained GGUF bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         vprintln!(
             "[slm::GenerativeSLM::from_bytes] Deserializing from {} bytes...",
@@ -1861,7 +1859,7 @@ where
 /// `vocab_size == 0` selects character-level tokenization (the sorted corpus
 /// vocabulary, identical to [`tokenize_corpus`]). `vocab_size >= 256` trains a
 /// byte-level [`ByteBpeTokenizer`] of that target size and encodes the corpus
-/// with it, so the same trainer, QAT, and FINF serialization work unchanged on
+/// with it, so the same trainer, QAT, and GGUF serialization work unchanged on
 /// subword tokens. Values in `1..256` are rejected (the 256-byte base
 /// vocabulary is irreducible).
 fn tokenize_for_lm(corpus: &str, context_len: usize, vocab_size: usize) -> Result<LmTokens> {
@@ -2366,11 +2364,10 @@ mod tests {
         assert_eq!(a.chars().count(), 4 + 10);
     }
 
-    /// End-to-end int4 (Opt#1): a trained transformer serialized to int4 and
-    /// reloaded must keep its projection weights packed in memory, generate
-    /// deterministically, and stay roughly faithful to the in-memory model.
+    /// End-to-end int4: a trained transformer serialized to int4 and reloaded
+    /// must generate deterministically.
     #[test]
-    fn int4_serialize_load_keeps_weights_packed_and_generates() {
+    fn int4_serialize_load_generates() {
         let corpus: String = "the quick brown fox jumps over the lazy dog. ".repeat(8);
         let mut rng = Rng::new(7);
         // dim 32 / 1 block keeps the test cheap while the [32,32] projections are
@@ -2380,19 +2377,8 @@ mod tests {
                 .unwrap();
 
         let bytes = slm.to_bytes_quantized_int4().unwrap();
-        // FINF v5.
-        assert_eq!(&bytes[4..8], &5u32.to_le_bytes());
+        assert_eq!(&bytes[..4], b"GGUF");
         let loaded = GenerativeSLM::from_bytes(&bytes).unwrap();
-
-        // A transformer block projection must be quantized in memory (int4).
-        let tb = loaded
-            .model
-            .layers()
-            .iter()
-            .find_map(|l| l.as_any().downcast_ref::<TransformerBlock>())
-            .expect("loaded model has a transformer block");
-        let qw = tb.q_proj.qweight().expect("q_proj kept packed in memory");
-        assert_eq!(qw.kind, crate::quant::QKind::Int4);
 
         // Generation runs and is deterministic for a fixed RNG.
         let a = loaded

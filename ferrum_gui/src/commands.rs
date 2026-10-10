@@ -531,11 +531,6 @@ pub struct ModelInfo {
 #[tauri::command]
 pub fn model_info(path: String) -> Result<ModelInfo, String> {
     let raw = std::fs::read(&path).map_err(|e| format!("cannot read {path}: {e}"))?;
-    let version = if raw.len() >= 8 {
-        u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]])
-    } else {
-        0
-    };
     let slm = GenerativeSLM::from_bytes(&raw).map_err(|e| format!("not a valid model: {e}"))?;
     let m = &slm.meta;
     let (tokenizer, merges) = if m.tokenizer_state.is_empty() {
@@ -554,14 +549,8 @@ pub fn model_info(path: String) -> Result<ModelInfo, String> {
     Ok(ModelInfo {
         path: path.clone(),
         bytes: raw.len() as u64,
-        format: format!(
-            "FINF v{version}{}",
-            if version == 5 {
-                " (int8-quantized)"
-            } else {
-                " (f32)"
-            }
-        ),
+        format: ferrum_core::loader::gguf_format(&raw)
+            .map_err(|e| format!("not a valid model: {e}"))?,
         name: m.dataset_name.clone(),
         task: format!("{:?}", m.task),
         input_dim: m.input_dim,
@@ -619,7 +608,7 @@ fn available_memory_bytes() -> Option<usize> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct GgufInfo {
+pub struct GgufSummary {
     pub path: String,
     pub bytes: u64,
     pub version: u32,
@@ -644,7 +633,7 @@ pub struct GgufInfo {
 
 /// Inspect a GGUF file without loading its weights (streamed header parse).
 #[tauri::command]
-pub async fn gguf_info(path: String) -> Result<GgufInfo, String> {
+pub async fn gguf_info(path: String) -> Result<GgufSummary, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let g = Gguf::open(&path).map_err(|e| format!("cannot open {path}: {e}"))?;
@@ -674,7 +663,7 @@ pub async fn gguf_info(path: String) -> Result<GgufInfo, String> {
         };
         let mb = |b: usize| b as f64 / 1e6;
         let param_count: u64 = g.tensors.iter().map(|t| t.num_elements() as u64).sum();
-        Ok(GgufInfo {
+        Ok(GgufSummary {
             path: path.clone(),
             bytes,
             version: g.version,
@@ -1294,6 +1283,37 @@ pub fn system_stats(state: State<'_, AppState>) -> Result<SysStats, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn model_info_reports_gguf_format_and_rejects_other_files() {
+        use ferrum_core::{GenerativeSLM, Rng};
+        let dir = std::env::temp_dir().join(format!("ferrum_gui_info_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let corpus = "abc abc abc ".repeat(20);
+        let slm = GenerativeSLM::train_transformer(
+            &corpus,
+            4,
+            16,
+            2,
+            1,
+            32,
+            4,
+            0.01,
+            4,
+            0,
+            &mut Rng::new(1),
+        )
+        .unwrap();
+        let model = dir.join("m.gguf");
+        slm.save(model.to_str().unwrap()).unwrap();
+        let info = model_info(model.to_str().unwrap().to_string()).unwrap();
+        assert_eq!(info.format, "GGUF v3 (ferrum, int8)");
+        assert!(info.bytes > 0);
+        let junk = dir.join("junk.gguf");
+        std::fs::write(&junk, b"FINF\x05\x00\x00\x00").unwrap();
+        assert!(model_info(junk.to_str().unwrap().to_string()).is_err());
+        assert!(model_info("/nonexistent/m.gguf".into()).is_err());
+    }
+
     // ── G2: download timeouts + URL validation ────────────────────────────────
 
     #[test]
@@ -1324,8 +1344,8 @@ mod tests {
 
     #[test]
     fn file_name_extracts_basename() {
-        assert_eq!(file_name("/a/b/model.bin"), "model.bin");
-        assert_eq!(file_name("model.bin"), "model.bin");
+        assert_eq!(file_name("/a/b/model.gguf"), "model.gguf");
+        assert_eq!(file_name("model.gguf"), "model.gguf");
     }
 
     // ── GGUF run params (F2: sampling knobs) ─────────────────────────────────
