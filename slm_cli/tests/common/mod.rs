@@ -44,3 +44,45 @@ pub fn tool(env: &str, name: &str, home_rel: &str) -> Result<PathBuf, String> {
         .find(|c| c.is_file())
         .ok_or_else(|| format!("{name} not found (${env}, PATH, ~/{home_rel})"))
 }
+
+/// Held while a test touches Ollama, LM Studio or their ports. Serialises threads of this
+/// process (mutex) *and* concurrent test processes (advisory `flock` on a file in the temp
+/// dir), so two `cargo test` runs never fight over the same runtime. Released on drop.
+pub struct RuntimeLock {
+    _thread: std::sync::MutexGuard<'static, ()>,
+    _file: std::fs::File,
+}
+
+static THREAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn runtime_lock_path() -> PathBuf {
+    std::env::temp_dir().join("ferrum-runtime-tests.lock")
+}
+
+fn open_lock_file() -> std::fs::File {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(runtime_lock_path())
+        .expect("open runtime lock file")
+}
+
+/// Block until this process owns the runtime lock.
+pub fn runtime_lock() -> RuntimeLock {
+    let thread = THREAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let file = open_lock_file();
+    file.lock().expect("flock runtime lock"); // blocks; the OS drops it if we die
+    RuntimeLock {
+        _thread: thread,
+        _file: file,
+    }
+}
+
+/// `true` if some other holder (this or another process) currently owns the lock.
+pub fn runtime_lock_is_held_elsewhere() -> bool {
+    matches!(
+        open_lock_file().try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    )
+}

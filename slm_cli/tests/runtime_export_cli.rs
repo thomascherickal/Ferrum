@@ -20,10 +20,9 @@ const DEV: &str = "/home/thomas/Projects/ferrum-cpu/.ferrum-dev";
 const PROMPT: &str = "Hello, my name is";
 const N: usize = 8;
 
-/// One lock for everything that touches Ollama, LM Studio or their ports.
-static RUNTIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
-fn serial() -> std::sync::MutexGuard<'static, ()> {
-    RUNTIME.lock().unwrap_or_else(|e| e.into_inner())
+/// One lock for everything that touches Ollama, LM Studio or their ports (threads and processes).
+fn serial() -> common::RuntimeLock {
+    common::runtime_lock()
 }
 
 fn gpt2() -> PathBuf {
@@ -215,11 +214,25 @@ impl Drop for TmpDir {
 
 fn spaced_link(tag: &str) -> (TmpDir, PathBuf) {
     let dir = std::env::temp_dir().join(format!("ferrum e1 {tag} {}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir); // a stale dir from a crashed run would make symlink fail with EEXIST
     std::fs::create_dir_all(&dir).unwrap();
     let guard = TmpDir(dir.clone());
     let link = dir.join("gpt2 q8.gguf");
     std::os::unix::fs::symlink(gpt2(), &link).unwrap();
     (guard, link)
+}
+
+#[test]
+fn spaced_link_survives_a_stale_dir_and_cleans_up() {
+    let (first, link1) = spaced_link("stale");
+    let dir = first.0.clone();
+    std::mem::forget(first); // simulate a crashed run that never cleaned up
+    assert!(link1.exists());
+    let (second, link2) = spaced_link("stale"); // same tag + pid -> same dir; must not EEXIST
+    assert_eq!(link1, link2);
+    assert!(link2.exists());
+    drop(second);
+    assert!(!dir.exists(), "guard must remove the dir on drop");
 }
 
 #[test]
@@ -403,7 +416,9 @@ fn ollama_down_gives_actionable_error() {
 #[test]
 fn cli_refuses_non_runnable_gguf_and_writes_modelfile() {
     let dir = std::env::temp_dir().join(format!("ferrum_e1_cli_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = TmpDir(dir.clone()); // removed even if an assertion panics
     let mut b = GgufBuilder::new();
     b.meta("general.architecture", MetaValue::String("ferrum".into()));
     let bad = dir.join("generic.gguf");
@@ -436,7 +451,6 @@ fn cli_refuses_non_runnable_gguf_and_writes_modelfile() {
     );
     let (ok, text) = exporter(&["export-ollama", "only-one-arg"], &[]);
     assert!(!ok && text.contains("usage:"), "{text}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

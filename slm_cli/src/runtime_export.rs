@@ -114,10 +114,18 @@ fn home_fallback(rel: &str) -> Option<PathBuf> {
 
 /// Run a tool; returns (success, stdout+stderr).
 fn run_tool(bin: &Path, args: &[&OsStr]) -> Result<(bool, String), String> {
-    let out = Command::new(bin)
-        .args(args)
-        .output()
-        .map_err(|e| format!("cannot run {}: {e}", bin.display()))?;
+    // ETXTBSY (26): the file is momentarily open for writing (e.g. another thread just wrote
+    // it and a concurrent fork still holds the descriptor); retry briefly instead of failing.
+    let mut tries = 0;
+    let out = loop {
+        match Command::new(bin).args(args).output() {
+            Err(e) if e.raw_os_error() == Some(26) && tries < 40 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            r => break r.map_err(|e| format!("cannot run {}: {e}", bin.display()))?,
+        }
+    };
     let text =
         String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
     Ok((out.status.success(), text))
@@ -322,11 +330,35 @@ mod tests {
     use ferrum_core::{GgufBuilder, MetaValue};
     use std::os::unix::fs::PermissionsExt;
 
-    fn tmp(tag: &str) -> PathBuf {
+    /// A fresh temp dir that is removed on drop (also when the test panics).
+    struct Tmp(PathBuf);
+    impl std::ops::Deref for Tmp {
+        type Target = PathBuf;
+        fn deref(&self) -> &PathBuf {
+            &self.0
+        }
+    }
+    impl AsRef<Path> for Tmp {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl AsRef<OsStr> for Tmp {
+        fn as_ref(&self) -> &OsStr {
+            self.0.as_os_str()
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp(tag: &str) -> Tmp {
         let d = std::env::temp_dir().join(format!("ferrum_rx_{}_{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        d
+        Tmp(d)
     }
 
     fn gguf(dir: &Path, file: &str, arch: Option<&str>, ctx: Option<u32>) -> PathBuf {
@@ -515,17 +547,19 @@ mod tests {
 
     #[test]
     fn find_tool_reads_the_real_env_and_path() {
-        let d = tmp("find_env");
-        let t = fake(&d, "envtool", "true");
-        std::env::set_var("FERRUM_RX_TEST_ENV", &t);
-        assert_eq!(
-            find_tool(None, "FERRUM_RX_TEST_ENV", "nope-xyz", None).unwrap(),
-            t
-        );
-        std::env::remove_var("FERRUM_RX_TEST_ENV");
-        let e = find_tool(None, "FERRUM_RX_TEST_ENV", "nope-xyz", None).unwrap_err();
-        assert!(e.contains("nope-xyz"), "{e}");
-        assert!(find_tool(None, "X", "sh", None).is_ok(), "sh is on PATH");
+        // No set_var/remove_var: mutating the process environment races with other tests'
+        // getenv calls. Use a variable cargo already provides, and one that is never set.
+        let unset = "FERRUM_RX_DEFINITELY_UNSET";
+        assert!(std::env::var_os(unset).is_none());
+        let e = find_tool(None, unset, "nope-xyz", None).unwrap_err();
+        assert!(e.contains("nope-xyz") && e.contains(unset), "{e}");
+        // `$CARGO` is the cargo binary when run under cargo; it must be picked up from the env.
+        if let Some(cargo) = std::env::var_os("CARGO").map(PathBuf::from) {
+            if cargo.is_file() {
+                assert_eq!(find_tool(None, "CARGO", "nope-xyz", None).unwrap(), cargo);
+            }
+        }
+        assert!(find_tool(None, unset, "sh", None).is_ok(), "sh is on PATH");
     }
 
     #[test]
@@ -632,6 +666,20 @@ mod tests {
         let e = export_ollama(&bad, "n", Some(s(&tool))).unwrap_err();
         assert!(e.contains("not runnable in llama.cpp"), "{e}");
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn run_tool_retries_while_the_script_is_still_open_for_writing() {
+        let d = tmp("txtbsy");
+        let t = fake(&d, "slowtool", "echo hi");
+        let hold = std::fs::OpenOptions::new().append(true).open(&t).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(hold);
+        });
+        let (ok, text) = run_tool(&t, &[]).unwrap();
+        release.join().unwrap();
+        assert!(ok && text.trim() == "hi", "{text}");
     }
 
     #[test]

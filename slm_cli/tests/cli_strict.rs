@@ -13,8 +13,16 @@ fn run(args: &[&str]) -> (i32, String) {
     (out.status.code().unwrap_or(-1), text)
 }
 
+/// A corpus file private to the calling test (a shared path races: `fs::write` truncates it
+/// while a parallel test is reading it, which showed up as "corpus is empty").
 fn corpus() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("ferrum_cli_strict_{}", std::process::id()));
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "ferrum_cli_strict_{}_{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join("c.txt");
     std::fs::write(&p, "abc abc abc\n".repeat(50)).unwrap();

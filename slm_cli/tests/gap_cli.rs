@@ -94,3 +94,60 @@ fn bpe_generate_accepts_short_seed_and_is_deterministic() {
     assert_eq!(a.stdout, b.stdout);
     assert!(String::from_utf8_lossy(&a.stdout).starts_with("th"));
 }
+
+#[test]
+#[ignore = "gap: CLI `generate --chars` ignores EOS (library generate_tokens stops with StopReason::Eos)"]
+fn cli_generate_stops_at_eos() {
+    let d = tmp("eosgen");
+    let corpus = d.join("c.txt");
+    let docs: Vec<String> = (0..60)
+        .map(|i| format!("The cat sat on mat {}.", i % 4))
+        .collect();
+    std::fs::write(&corpus, docs.join("\n<|endoftext|>\n")).unwrap();
+    let model = d.join("m.gguf");
+    let out = tt(&[
+        "train",
+        corpus.to_str().unwrap(),
+        model.to_str().unwrap(),
+        "--epochs",
+        "60",
+        "--context",
+        "16",
+        "--embed",
+        "32",
+        "--heads",
+        "2",
+        "--blocks",
+        "1",
+        "--hidden",
+        "64",
+        "--vocab",
+        "300",
+        "--lr",
+        "0.01",
+        "--batch",
+        "8",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let g = tt(&[
+        "generate",
+        model.to_str().unwrap(),
+        "The cat sat on mat",
+        "--temp",
+        "0",
+        "--chars",
+        "400",
+    ]);
+    assert!(g.status.success());
+    let text = String::from_utf8_lossy(&g.stdout);
+    assert!(!text.contains("endoftext"), "{text}");
+    assert!(
+        text.trim().len() < 60,
+        "generation should stop at the document end, got {} chars: {text}",
+        text.trim().len()
+    );
+}
