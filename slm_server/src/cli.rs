@@ -1,6 +1,6 @@
 //! Command-line parsing and the serve loop behind `ferrum-serve`.
 
-use crate::{app, info_for, Limits};
+use crate::{app, Limits};
 use std::future::Future;
 use std::str::FromStr;
 
@@ -70,8 +70,7 @@ pub async fn run(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), String> {
     let bytes = std::fs::read(&cfg.model).map_err(|e| format!("cannot read {}: {e}", cfg.model))?;
-    let model = ferrum_core::GenerativeSLM::from_bytes(&bytes).map_err(|e| e.to_string())?;
-    let info = info_for(&model, &bytes);
+    let (router, info) = app(bytes, cfg.limits)?;
     let listener = tokio::net::TcpListener::bind((cfg.host.as_str(), cfg.port))
         .await
         .map_err(|e| format!("cannot bind {}:{}: {e}", cfg.host, cfg.port))?;
@@ -83,7 +82,7 @@ pub async fn run(
         info.vocab,
         listener.local_addr().map_err(|e| e.to_string())?
     );
-    axum::serve(listener, app(model, info, cfg.limits))
+    axum::serve(listener, router)
         .with_graceful_shutdown(shutdown)
         .await
         .map_err(|e| e.to_string())
