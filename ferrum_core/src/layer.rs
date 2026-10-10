@@ -1466,6 +1466,56 @@ mod tests {
     }
 
     #[test]
+    fn block_ffn_uses_gelu_in_full_and_cached_paths() {
+        // Attention contributes nothing (all zero weights), so out = x + ffn2(gelu(ffn1(ln2(x)))).
+        // A negative pre-activation distinguishes GELU (-0.154 at -0.5) from ReLU (0).
+        let z = |n: usize| vec![0.0f32; n];
+        let block = TransformerBlock::new(
+            1,
+            1,
+            2,
+            vec![1.0; 2],
+            z(2),
+            z(4),
+            z(2),
+            z(4),
+            z(2),
+            z(4),
+            z(2),
+            z(4),
+            z(2),
+            vec![1.0; 2],
+            z(2),
+            vec![-0.5, 0.0],
+            z(1), // ffn1: hidden = -0.5 * norm2[0]
+            vec![1.0, 0.0],
+            z(2), // ffn2: out[0] += hidden
+        )
+        .unwrap();
+        let x = Tensor::matrix(1, 2, vec![3.0, 1.0]).unwrap();
+        let n2 = block.ln2.forward(&x).unwrap();
+        assert!(n2.data[0] > 0.9, "norm2[0] = {}", n2.data[0]);
+        let pre = -0.5 * n2.data[0];
+        let want = [3.0 + crate::activation::gelu(pre), 1.0];
+        assert!(
+            crate::activation::gelu(pre) < -0.1,
+            "test must hit the negative lobe"
+        );
+        let full = block.forward(&x).unwrap();
+        let mut cache = KvCache::new(1, 2);
+        let cached = block.forward_with_cache(&x, &mut cache).unwrap();
+        for (d, &w) in want.iter().enumerate() {
+            assert!(
+                (full.data[d] - w).abs() < 1e-6,
+                "full[{d}] {} vs {}",
+                full.data[d],
+                w
+            );
+            assert!((cached.data[d] - w).abs() < 1e-6, "cached[{d}]");
+        }
+    }
+
+    #[test]
     fn kv_cache_overflow_errors() {
         let block = minimal_block(2, 1, 4, 8);
         let mut cache = KvCache::new(2, 4);

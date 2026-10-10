@@ -546,11 +546,17 @@ impl ByteBpeTokenizer {
             tok.vocab.push(merged);
             tok.merges.push((a, b));
         }
-        for (name, ty) in tokens[n_text..].iter().zip(&token_types[n_text..]) {
+        for (k, (name, ty)) in tokens[n_text..]
+            .iter()
+            .zip(&token_types[n_text..])
+            .enumerate()
+        {
             if *ty != 3 {
                 return Err(bad(format!("token {name:?} after merges is not control")));
             }
-            tok.add_special_token(name)?;
+            if tok.add_special_token(name)? != n_text + k {
+                return Err(bad(format!("duplicate special token {name:?}")));
+            }
         }
         tok.rebuild_ranks();
         Ok(tok)
@@ -1039,5 +1045,296 @@ mod tests {
         let (t, mut m, ty) = (tok.gguf_tokens(), tok.gguf_merges(), tok.gguf_token_types());
         m[0] = "zz\u{1F338} yy".into();
         assert!(ByteBpeTokenizer::from_gguf_vocab(&t, &m, &ty).is_err());
+    }
+    fn pt(text: &str) -> Vec<&str> {
+        let got = pretokenize(text);
+        assert_eq!(got.concat(), text, "chunks must partition {text:?}");
+        assert!(got.iter().all(|c| !c.is_empty()), "empty chunk in {got:?}");
+        got
+    }
+
+    #[test]
+    fn byte_to_unicode_full_table_matches_openai_algorithm() {
+        // OpenAI gpt-2 `bytes_to_unicode()`, computed here independently.
+        let mut bs: Vec<u32> = (0x21..=0x7E)
+            .chain(0xA1..=0xAC)
+            .chain(0xAE..=0xFF)
+            .collect();
+        let mut cs = bs.clone();
+        let mut n = 0;
+        for b in 0..256u32 {
+            if !bs.contains(&b) {
+                bs.push(b);
+                cs.push(256 + n);
+                n += 1;
+            }
+        }
+        assert_eq!((bs.len(), n), (256, 68));
+        for (b, c) in bs.iter().zip(&cs) {
+            assert_eq!(byte_to_unicode(*b as u8) as u32, *c, "byte {b:#04x}");
+        }
+        // spot checks of the published table
+        assert_eq!(byte_to_unicode(0x00), '\u{100}');
+        assert_eq!(byte_to_unicode(0x20), '\u{120}'); // Ġ
+        assert_eq!(byte_to_unicode(0x7F), '\u{121}');
+        assert_eq!(byte_to_unicode(0xA0), '\u{142}');
+        assert_eq!(byte_to_unicode(0xAD), '\u{143}');
+        assert_eq!(byte_to_unicode(0xFF), 'ÿ');
+        let uniq: std::collections::HashSet<char> = (0..=255u8).map(byte_to_unicode).collect();
+        assert_eq!(uniq.len(), 256, "table is injective");
+    }
+
+    #[test]
+    fn pretokenize_contractions() {
+        assert_eq!(pt("don't"), ["don", "'t"]);
+        assert_eq!(
+            pt("I've we're they'll he'd she's I'm"),
+            ["I", "'ve", " we", "'re", " they", "'ll", " he", "'d", " she", "'s", " I", "'m"]
+        );
+        // case-sensitive, and incomplete suffixes are plain punctuation
+        assert_eq!(pt("'S"), ["'", "S"]);
+        assert_eq!(pt("'RE"), ["'", "RE"]);
+        assert_eq!(pt("'r"), ["'", "r"]);
+        assert_eq!(pt("'l"), ["'", "l"]);
+        assert_eq!(pt("'v"), ["'", "v"]);
+        assert_eq!(pt("it'"), ["it", "'"]);
+        assert_eq!(pt("'re"), ["'re"]);
+        assert_eq!(pt("'ll"), ["'ll"]);
+        assert_eq!(pt("x'rex"), ["x", "'re", "x"]);
+        assert_eq!(pt("''s"), ["''", "s"]); // contraction only at the start of a token
+        assert_eq!(pt("'t'd"), ["'t", "'d"]);
+        assert_eq!(pt("a 's"), ["a", " '", "s"]); // space-led: ` ?[^\s\p{L}\p{N}]+` wins
+    }
+
+    #[test]
+    fn pretokenize_whitespace_rules() {
+        assert_eq!(pt(""), Vec::<&str>::new());
+        assert_eq!(pt(" "), [" "]);
+        assert_eq!(pt("   "), ["   "]);
+        assert_eq!(pt("\n\n\n"), ["\n\n\n"]);
+        assert_eq!(pt("  x"), [" ", " x"]);
+        assert_eq!(pt("x \n"), ["x", " \n"]);
+        assert_eq!(pt("a\n\n b"), ["a", "\n\n", " b"]);
+        assert_eq!(pt("a\tb"), ["a", "\t", "b"]);
+        assert_eq!(pt("a \tb"), ["a", " ", "\t", "b"]);
+        assert_eq!(pt("a  !!"), ["a", " ", " !!"]);
+        assert_eq!(pt("\n word"), ["\n", " word"]);
+        assert_eq!(pt("\r\n\r\nx"), ["\r\n\r", "\n", "x"]);
+        // Unicode White_Space is whitespace; a lone leading ' ' only attaches to the next word
+        assert_eq!(pt("a\u{a0}b"), ["a", "\u{a0}", "b"]);
+        assert_eq!(pt("\u{2003}x"), ["\u{2003}", "x"]);
+        assert_eq!(pt(" \u{a0}b"), [" ", "\u{a0}", "b"]);
+        assert_eq!(pt("a\u{3000}\u{3000}"), ["a", "\u{3000}\u{3000}"]);
+    }
+
+    #[test]
+    fn pretokenize_char_classes() {
+        assert_eq!(pt("a1b2"), ["a", "1", "b", "2"]);
+        assert_eq!(pt(" 12ab"), [" 12", "ab"]);
+        assert_eq!(pt("x 3.14"), ["x", " 3", ".", "14"]);
+        assert_eq!(pt(" !"), [" !"]);
+        assert_eq!(pt("?!.. x"), ["?!..", " x"]);
+        // No (superscript), Nl (roman numeral) are numbers; Nd in other scripts too
+        assert_eq!(pt("a\u{b2}b"), ["a", "\u{b2}", "b"]);
+        assert_eq!(pt("x\u{2167}y"), ["x", "\u{2167}", "y"]);
+        assert_eq!(pt(" \u{663}\u{664}z"), [" \u{663}\u{664}", "z"]);
+        // letters: Lo (CJK/kana), Ll/Lu (Greek), Lm (modifier), Lt (titlecase)
+        assert_eq!(pt("日本語 テスト"), ["日本語", " テスト"]);
+        assert_eq!(pt("αβγ Δ"), ["αβγ", " Δ"]);
+        assert_eq!(pt("a\u{2b0}b"), ["a\u{2b0}b"]);
+        assert_eq!(pt("\u{1c5}x"), ["\u{1c5}x"]);
+        // combining marks are not letters: they split off as punctuation-like runs
+        assert_eq!(pt("e\u{301}x"), ["e", "\u{301}", "x"]);
+        // symbols, emoji, ZWJ (Cf), controls and private use are all `[^\s\p{L}\p{N}]`
+        assert_eq!(pt("😀😀 😀"), ["😀😀", " 😀"]);
+        assert_eq!(pt("a\u{200d}b"), ["a", "\u{200d}", "b"]);
+        assert_eq!(pt("\u{1}\u{2}x"), ["\u{1}\u{2}", "x"]);
+        assert_eq!(pt("\u{e000}\u{e001}"), ["\u{e000}\u{e001}"]);
+    }
+
+    #[test]
+    fn pretokenize_unassigned_codepoints_lump_with_other_like_llama_cpp() {
+        // llama.cpp b11521's table marks Cn as UNDEFINED (a nonzero flag), so its
+        // `[^\s\p{L}\p{N}]+` branch accepts them: they join the punctuation run
+        // rather than becoming one chunk each.
+        assert!(char::from_u32(0x378).is_some());
+        assert_eq!(pt("a\u{378}\u{379}b"), ["a", "\u{378}\u{379}", "b"]);
+        assert_eq!(pt(" \u{378}z"), [" \u{378}", "z"]);
+        assert_eq!(pt("!\u{378}?"), ["!\u{378}?"]);
+    }
+
+    #[test]
+    fn pretokenize_is_a_partition_for_mixed_text() {
+        let text = "Héllo, wörld!! It's 3.14 — ok?\n\n\tTab\u{a0}end  \r\n日本 😀 'x'  ";
+        let chunks = pt(text);
+        assert!(chunks.len() > 15);
+        let tok = ByteBpeTokenizer::train(&text.repeat(5), 300).unwrap();
+        assert_eq!(tok.decode(&tok.encode(text)), text);
+    }
+
+    #[test]
+    fn merges_never_cross_pretokenized_chunks() {
+        // "ab" appears only across the chunk boundary of "a" + " b"-style splits
+        let tok = ByteBpeTokenizer::train(&"a,b ".repeat(30), 300).unwrap();
+        let ids = tok.encode("a,b");
+        for id in ids {
+            if let Some(bytes) = tok.token_bytes(id) {
+                assert!(
+                    !(bytes.len() > 1 && bytes.contains(&b'a') && bytes.contains(&b',')),
+                    "token {id} spans letter and punctuation: {bytes:?}"
+                );
+            }
+        }
+    }
+
+    fn small_tok() -> ByteBpeTokenizer {
+        ByteBpeTokenizer::train(&"abab cdcd ünï ".repeat(12), 290).unwrap()
+    }
+
+    #[test]
+    fn eos_reservation_edge_cases() {
+        // 257 = 256 bytes + EOS and nothing else
+        let t = ByteBpeTokenizer::train("aaaa bbbb", 257).unwrap();
+        assert_eq!(
+            (t.vocab_size(), t.eos_id(), t.num_special()),
+            (257, Some(256), 1)
+        );
+        assert_eq!(t.gguf_merges(), Vec::<String>::new());
+        assert_eq!(t.gguf_token_types().last(), Some(&3));
+        // EOS lands directly after the last merge, wherever training stopped
+        let t = ByteBpeTokenizer::train("ab", 400).unwrap();
+        assert_eq!(
+            t.vocab_size(),
+            257,
+            "no repeated pair -> no merges, still EOS"
+        );
+        assert_eq!(t.eos_id(), Some(256));
+        let t = small_tok();
+        assert_eq!(t.eos_id(), Some(t.vocab_size() - 1));
+        assert!(t.vocab_size() <= 290);
+        assert_eq!(
+            t.decode(&[t.eos_id().unwrap()]),
+            "",
+            "EOS decodes to nothing"
+        );
+        assert_eq!(t.pad_id(), None);
+        assert_eq!(t.unk_id(), None);
+        assert_eq!(t.bos_id(), None);
+        assert!(!t.encode("<|endoftext|>").contains(&t.eos_id().unwrap()));
+    }
+
+    #[test]
+    fn standard_special_tokens_ids_and_gguf_types() {
+        let mut t = small_tok();
+        let n_text = t.vocab_size() - 1;
+        let ids = t.add_standard_special_tokens();
+        assert_eq!(ids, [n_text + 1, n_text, n_text + 2, n_text + 3]);
+        assert_eq!(t.pad_id(), Some(n_text + 2));
+        assert_eq!(t.unk_id(), Some(n_text + 3));
+        let types = t.gguf_token_types();
+        assert_eq!(types.len(), t.vocab_size());
+        assert!(types[..n_text].iter().all(|&x| x == 1));
+        assert!(types[n_text..].iter().all(|&x| x == 3));
+        let toks = t.gguf_tokens();
+        assert_eq!(
+            &toks[n_text..],
+            ["<|endoftext|>", "<bos>", "<pad>", "<unk>"]
+        );
+        let back = ByteBpeTokenizer::from_gguf_vocab(&toks, &t.gguf_merges(), &types).unwrap();
+        assert_eq!(back.encode_state(), t.encode_state());
+        assert_eq!(back.unk_id(), t.unk_id());
+    }
+
+    #[test]
+    fn gguf_tokens_map_every_byte_through_the_table() {
+        let t = small_tok();
+        let toks = t.gguf_tokens();
+        for b in 0..=255u8 {
+            assert_eq!(toks[b as usize], byte_to_unicode(b).to_string(), "byte {b}");
+        }
+        // a merged token is the concatenation of its parts' mapped chars
+        let m = t.gguf_merges();
+        for (i, line) in m.iter().enumerate() {
+            let (l, r) = line.split_once(' ').unwrap();
+            assert_eq!(format!("{l}{r}"), toks[256 + i]);
+        }
+        // multi-byte UTF-8 (ü = C3 BC) is two mapped chars (Ã¼), not one raw ü
+        assert_eq!((toks[0xC3].as_str(), toks[0xBC].as_str()), ("Ã", "¼"));
+    }
+
+    fn gguf_parts(t: &ByteBpeTokenizer) -> (Vec<String>, Vec<String>, Vec<i32>) {
+        (t.gguf_tokens(), t.gguf_merges(), t.gguf_token_types())
+    }
+
+    #[test]
+    fn from_gguf_vocab_error_paths() {
+        let t = small_tok();
+        let (tk, mg, ty) = gguf_parts(&t);
+        assert!(mg.len() >= 3);
+        let err = |tk: &[String], mg: &[String], ty: &[i32]| {
+            ByteBpeTokenizer::from_gguf_vocab(tk, mg, ty)
+                .err()
+                .map(|e| e.to_string())
+        };
+        // lengths
+        assert!(err(&tk[..tk.len() - 3], &mg, &ty[..ty.len() - 3])
+            .unwrap()
+            .contains("tokens"));
+        assert!(err(&tk, &mg, &ty[1..]).unwrap().contains("types"));
+        // byte table
+        let mut bad = tk.clone();
+        bad.swap(65, 66);
+        assert!(err(&bad, &mg, &ty).unwrap().contains("is not byte"));
+        // merge line without a separator / with unknown parts / forward reference
+        let mut m = mg.clone();
+        m[1] = "nospace".into();
+        assert!(err(&tk, &m, &ty).unwrap().contains("bad merge"));
+        let mut m = mg.clone();
+        m[1] = "ZZ YY".into();
+        assert!(err(&tk, &m, &ty).unwrap().contains("not a token"));
+        let mut m = mg.clone();
+        let j = t
+            .merges
+            .iter()
+            .position(|&(a, b)| a >= 256 || b >= 256)
+            .unwrap();
+        m[0] = mg[j].clone(); // refers to a merged token that does not exist yet
+        assert!(err(&tk, &m, &ty).unwrap().contains("later token"));
+        // token that is not the concatenation of its merge
+        let mut bad = tk.clone();
+        bad.swap(256, 257);
+        assert!(err(&bad, &mg, &ty).unwrap().contains("is not merge"));
+        // non-control token after the merges
+        let mut ty2 = ty.clone();
+        *ty2.last_mut().unwrap() = 1;
+        assert!(err(&tk, &mg, &ty2).unwrap().contains("not control"));
+        // invalid special name (contains ',')
+        let mut bad = tk.clone();
+        *bad.last_mut().unwrap() = "a,b".into();
+        assert!(err(&bad, &mg, &ty).is_some());
+        // empty merge list / no specials is fine
+        let byte_only = ByteBpeTokenizer::from_gguf_vocab(&tk[..256], &[], &ty[..256]).unwrap();
+        assert_eq!((byte_only.vocab_size(), byte_only.num_special()), (256, 0));
+    }
+
+    #[test]
+    fn from_gguf_vocab_rejects_duplicate_special_names() {
+        let mut t = small_tok();
+        t.add_special_token("<pad>").unwrap();
+        let (mut tk, mg, mut ty) = gguf_parts(&t);
+        tk.push("<pad>".into()); // same name twice: ids after it would silently shift
+        ty.push(3);
+        assert!(ByteBpeTokenizer::from_gguf_vocab(&tk, &mg, &ty).is_err());
+    }
+
+    #[test]
+    fn from_gguf_vocab_multibyte_first_char_split_follows_llama_cpp() {
+        // Merge lines split at the first space after index 1, so a left token whose
+        // first char is multi-byte (e.g. 'Ġ') still parses.
+        let t = ByteBpeTokenizer::train(&"the the the the ".repeat(10), 300).unwrap();
+        let (tk, mg, ty) = gguf_parts(&t);
+        assert!(mg.iter().any(|m| m.starts_with('Ġ')), "{mg:?}");
+        let back = ByteBpeTokenizer::from_gguf_vocab(&tk, &mg, &ty).unwrap();
+        assert_eq!(back.encode(" the the"), t.encode(" the the"));
     }
 }

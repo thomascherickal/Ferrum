@@ -13,6 +13,11 @@ pub fn gelu(x: f32) -> f32 {
 
 /// d/dx [`gelu`].
 pub fn gelu_grad(x: f32) -> f32 {
+    // tanh has saturated to exactly ±1 by |x| = 10 (so this is bit-identical),
+    // and the polynomial below would overflow to 0·inf = NaN for huge |x|.
+    if x.abs() >= 10.0 {
+        return if x > 0.0 { 1.0 } else { 0.0 };
+    }
     const K: f32 = 0.797_884_6;
     let u = K * (x + 0.044715 * x * x * x);
     let t = u.tanh();
@@ -147,6 +152,37 @@ mod tests {
             );
         }
         assert_eq!(gelu(0.0), 0.0);
+    }
+
+    #[test]
+    fn gelu_saturates_cleanly_for_large_magnitudes() {
+        for &x in &[10.0f32, 12.5, 30.0, 1e4, 1e10, 1e20, 3e38] {
+            assert_eq!(gelu(x), x, "gelu({x}) is identity for large x");
+            assert_eq!(gelu_grad(x), 1.0, "gelu'({x})");
+            assert_eq!(gelu(-x).abs(), 0.0, "gelu(-{x}) is 0");
+            assert_eq!(gelu_grad(-x), 0.0, "gelu'(-{x})");
+        }
+        // continuity just below the saturation point
+        assert!((gelu_grad(9.99) - 1.0).abs() < 1e-6);
+        assert!(gelu_grad(-9.99).abs() < 1e-6);
+    }
+
+    #[test]
+    fn gelu_known_values() {
+        // tanh-approximation reference values (computed in f64)
+        for &(x, want, wg) in &[
+            (1.0f32, 0.841_191_9, 1.082_964_1),
+            (-1.0, -0.158_808_1, -0.082_964_1),
+            (0.5, 0.345_714, 0.867_369_9),
+        ] {
+            assert!((gelu(x) - want).abs() < 2e-6, "gelu({x}) = {}", gelu(x));
+            assert!(
+                (gelu_grad(x) - wg).abs() < 2e-6,
+                "gelu'({x}) = {}",
+                gelu_grad(x)
+            );
+        }
+        assert_eq!(gelu_grad(0.0), 0.5);
     }
 
     #[test]

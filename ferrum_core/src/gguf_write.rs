@@ -1138,6 +1138,40 @@ mod tests {
     }
 
     #[test]
+    fn enc_q8_0_layout_and_reader_decode_equal_qat_snap_exactly() {
+        use crate::gguf::GGML_Q8_0;
+        // positive, negative, zero and outlier blocks
+        let mut x: Vec<f32> = (0..32 * 4)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 7.0)
+            .collect();
+        x[32..64].fill(0.0);
+        x[64..96].iter_mut().for_each(|v| *v = -v.abs());
+        x[100] = 900.0;
+        let bytes = encode_tensor(&x, GGML_Q8_0).unwrap();
+        assert_eq!(
+            bytes.len(),
+            4 * 34,
+            "34 bytes per block: f16 scale + 32 x i8"
+        );
+        for (b, blk) in bytes.chunks_exact(34).enumerate() {
+            let (d16, q) = crate::quant::q8_0_block(&x[b * 32..(b + 1) * 32]);
+            assert_eq!(
+                u16::from_le_bytes([blk[0], blk[1]]),
+                d16,
+                "scale of block {b}"
+            );
+            let got: Vec<i8> = blk[2..].iter().map(|&v| v as i8).collect();
+            assert_eq!(got, q.to_vec(), "quants of block {b}");
+        }
+        assert_eq!(&bytes[34..36], &[0, 0], "all-zero block has a zero scale");
+        // what llama.cpp reads back is bit-identical to what QAT trains against
+        let back = dequant_via_reader(&x, GGML_Q8_0, &[128]);
+        let mut snapped = x.clone();
+        crate::quant::fake_quantize_q8_0_rows(&mut snapped, 128);
+        assert_eq!(back, snapped);
+    }
+
+    #[test]
     fn enc_q8_1_within_block_bound() {
         use crate::gguf::GGML_Q8_1;
         let x: Vec<f32> = (0..64).map(|i| ((i * 5) % 11) as f32 - 5.0).collect();

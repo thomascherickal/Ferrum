@@ -351,6 +351,107 @@ mod tests {
     }
 
     #[test]
+    fn q8_0_block_rounds_half_away_from_zero_and_pins_amax_to_127() {
+        // amax = 127 -> d = 1 exactly, so q = round(x) with ties away from zero (C roundf).
+        let mut x = [0.0f32; 32];
+        x[..8].copy_from_slice(&[127.0, 0.5, 1.5, -0.5, -2.5, 2.4999, -126.5, 0.49]);
+        let (d16, q) = q8_0_block(&x);
+        assert_eq!(crate::gguf::f16_to_f32(d16), 1.0);
+        assert_eq!(&q[..8], &[127, 1, 2, -1, -3, 2, -127, 0]);
+        assert!(q[8..].iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn q8_0_block_negative_extreme_all_negative_and_single_outlier() {
+        let mut neg = [-0.01f32; 32];
+        neg[7] = -3.0;
+        let (d16, q) = q8_0_block(&neg);
+        assert_eq!(
+            q[7], -127,
+            "the largest-magnitude (negative) value maps to -127"
+        );
+        assert!(q.iter().all(|&v| v <= 0));
+        let d = crate::gguf::f16_to_f32(d16);
+        assert!(
+            (d - 3.0 / 127.0).abs() < 3.0 / 127.0 * 1e-3,
+            "f16 scale ~ amax/127: {d}"
+        );
+        // one outlier crushes the small values to the 0/-1 bins
+        assert_eq!(q[0], (-0.01f32 * (1.0 / (3.0 / 127.0))).round() as i8);
+        let mut pos = [0.0f32; 32];
+        pos[31] = 5.0;
+        let (_, q) = q8_0_block(&pos);
+        assert_eq!((q[31], q[..31].iter().all(|&v| v == 0)), (127, true));
+    }
+
+    #[test]
+    fn q8_0_all_zero_block_has_zero_scale_and_snaps_to_zero_without_nan() {
+        let (d16, q) = q8_0_block(&[0.0; 32]);
+        assert_eq!((d16, q), (0, [0i8; 32]));
+        let mut w = vec![0.0f32; 64];
+        fake_quantize_q8_0_rows(&mut w, 32);
+        assert!(w.iter().all(|&v| v == 0.0 && v.is_finite()));
+        // sub-f16-range block: the stored scale underflows to 0 -> snaps to zero, never NaN
+        let mut tiny = vec![1e-30f32; 32];
+        fake_quantize_q8_0_rows(&mut tiny, 32);
+        assert!(tiny.iter().all(|v| v.is_finite()), "{tiny:?}");
+    }
+
+    #[test]
+    fn q8_0_snap_equals_q_times_f16_scale_and_blocks_are_independent() {
+        // two blocks with very different magnitudes keep their own scales
+        let mut w: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.001).collect();
+        w.extend((0..32).map(|i| (i as f32 - 16.0) * 100.0));
+        let orig = w.clone();
+        fake_quantize_q8_0_rows(&mut w, 64);
+        for b in 0..2 {
+            let src = &orig[b * 32..(b + 1) * 32];
+            let (d16, q) = q8_0_block(src);
+            let d = crate::gguf::f16_to_f32(d16);
+            for k in 0..32 {
+                assert_eq!(w[b * 32 + k], q[k] as f32 * d, "block {b} elem {k}");
+            }
+            let amax = src.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+            for k in 0..32 {
+                assert!((w[b * 32 + k] - src[k]).abs() <= amax / 127.0 * 0.51 + amax * 1e-3);
+            }
+        }
+    }
+
+    #[test]
+    fn q8_0_cols_blocks_run_down_each_column_and_match_transposed_rows() {
+        let (rows, cols) = (64usize, 5usize);
+        let orig: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i * 29 % 97) as f32 - 48.0) * (1.0 + (i % cols) as f32))
+            .collect();
+        let mut w = orig.clone();
+        fake_quantize_q8_0_cols(&mut w, rows, cols);
+        // reference: transpose to [cols][rows] (GGML ne0 = rows), snap rows, transpose back
+        let mut t: Vec<f32> = (0..cols)
+            .flat_map(|j| (0..rows).map(move |i| (i, j)))
+            .map(|(i, j)| orig[i * cols + j])
+            .collect();
+        fake_quantize_q8_0_rows(&mut t, rows);
+        for i in 0..rows {
+            for j in 0..cols {
+                assert_eq!(w[i * cols + j], t[j * rows + i], "({i},{j})");
+            }
+        }
+    }
+
+    #[test]
+    fn q8_0_degenerate_shapes_are_noops() {
+        let orig = vec![1.5f32; 64];
+        let mut w = orig.clone();
+        fake_quantize_q8_0_rows(&mut w, 0);
+        fake_quantize_q8_0_cols(&mut w, 0, 4);
+        fake_quantize_q8_0_cols(&mut w, 63, 1);
+        assert_eq!(w, orig);
+        assert!(q8_0_eligible(32) && q8_0_eligible(0) && q8_0_eligible(4096));
+        assert!(!q8_0_eligible(31) && !q8_0_eligible(33) && !q8_0_eligible(48));
+    }
+
+    #[test]
     fn q8_0_ineligible_is_untouched_and_rows_snap() {
         let orig: Vec<f32> = (0..48 * 3).map(|i| i as f32 * 0.013).collect();
         let mut w = orig.clone();

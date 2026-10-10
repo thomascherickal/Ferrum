@@ -2108,6 +2108,40 @@ mod tests {
         assert_eq!(serial.snapshot_weights(), threaded.snapshot_weights());
     }
 
+    /// QAT and gradient clipping must also run (and stay finite, restoring the
+    /// f32 masters) on the multi-shard path.
+    #[test]
+    fn threaded_multishard_qat_and_clip_train_and_keep_masters() {
+        let mut rng0 = Rng::new(21);
+        let mut net = TransformerNet::new(4, 32, 32, 2, 32, 1, &mut rng0).unwrap();
+        net.set_qat(true);
+        net.set_grad_clip(Some(0.05));
+        let tokens: Vec<usize> = (0..200).map(|i| (i * 3) % 4).collect();
+        let adam = Adam::new(0.01);
+        let mut rng = Rng::new(9);
+        let before = net.snapshot_weights();
+        let first =
+            train_transformer_epoch_threaded(&mut net, &tokens, 16, &adam, &mut rng, 3).unwrap();
+        let mut last = first;
+        for _ in 0..5 {
+            last = train_transformer_epoch_threaded(&mut net, &tokens, 16, &adam, &mut rng, 3)
+                .unwrap();
+        }
+        assert!(first.is_finite() && last < first, "{first} -> {last}");
+        let after = net.snapshot_weights();
+        assert!(after.iter().flatten().all(|v| v.is_finite()));
+        assert_ne!(before, after);
+        // masters are restored after each step: they are not sitting on the Q8_0 grid
+        let mut snapped = after.clone();
+        net.fake_quantize_weights();
+        let grid = net.snapshot_weights();
+        assert_ne!(
+            snapped.remove(0),
+            grid[0],
+            "f32 masters must not be left snapped"
+        );
+    }
+
     /// Data-parallel training reduces loss like the serial path.
     #[test]
     fn threaded_multishard_reduces_loss() {
