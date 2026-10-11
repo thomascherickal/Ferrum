@@ -53,8 +53,10 @@ class Fixture:
         self.test.write_text("A a. B b. C c. D d. E e.<|endoftext|>F f. G g. H h. I i. J j.")
         self.out = self.root / "res/out.json"
 
-    def run(self, *extra, timeout=60):
-        env = dict(os.environ, FERRUM_LIGHTEVAL_VENV=str(self.root / "venv"), PATH=f"{self.root/'bin'}:{os.environ['PATH']}")
+    def run(self, *extra, timeout=60, env_extra=None):
+        env = {k: v for k, v in os.environ.items() if k != "CARGO_TARGET_DIR"}
+        env.update(env_extra or {})
+        env.update( FERRUM_LIGHTEVAL_VENV=str(self.root / "venv"), PATH=f"{self.root/'bin'}:{os.environ['PATH']}")
         return subprocess.run(
             ["bash", str(self.root / "eval/lighteval/run.sh"), "--model", "m.bin", "--test", str(self.test), "--out", str(self.out), "--port", str(free_port()), *extra],
             capture_output=True, text=True, env=env, timeout=timeout,
@@ -105,6 +107,14 @@ class RunShTest(unittest.TestCase):
         self.assertNotIn("--max-samples", argv)
         self.assertIn("wikitext:103:document_level|0", argv)
         self.assertIsNone(json.loads(fx.out.read_text())["max_samples"])
+
+    def test_honours_cargo_target_dir(self):
+        fx = Fixture(DEAD_SERVER)  # the default location holds a server that dies
+        alt = fx.root / "alt-target"
+        exe(alt / "release/ferrum-serve", GOOD_SERVER)
+        r = fx.run(env_extra={"CARGO_TARGET_DIR": str(alt)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(fx.out.exists())
 
     def test_bad_arguments(self):
         fx = Fixture(GOOD_SERVER)

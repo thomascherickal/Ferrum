@@ -26,7 +26,7 @@ work="$here/out"; rm -rf "$work"; mkdir -p "$work"
 "$py" "$here/make_task_data.py" "$test" "$work/data"
 
 (cd "$root" && cargo build --release -q -p slm_server)
-"$root/target/release/ferrum-serve" --model "$model" --port "$port" 2>"$work/server.log" &
+"${CARGO_TARGET_DIR:-$root/target}/release/ferrum-serve" --model "$model" --port "$port" 2>"$work/server.log" &
 srv=$!
 trap 'kill $srv 2>/dev/null || true' EXIT
 for _ in $(seq 1 600); do   # up to 60 s; bail out early if the server died
