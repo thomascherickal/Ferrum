@@ -981,14 +981,13 @@ impl GenerativeSLM {
     ///
     /// Maintains a rolling window of the most recent ≤ `context_len` token IDs
     /// in a per-block [`KvCache`] and samples one character per step. While the
-    /// window is below capacity each step is a single O(context) cached `feed`;
-    /// once the window is full the cache is re-primed with the most recent
-    /// `context_len` tokens before the next prediction. Because that re-prime
-    /// reconstructs exactly the same `context_len`-token window at positions
-    /// `0..context_len-1` that the previous (full-forward) path fed, this
-    /// produces **bit-identical** output to the old path for any seed at least
-    /// `context_len` characters long, while being strictly faster whenever the
-    /// generated sequence fits within the context window.
+    /// window is below capacity each step is a single O(context) cached `feed`.
+    /// When it overflows, the cache is re-primed from the newest half window
+    /// (learned absolute positions rule out sliding the cache by one), so the
+    /// cost is one re-prime per `context_len / 2` characters: linear in the
+    /// number of generated characters. Output within the first `context_len`
+    /// characters matches the old full-forward path bit for bit; past that the
+    /// model sees a half-window of history right after each re-prime.
     #[allow(clippy::too_many_arguments)]
     fn generate_char_cached_stream<F>(
         &self,
@@ -1062,7 +1061,9 @@ impl GenerativeSLM {
             // cache incrementally with a single cheap feed.
             window.push(next_idx);
             if window.len() > cap {
-                window.remove(0);
+                // Re-prime from the newest half window: one re-prime per cap/2
+                // tokens instead of one per token.
+                window.drain(..window.len() - (cap / 2).max(1));
                 dist = cached.prime(&window)?;
             } else {
                 dist = cached.feed(next_idx)?;
@@ -1077,22 +1078,24 @@ impl GenerativeSLM {
     }
 
     /// Streaming BPE generation path. Rebuilds the stored [`ByteBpeTokenizer`],
-    /// encodes the seed to token IDs, samples one token at a time from the model,
-    /// and decodes the whole token stream back to text. Generation continues
-    /// until at least `num_chars` characters have been added past the seed, then
-    /// the result is trimmed to exactly that length so the character contract
-    /// matches the char-level path.
+    /// encodes the seed (document separators become EOS), samples one token at a
+    /// time and stops at EOS (the end of the document), at `num_chars`
+    /// characters past the seed, or at the `stop` string, whichever comes first.
+    /// The result is `seed` verbatim followed by the continuation, so the
+    /// character contract matches the char-level path.
     ///
-    /// Genuine transformer models drive a per-block [`KvCache`] (O(context) per
-    /// token, the same fast path as the char-level and WASM builds); models
-    /// without transformer blocks (the embedded-MLP BPE family) fall back to a
-    /// full forward over the last `context_len` tokens, left-padded with token 0
-    /// when the prompt is shorter than the window.
+    /// Genuine transformer models drive a per-block [`KvCache`] (the same fast
+    /// path as the char-level and WASM builds): one cached `feed` per token and
+    /// one re-prime from the newest half window per `context_len / 2` tokens,
+    /// with the continuation decoded incrementally, so the cost is linear in
+    /// the generated length. Models without transformer blocks (the
+    /// embedded-MLP BPE family) fall back to a full forward over the last
+    /// `context_len` tokens, left-padded with token 0 when the prompt is shorter
+    /// than the window.
     ///
-    /// As tokens land, the newly decoded continuation characters are streamed to
-    /// `on_text`, holding back the final (possibly partial) character until the
-    /// next token completes it so a `U+FFFD` placeholder is never emitted and
-    /// then revised.
+    /// Newly decoded continuation characters are streamed to `on_text` as tokens
+    /// land. A trailing partial multi-byte character is held back until it
+    /// completes, so a `U+FFFD` placeholder is never emitted and then revised.
     #[allow(clippy::too_many_arguments)]
     fn generate_bpe_stream<F>(
         &self,
@@ -1108,28 +1111,103 @@ impl GenerativeSLM {
     {
         let tok = ByteBpeTokenizer::from_state(&self.meta.tokenizer_state)?;
         let context_len = self.meta.input_dim;
-        let seed_chars = seed.chars().count();
-        let target_chars = seed_chars + num_chars;
-
-        let mut ids: Vec<usize> = tok.encode(seed);
+        let eos = tok.eos_id();
+        let ids = tok.encode_docs(seed);
         vprintln!(
-            "[slm::generate_bpe] seed encoded to {} tokens, ctx={}, target_chars={}",
+            "[slm::generate_bpe] seed encoded to {} tokens, ctx={}, num_chars={}",
             ids.len(),
             context_len,
-            target_chars
+            num_chars
         );
 
-        // Number of continuation characters already streamed (never includes the
-        // seed). Emit a delta after every token so output is incremental, capped
-        // at `budget` continuation chars (which tightens to the stop position).
-        let mut emitted_cont = 0usize;
-        let mut flush = |full: &str, hold_back_partial: bool, budget: usize, on_text: &mut F| {
-            let cont_chars = full.chars().count().saturating_sub(seed_chars);
-            let avail = if hold_back_partial {
-                cont_chars.saturating_sub(1).min(budget)
+        // Bound the loop: every step adds ≥1 byte, but guard against a model
+        // that keeps emitting zero-width or repeated control tokens.
+        let max_steps = num_chars * 8 + 64;
+
+        if let Some(mut cached) = CachedTransformer::try_new(&self.model) {
+            // Fast path: KV-cached incremental decoding over a rolling window.
+            let cap = cached.capacity().max(2);
+            let mut window: Vec<usize> = if ids.is_empty() {
+                vec![eos.unwrap_or(0)]
             } else {
-                cont_chars.min(budget)
+                ids[ids.len().saturating_sub(cap)..].to_vec()
             };
+            let mut dist = cached.prime(&window)?;
+            let stop_len = stop.map_or(0, str::len);
+            let mut cont = String::new(); // decoded continuation (complete chars)
+            let mut cont_chars = 0usize;
+            let mut pending: Vec<u8> = Vec::new(); // incomplete trailing UTF-8
+                                                   // Continuation chars (and their bytes) already streamed.
+            let (mut emitted, mut emitted_bytes) = (0usize, 0usize);
+            // The continuation-char budget: `num_chars`, tightened to the stop
+            // position when one is hit.
+            let mut budget = num_chars;
+            let mut steps = 0;
+            while cont_chars < num_chars && steps < max_steps {
+                let logits: Vec<f32> = dist.iter().map(|&p| p.max(1e-12).ln()).collect();
+                let next = sample_with_params(&logits, params, &window, rng);
+                if Some(next) == eos {
+                    break; // end of document
+                }
+                steps += 1;
+                let before = cont.len();
+                pending.extend_from_slice(tok.token_bytes(next).unwrap_or(&[]));
+                drain_utf8(&mut pending, &mut cont);
+                cont_chars += cont[before..].chars().count();
+                if let Some(s) = stop {
+                    // Only the tail can contain a newly completed stop string.
+                    let from = (0..=before.saturating_sub(stop_len))
+                        .rev()
+                        .find(|&i| cont.is_char_boundary(i))
+                        .unwrap_or(0);
+                    if let Some(i) = cont[from..].find(s) {
+                        budget = cont[..from + i + s.len()].chars().count().min(num_chars);
+                        break;
+                    }
+                }
+                let avail = cont_chars.min(budget);
+                if avail > emitted {
+                    let delta: String = cont[emitted_bytes..]
+                        .chars()
+                        .take(avail - emitted)
+                        .collect();
+                    on_text(&delta);
+                    emitted = avail;
+                    emitted_bytes += delta.len();
+                }
+                window.push(next);
+                if window.len() > cap {
+                    // One re-prime per cap/2 tokens, not one per token.
+                    window.drain(..window.len() - cap / 2);
+                    dist = cached.prime(&window)?;
+                } else {
+                    dist = cached.feed(next)?;
+                }
+            }
+            if !pending.is_empty() {
+                cont.push_str(&String::from_utf8_lossy(&pending));
+            }
+            let tail: String = cont[emitted_bytes..]
+                .chars()
+                .take(budget.saturating_sub(emitted))
+                .collect();
+            if !tail.is_empty() {
+                on_text(&tail);
+            }
+            return Ok(seed.chars().chain(cont.chars().take(budget)).collect());
+        }
+
+        // Fallback (no transformer blocks): full forward over the last
+        // `context_len` tokens, left-padded with token 0 when too short.
+        // ponytail: re-decodes the whole stream every step (O(n²)); this family
+        // is tiny and legacy. Port the incremental decode above if it matters.
+        let mut ids = ids;
+        let seed_chars = seed.chars().count();
+        let target_chars = seed_chars + num_chars;
+        let mut emitted_cont = 0usize;
+        let mut budget = num_chars;
+        let mut flush = |full: &str, budget: usize, on_text: &mut F| {
+            let avail = full.chars().count().saturating_sub(seed_chars).min(budget);
             if avail > emitted_cont {
                 let delta: String = full
                     .chars()
@@ -1140,101 +1218,42 @@ impl GenerativeSLM {
                 emitted_cont = avail;
             }
         };
-
-        // Continuation-char count up to and including the first `stop` match
-        // (I3), if present in the decoded continuation.
-        let stop_cut = |full: &str| -> Option<usize> {
-            let s = stop?;
-            let cont: String = full.chars().skip(seed_chars).collect();
-            cont.find(s).map(|b| cont[..b + s.len()].chars().count())
-        };
-
-        // Bound the loop: every step adds ≥1 byte, but guard against a model
-        // that keeps emitting zero-width or repeated control tokens.
-        let max_steps = num_chars * 8 + 64;
-        // The continuation-char budget that finally bounds the output: `num_chars`
-        // normally, tightened to the stop position when one is hit.
-        let mut budget = num_chars;
-
-        if let Some(mut cached) = CachedTransformer::try_new(&self.model) {
-            // Fast path: KV-cached incremental decoding. A rolling window of the
-            // most recent ≤ capacity tokens lives in the cache; each step is a
-            // single O(context) `feed` until the window fills, then a re-prime.
-            let cap = cached.capacity().max(1);
-            let mut window: Vec<usize> = if ids.is_empty() {
-                vec![0]
+        let mut steps = 0;
+        while tok.decode(&ids).chars().count() < target_chars && steps < max_steps {
+            let mut ctx: Vec<f32> = Vec::with_capacity(context_len);
+            if ids.len() < context_len {
+                ctx.resize(context_len - ids.len(), 0.0);
+                ctx.extend(ids.iter().map(|&t| t as f32));
             } else {
-                ids[ids.len().saturating_sub(cap)..].to_vec()
-            };
-            let mut dist = cached.prime(&window)?;
-
-            let mut steps = 0;
-            while tok.decode(&ids).chars().count() < target_chars && steps < max_steps {
-                let logits: Vec<f32> = dist.iter().map(|&p| p.max(1e-12).ln()).collect();
-                let next = sample_with_params(&logits, params, &window, rng);
-                ids.push(next);
-                steps += 1;
-                let full = tok.decode(&ids);
-                // I3: stop at a natural boundary if the stop string appeared.
-                if let Some(cut) = stop_cut(&full) {
-                    budget = cut.min(num_chars);
+                ctx.extend(ids[ids.len() - context_len..].iter().map(|&t| t as f32));
+            }
+            let input = Tensor::matrix(1, context_len, ctx)?;
+            let out = self.model.forward(&input)?;
+            let (rows, cols) = out.matrix_dims()?;
+            let logits: Vec<f32> = out.data[(rows - 1) * cols..]
+                .iter()
+                .map(|&p| p.max(1e-12).ln())
+                .collect();
+            let recent = &ids[ids.len().saturating_sub(context_len)..];
+            let next = sample_with_params(&logits, params, recent, rng);
+            if Some(next) == eos {
+                break; // end of document
+            }
+            ids.push(next);
+            steps += 1;
+            let full = tok.decode(&ids);
+            if let Some(s) = stop {
+                let cont: String = full.chars().skip(seed_chars).collect();
+                if let Some(b) = cont.find(s) {
+                    budget = cont[..b + s.len()].chars().count().min(num_chars);
                     break;
                 }
-                flush(&full, true, budget, &mut on_text);
-
-                window.push(next);
-                if window.len() > cap {
-                    window.remove(0);
-                    dist = cached.prime(&window)?;
-                } else {
-                    dist = cached.feed(next)?;
-                }
             }
-        } else {
-            // Fallback (no transformer blocks): full forward over the last
-            // `context_len` tokens, left-padded with token 0 when too short.
-            let mut steps = 0;
-            while tok.decode(&ids).chars().count() < target_chars && steps < max_steps {
-                let mut ctx: Vec<f32> = Vec::with_capacity(context_len);
-                if ids.len() < context_len {
-                    ctx.resize(context_len - ids.len(), 0.0);
-                    ctx.extend(ids.iter().map(|&t| t as f32));
-                } else {
-                    ctx.extend(ids[ids.len() - context_len..].iter().map(|&t| t as f32));
-                }
-                let input = Tensor::matrix(1, context_len, ctx)?;
-                let out = self.model.forward(&input)?;
-                let (rows, cols) = out.matrix_dims()?;
-                let logits: Vec<f32> = out.data[(rows - 1) * cols..]
-                    .iter()
-                    .map(|&p| p.max(1e-12).ln())
-                    .collect();
-                let recent_start = ids.len().saturating_sub(context_len);
-                let recent = ids[recent_start..].to_vec();
-                let next = sample_with_params(&logits, params, &recent, rng);
-                ids.push(next);
-                steps += 1;
-                let full = tok.decode(&ids);
-                if let Some(cut) = stop_cut(&full) {
-                    budget = cut.min(num_chars);
-                    break;
-                }
-                flush(&full, true, budget, &mut on_text);
-            }
+            flush(&full, budget, &mut on_text);
         }
-
-        // Decode the full token stream, emit any remaining continuation chars up
-        // to the final budget, and trim to exactly that many.
         let full = tok.decode(&ids);
-        flush(&full, false, budget, &mut on_text);
-        let trimmed: String = full.chars().take(seed_chars + budget).collect();
-        vprintln!(
-            "[slm::generate_bpe] generated {} tokens → {} chars (trimmed to {})",
-            ids.len(),
-            full.chars().count(),
-            trimmed.chars().count()
-        );
-        Ok(trimmed)
+        flush(&full, budget, &mut on_text);
+        Ok(full.chars().take(seed_chars + budget).collect())
     }
 
     /// Generate a completion from `seed` and return **only the newly generated
@@ -1944,6 +1963,12 @@ struct CachedTransformer<'a> {
     capacity: usize,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of `CachedTransformer::feed` calls on this thread.
+    static FEEDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl<'a> CachedTransformer<'a> {
     /// Build a driver if `model` contains at least one `TransformerBlock`.
     fn try_new(model: &'a Sequential) -> Option<Self> {
@@ -1984,6 +2009,8 @@ impl<'a> CachedTransformer<'a> {
     /// list exactly like a full forward, but routes the embedding through
     /// `embed_one(token, pos)` and each block through `forward_with_cache`.
     fn feed(&mut self, token: usize) -> Result<Vec<f32>> {
+        #[cfg(test)]
+        FEEDS.with(|f| f.set(f.get() + 1));
         let mut x: Option<Tensor> = None;
         let mut block_idx = 0usize;
         for layer in self.model.layers() {
@@ -3340,5 +3367,281 @@ mod tests {
         assert!(all_e.greedy);
         assert_eq!(all_e.n_tokens, 3);
         assert_eq!(slm.score("ab", "e").unwrap().n_tokens, 1);
+    }
+
+    // ── Linear-time legacy generation (Phase 1A Task 1) ───────────────────────
+
+    fn feeds() -> usize {
+        FEEDS.with(|f| f.get())
+    }
+
+    /// Byte-level BPE model without transformer blocks whose output is a fixed
+    /// distribution: `Linear` of zero weights plus `bias` over the token ids.
+    fn constant_bpe_slm(bias_for: impl Fn(&ByteBpeTokenizer) -> Vec<f32>) -> GenerativeSLM {
+        let tok = ByteBpeTokenizer::train("the cat sat on the mat. ", 280).unwrap();
+        let bias = bias_for(&tok);
+        let v = tok.vocab_size();
+        let lin = crate::layer::Linear::new(4, v, vec![0.0; 4 * v], bias).unwrap();
+        let model = Sequential::new().with(Box::new(lin)).with(Box::new(
+            crate::layer::ActivationLayer::new(crate::activation::Activation::Softmax),
+        ));
+        let meta = ModelMetadata {
+            task: TaskType::TransformerSLM,
+            input_dim: 4,
+            output_dim: v,
+            tokenizer_state: tok.encode_state(),
+            ..ModelMetadata::default()
+        };
+        GenerativeSLM::new(
+            model,
+            Normalizer {
+                means: vec![],
+                stds: vec![],
+            },
+            meta,
+        )
+    }
+
+    #[test]
+    fn bpe_generation_reprimes_once_per_half_window() {
+        let slm = tiny_bpe_slm(); // context 8
+        FEEDS.with(|f| f.set(0));
+        let n = 400; // chars >> context
+        let out = slm
+            .generate_with(
+                "the cat",
+                n,
+                &SamplingParams::with_temperature(0.8),
+                &mut Rng::new(5),
+            )
+            .unwrap();
+        assert!(out.chars().count() >= "the cat".len());
+        // Each token costs one feed plus, every cap/2 tokens, a re-prime of cap/2
+        // feeds: <= 2 feeds per token. The old path re-primed the whole window
+        // for every token (about cap feeds per token).
+        let tokens = ByteBpeTokenizer::from_state(&slm.meta.tokenizer_state)
+            .unwrap()
+            .encode(&out["the cat".len()..])
+            .len();
+        assert!(
+            feeds() <= 2 * tokens + 16,
+            "feeds={} tokens={tokens}",
+            feeds()
+        );
+    }
+
+    #[test]
+    fn seed_with_doc_separator_is_preserved() {
+        let corpus = "the cat sat.<|endoftext|>the dog ran.<|endoftext|>".repeat(30);
+        let cfg = TransformerConfig {
+            context_len: 8,
+            embed_dim: 8,
+            num_heads: 2,
+            num_blocks: 1,
+            hidden_dim: 16,
+            epochs: 1,
+            vocab_size: 280,
+            ..TransformerConfig::default()
+        };
+        let slm =
+            GenerativeSLM::train_transformer_config(&corpus, &cfg, &mut Rng::new(2), |_, _| {})
+                .unwrap();
+        let seed = "the cat sat.<|endoftext|>the";
+        let out = slm.generate(seed, 20, 0.8, &mut Rng::new(1)).unwrap();
+        assert!(out.starts_with(seed), "{out:?}");
+        // The model may end the document early; it never exceeds the budget.
+        assert!(out.chars().count() <= seed.chars().count() + 20);
+    }
+
+    #[test]
+    fn char_generation_reprimes_once_per_half_window() {
+        let slm = tiny_char_slm(); // context 8
+        FEEDS.with(|f| f.set(0));
+        let n = 300;
+        let out = slm.generate("abcabcab", n, 0.8, &mut Rng::new(1)).unwrap();
+        assert_eq!(out.chars().count(), 8 + n);
+        assert!(feeds() <= 2 * n + 16, "feeds={}", feeds());
+    }
+
+    #[test]
+    fn char_generation_survives_a_one_token_window() {
+        // Window of 1: the half-window keeps at least one token.
+        let corpus = "abab".repeat(30);
+        let cfg = TransformerConfig {
+            context_len: 1,
+            embed_dim: 8,
+            num_heads: 2,
+            num_blocks: 1,
+            hidden_dim: 16,
+            epochs: 1,
+            vocab_size: 0,
+            ..TransformerConfig::default()
+        };
+        let slm =
+            GenerativeSLM::train_transformer_config(&corpus, &cfg, &mut Rng::new(1), |_, _| {})
+                .unwrap();
+        let out = slm.generate("a", 12, 0.8, &mut Rng::new(1)).unwrap();
+        assert_eq!(out.chars().count(), 13);
+    }
+
+    #[test]
+    fn generation_stops_at_eos_and_streams_the_same_text() {
+        let slm = tiny_eos_slm();
+        let p = greedy();
+        let mut streamed = String::new();
+        let out = slm
+            .generate_stream_with("the cat", 200, &p, &mut Rng::new(1), |f| {
+                streamed.push_str(f)
+            })
+            .unwrap();
+        let g = slm
+            .generate_tokens("the cat", 200, &[], &p, &mut Rng::new(1))
+            .unwrap();
+        assert_eq!(g.stop_reason, StopReason::Eos, "{g:?}");
+        // The continuation ends at the document end (EOS), not at the budget.
+        assert_eq!(out, format!("the cat{}", g.text));
+        assert!(out.chars().count() < "the cat".len() + 200);
+        assert_eq!(streamed, g.text);
+        // With a stop string that never matches, EOS still ends generation.
+        let until = slm
+            .generate_until("the cat", 200, "#none#", &p, &mut Rng::new(1))
+            .unwrap();
+        assert_eq!(until, out);
+    }
+
+    #[test]
+    fn generate_until_cuts_after_a_stop_spanning_tokens() {
+        let slm = tiny_bpe_slm();
+        let p = greedy();
+        let free = slm
+            .generate_tokens("the cat", 40, &[], &p, &mut Rng::new(1))
+            .unwrap()
+            .text;
+        // A 4-char stop taken from the middle of the free run spans tokens.
+        let stop: String = free.chars().skip(3).take(4).collect();
+        let want_end = free.find(&stop).unwrap() + stop.len();
+        let mut streamed = String::new();
+        let out = slm
+            .generate_stream_until("the cat", 40, &stop, &p, &mut Rng::new(1), |f| {
+                streamed.push_str(f)
+            })
+            .unwrap();
+        assert_eq!(out, format!("the cat{}", &free[..want_end]));
+        assert_eq!(streamed, &free[..want_end]);
+    }
+
+    #[test]
+    fn generate_until_honours_the_char_budget_over_a_later_stop() {
+        let slm = tiny_bpe_slm();
+        let p = greedy();
+        let free = slm
+            .generate_tokens("the cat", 40, &[], &p, &mut Rng::new(1))
+            .unwrap()
+            .text;
+        // The stop sits past the 3-char budget: the budget wins.
+        let stop: String = free.chars().skip(6).take(3).collect();
+        let out = slm
+            .generate_until("the cat", 3, &stop, &p, &mut Rng::new(1))
+            .unwrap();
+        assert_eq!(
+            out,
+            format!("the cat{}", free.chars().take(3).collect::<String>())
+        );
+    }
+
+    #[test]
+    fn bpe_generation_streams_multibyte_text_without_replacement_chars() {
+        let slm = tiny_utf8_slm();
+        let p = greedy();
+        let mut streamed = String::new();
+        let out = slm
+            .generate_stream_with("\u{e9}", 5, &p, &mut Rng::new(1), |f| streamed.push_str(f))
+            .unwrap();
+        assert_eq!(out, "\u{e9}".repeat(6));
+        assert_eq!(streamed, "\u{e9}".repeat(5));
+        // A multi-byte stop string sits on char boundaries.
+        let until = slm
+            .generate_until("\u{e9}", 20, "\u{e9}\u{e9}", &p, &mut Rng::new(1))
+            .unwrap();
+        assert_eq!(until, "\u{e9}".repeat(3));
+    }
+
+    #[test]
+    fn bpe_generation_from_an_empty_seed_starts_at_bos() {
+        let slm = tiny_eos_slm();
+        let out = slm
+            .generate_with(
+                "",
+                6,
+                &SamplingParams::with_temperature(0.8),
+                &mut Rng::new(2),
+            )
+            .unwrap();
+        assert!(out.chars().count() <= 6);
+        let p = greedy();
+        let g = slm
+            .generate_tokens("", 20, &[], &p, &mut Rng::new(2))
+            .unwrap();
+        let want: String = g.text.chars().take(6).collect();
+        assert_eq!(
+            slm.generate_with("", 6, &p, &mut Rng::new(2)).unwrap(),
+            want
+        );
+    }
+
+    #[test]
+    fn bpe_fallback_path_stops_at_eos_stop_and_budget() {
+        // Always EOS: nothing is generated.
+        let eos_slm = constant_bpe_slm(|t| {
+            let mut b = vec![0.0; t.vocab_size()];
+            b[t.eos_id().unwrap()] = 30.0;
+            b
+        });
+        let p = greedy();
+        assert_eq!(
+            eos_slm
+                .generate_with("ab", 10, &p, &mut Rng::new(1))
+                .unwrap(),
+            "ab"
+        );
+        // Always the byte 'z': the budget bounds the run, stops cut it.
+        let z_slm = constant_bpe_slm(|t| {
+            let mut b = vec![0.0; t.vocab_size()];
+            b[b'z' as usize] = 30.0;
+            b
+        });
+        let mut streamed = String::new();
+        let out = z_slm
+            .generate_stream_with("ab", 5, &p, &mut Rng::new(1), |f| streamed.push_str(f))
+            .unwrap();
+        assert_eq!(out, "abzzzzz");
+        assert_eq!(streamed, "zzzzz");
+        assert_eq!(
+            z_slm
+                .generate_until("ab", 9, "zz", &p, &mut Rng::new(1))
+                .unwrap(),
+            "abzz"
+        );
+        assert_eq!(
+            z_slm.generate_with("ab", 0, &p, &mut Rng::new(1)).unwrap(),
+            "ab"
+        );
+    }
+
+    #[test]
+    fn eos_after_an_incomplete_character_flushes_a_replacement() {
+        // Near-uniform sampling over bytes: sooner or later EOS follows a lone
+        // UTF-8 lead byte, which is flushed lossily (never dropped silently).
+        let slm = tiny_utf8_slm();
+        let p = SamplingParams::with_temperature(50.0);
+        let hit = (0..400u64).any(|seed| {
+            let mut streamed = String::new();
+            let out = slm
+                .generate_stream_with("", 5000, &p, &mut Rng::new(seed), |f| streamed.push_str(f))
+                .unwrap();
+            assert_eq!(out, streamed, "fragments must add up to the output");
+            out.chars().count() < 5000 && out.ends_with('\u{FFFD}')
+        });
+        assert!(hit, "no run ended with an incomplete character");
     }
 }
