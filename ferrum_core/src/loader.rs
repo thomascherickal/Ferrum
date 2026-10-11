@@ -1975,6 +1975,24 @@ mod tests {
         }
     }
 
+    /// Two tensors sharing bytes are rejected at parse time for both codecs
+    /// (the same file loads fine before the edit).
+    #[test]
+    fn from_gguf_rejects_overlapping_tensors() {
+        let (m, n, meta) = bpe_parts(32, 64, true);
+        let gpt2 = to_gguf(&m, &n, &meta, QPrec::F32).unwrap();
+        let (model, norm, emeta) = make_embedding_bundle_big();
+        let generic = to_gguf(&model, &norm, &emeta, QPrec::F32).unwrap();
+        for (bytes, arch_name) in [(gpt2, "gpt2"), (generic, "ferrum")] {
+            assert_eq!(arch(&bytes), arch_name);
+            from_gguf(&bytes).unwrap();
+            let mut bad = bytes.clone();
+            crate::gguf::patch_tensor_offset(&mut bad, 1, 0); // onto tensor 0
+            let e = load_err(&bad);
+            assert!(e.contains("overlap"), "{arch_name}: {e}");
+        }
+    }
+
     #[test]
     fn from_gguf_reports_bad_fields() {
         let s = |x: &str| MetaValue::String(x.into());

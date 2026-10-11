@@ -84,17 +84,6 @@ pub(crate) fn open(bytes: &[u8], old_magic: &[u8; 4], arch: &str) -> Result<Gguf
     Ok(g)
 }
 
-/// Total element count of the `p{i}.data` tensors. Since [`open`] proved each
-/// tensor lies inside the file, this is bounded by the file size; loaders
-/// compare it with the count implied by the header *before* allocating.
-pub(crate) fn data_elements(g: &Gguf) -> Result<usize> {
-    g.tensors
-        .iter()
-        .filter(|t| t.name.ends_with(".data"))
-        .try_fold(0usize, |acc, t| acc.checked_add(t.num_elements()))
-        .ok_or_else(|| bad("checkpoint tensor sizes overflow".into()))
-}
-
 fn missing(key: &str) -> InferError {
     bad(format!(
         "checkpoint key 'ferrum.ckpt.{key}' missing or of the wrong type"
@@ -287,23 +276,6 @@ mod tests {
         // Dropping the tail of a valid file also puts a tensor past EOF.
         let bytes = sample();
         assert!(open(&bytes[..bytes.len() - 4], b"OLDM", ARCH).is_err());
-    }
-
-    #[test]
-    fn data_elements_sums_data_tensors_only() {
-        let g = open(&sample(), b"OLDM", ARCH).unwrap();
-        assert_eq!(data_elements(&g).unwrap(), 2); // p0.m / p0.v excluded
-        let mut b = begin(ARCH);
-        put_param(&mut b, 0, &[1.0; 3], &[0.0; 3], &[0.0; 3]);
-        put_param(&mut b, 1, &[1.0; 5], &[0.0; 5], &[0.0; 5]);
-        let g = open(&b.into_bytes(), b"OLDM", ARCH).unwrap();
-        assert_eq!(data_elements(&g).unwrap(), 8);
-        // Overflowing sums are an error, not a wrap (directory only; no data).
-        let mut g = open(&sample(), b"OLDM", ARCH).unwrap();
-        let mut t = g.tensors[0].clone();
-        t.dims = vec![u64::MAX];
-        g.tensors = vec![t.clone(), t];
-        assert!(data_elements(&g).is_err());
     }
 
     #[test]

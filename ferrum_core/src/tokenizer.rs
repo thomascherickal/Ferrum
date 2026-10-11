@@ -1620,4 +1620,22 @@ mod tests {
         );
         assert!(ByteBpeTokenizer::from_gguf_bytes(&broken).is_err());
     }
+
+    /// A tokenizer file normally has no tensors; one that carries two
+    /// overlapping ones is rejected by the shared GGUF extent check.
+    #[test]
+    fn tokenizer_file_rejects_overlapping_tensors() {
+        let good = trained_tok().to_gguf_bytes();
+        let mut b = GgufBuilder::new();
+        for (k, v) in &crate::gguf::Gguf::parse(good).unwrap().metadata {
+            b.meta(k, v.clone());
+        }
+        b.tensor("a", &[8], crate::gguf::GGML_F32, vec![0; 32]);
+        b.tensor("b", &[8], crate::gguf::GGML_F32, vec![0; 32]);
+        let mut bytes = b.into_bytes();
+        ByteBpeTokenizer::from_gguf_bytes(&bytes).unwrap(); // control
+        crate::gguf::patch_tensor_offset(&mut bytes, 1, 16);
+        let e = ByteBpeTokenizer::from_gguf_bytes(&bytes).err().unwrap();
+        assert!(e.to_string().contains("overlap"), "{e}");
+    }
 }

@@ -800,27 +800,28 @@ impl TransformerNet {
     /// Parameter tensors per transformer block (`BlockT::params`).
     const BLOCK_PARAMS: usize = 16;
 
-    /// Total scalar parameters for the given architecture; `None` on overflow.
-    fn expected_param_count(
+    /// Element count of every parameter, in `params_all` order; `None` on
+    /// overflow. Allocates `5 + 16·blocks` entries, so callers bound `blocks`
+    /// first.
+    fn param_lens(
         vocab: usize,
         ctx: usize,
         embed: usize,
         hidden: usize,
         blocks: usize,
-    ) -> Option<usize> {
-        let sq = embed.checked_mul(embed)?;
-        // 4 attention matrices + 9 length-`embed` vectors + 2 FFN matrices + bias.
-        let block = sq
-            .checked_mul(4)?
-            .checked_add(embed.checked_mul(9)?)?
-            .checked_add(embed.checked_mul(hidden)?.checked_mul(2)?)?
-            .checked_add(hidden)?;
-        vocab
-            .checked_mul(embed)? // token embedding
-            .checked_add(ctx.checked_mul(embed)?)? // positions
-            .checked_add(block.checked_mul(blocks)?)?
-            .checked_add(embed.checked_mul(2)?)? // final LayerNorm
-            .checked_add(embed.checked_mul(vocab)?) // LM head
+    ) -> Option<Vec<usize>> {
+        let (e, h) = (embed, hidden);
+        let sq = e.checked_mul(e)?;
+        let eh = e.checked_mul(h)?;
+        let block = [e, e, sq, e, sq, e, sq, e, sq, e, e, e, eh, h, eh, e];
+        debug_assert_eq!(block.len(), Self::BLOCK_PARAMS);
+        let ev = vocab.checked_mul(e)?; // token embedding / LM head
+        let mut lens = vec![ev, ctx.checked_mul(e)?]; // + positions
+        for _ in 0..blocks {
+            lens.extend(block);
+        }
+        lens.extend([e, e, ev]); // final LayerNorm scale + shift, head
+        Some(lens)
     }
 
     /// Reject a checkpoint whose header dims do not account for exactly the
@@ -840,9 +841,20 @@ impl TransformerNet {
         if n_params.checked_mul(3) != Some(g.tensors.len()) {
             return Err(bad());
         }
-        let want = Self::expected_param_count(vocab, ctx, embed, hidden, blocks).ok_or_else(bad)?;
-        if ckpt::data_elements(g)? != want {
-            return Err(bad());
+        let lens = Self::param_lens(vocab, ctx, embed, hidden, blocks).ok_or_else(bad)?;
+        // Exactly `p{i}.{data,m,v}`, F32, of the expected length. With the
+        // count check above and distinct names, this accounts for every
+        // tensor, so (non-overlapping, in-file) extents bound what `new` may
+        // allocate by the file size.
+        let by_name: std::collections::HashMap<&str, &crate::gguf::TensorInfo> =
+            g.tensors.iter().map(|t| (t.name.as_str(), t)).collect();
+        for (i, &len) in lens.iter().enumerate() {
+            for s in ["data", "m", "v"] {
+                match by_name.get(format!("p{i}.{s}").as_str()) {
+                    Some(t) if t.ggml_type == crate::gguf::GGML_F32 && t.dims == [len as u64] => {}
+                    _ => return Err(bad()),
+                }
+            }
         }
         Ok(())
     }
@@ -2579,33 +2591,30 @@ mod tests {
     }
 
     #[test]
-    fn expected_param_count_matches_real_nets_and_detects_overflow() {
+    fn param_lens_match_real_nets_and_detect_overflow() {
         for (v, c, e, h, hid, b) in [
             (6, 4, 8, 2, 16, 2),
             (30, 8, 16, 2, 32, 1),
             (5, 3, 4, 1, 7, 3),
         ] {
             let net = TransformerNet::new(v, c, e, h, hid, b, &mut Rng::new(1)).unwrap();
-            let real: usize = net.params_all().iter().map(|p| p.data.data.len()).sum();
-            assert_eq!(
-                TransformerNet::expected_param_count(v, c, e, hid, b),
-                Some(real)
-            );
-            assert_eq!(net.params_all().len(), 5 + TransformerNet::BLOCK_PARAMS * b);
+            let real: Vec<usize> = net.params_all().iter().map(|p| p.data.data.len()).collect();
+            assert_eq!(TransformerNet::param_lens(v, c, e, hid, b), Some(real));
         }
         let big = usize::MAX / 2;
+        // u64-based literal: `1 << 40` / `1 << 62` do not fit a 32-bit usize.
+        let huge = usize::try_from(1u64 << 40).unwrap_or(usize::MAX);
+        let huger = usize::try_from(1u64 << 62).unwrap_or(usize::MAX);
         for args in [
             (big, 1, 4, 1, 1),
             (1, big, 4, 1, 1),
             (1, 1, big, 1, 1),
-            (1, 1, 4, big, 1),
-            (1, 1, 4, 1, big),
-            (1, 1, 1 << 40, 1, 1),
-            (1, 1, 4, 1 << 62, 1),
+            (1, 1, huge, 1, 1),
+            (1, 1, 4, huger, 1),
         ] {
-            let (v, c, e, h, b) = args;
+            let (v, c, e, hid, b) = args;
             assert_eq!(
-                TransformerNet::expected_param_count(v, c, e, h, b),
+                TransformerNet::param_lens(v, c, e, hid, b),
                 None,
                 "{args:?}"
             );
@@ -2666,6 +2675,128 @@ mod tests {
         crate::ckpt::put_u64(&mut huge, "step", 0);
         crate::ckpt::put_u64(&mut huge, "rng", 1);
         assert!(TransformerNet::load_checkpoint(&huge.into_bytes()).is_err());
+    }
+
+    /// Rebuild a checkpoint's GGUF with `edit` applied to each tensor
+    /// `(name, dims, type)`; data is zero-filled to the *edited* extent, so
+    /// the result is always a structurally valid, non-overlapping GGUF.
+    fn mangled(bytes: &[u8], edit: impl Fn(&mut (String, Vec<u64>, u32))) -> Vec<u8> {
+        let g = crate::gguf::Gguf::parse(bytes.to_vec()).unwrap();
+        let mut b = crate::gguf_write::GgufBuilder::new();
+        for (k, v) in &g.metadata {
+            b.meta(k, v.clone());
+        }
+        for t in &g.tensors {
+            let mut e = (t.name.clone(), t.dims.clone(), t.ggml_type);
+            edit(&mut e);
+            let n: u64 = e.1.iter().product();
+            let width = if e.2 == crate::gguf::GGML_F32 { 4 } else { 2 };
+            b.tensor(&e.0, &e.1, e.2, vec![0u8; n as usize * width]);
+        }
+        b.into_bytes()
+    }
+
+    /// `check_header` demands exactly `p{i}.{data,m,v}` F32 tensors of the
+    /// header-implied length, even when the extents are all valid.
+    #[test]
+    fn check_header_requires_exact_tensor_names_dims_and_types() {
+        let mut r = Rng::new(1);
+        let net = TransformerNet::new(6, 4, 8, 2, 16, 2, &mut r).unwrap();
+        let bytes = net.save_checkpoint(&r);
+        TransformerNet::load_checkpoint(&bytes).unwrap(); // control
+        type Edit = Box<dyn Fn(&mut (String, Vec<u64>, u32))>;
+        let cases: Vec<(&str, Edit)> = vec![
+            (
+                "renamed tensor",
+                Box::new(|t| {
+                    if t.0 == "p3.m" {
+                        t.0 = "q3.m".into();
+                    }
+                }),
+            ),
+            (
+                "wrong dims",
+                Box::new(|t| {
+                    if t.0 == "p5.data" {
+                        t.1 = vec![t.1[0] + 1];
+                    }
+                }),
+            ),
+            (
+                "wrong rank",
+                Box::new(|t| {
+                    if t.0 == "p5.v" {
+                        t.1 = vec![1, t.1[0]];
+                    }
+                }),
+            ),
+            (
+                "wrong type (extent changes)",
+                Box::new(|t| {
+                    if t.0 == "p5.m" {
+                        t.2 = crate::gguf::GGML_F16;
+                    }
+                }),
+            ),
+        ];
+        for (why, edit) in cases {
+            let e = TransformerNet::load_checkpoint(&mangled(&bytes, &edit))
+                .err()
+                .unwrap_or_else(|| panic!("{why} must be rejected"));
+            assert!(
+                e.to_string().contains("does not match its tensors"),
+                "{why}: {e}"
+            );
+        }
+    }
+
+    /// The round-1 bypass: every `*.data` tensor aliases the same bytes, with
+    /// a header chosen so the summed element count equals the architecture's
+    /// parameter count. Rejected centrally (overlap) before any net exists,
+    /// and by `check_header` on its own once the aliasing is removed.
+    #[test]
+    fn aliased_tensor_checkpoint_is_rejected_quickly() {
+        const BLOCKS: usize = 100;
+        const L: u64 = 1001; // elements per aliased `*.data` tensor (odd)
+        let n_params = 5 + 16 * BLOCKS;
+        // embed = heads = hidden = ctx = 1: total params = 2*vocab + 16*blocks + 3
+        // must equal n_params * L, so vocab is solved for.
+        let vocab = (n_params as u64 * L - (16 * BLOCKS as u64 + 3)) / 2;
+        let mut b = crate::ckpt::begin("ferrum-checkpoint");
+        for (k, v) in [
+            ("vocab", vocab as usize),
+            ("context", 1),
+            ("embed", 1),
+            ("heads", 1),
+            ("hidden", 1),
+            ("blocks", BLOCKS),
+        ] {
+            crate::ckpt::put_u32(&mut b, k, v);
+        }
+        crate::ckpt::put_bool(&mut b, "qat", false);
+        crate::ckpt::put_bool(&mut b, "tie", false);
+        crate::ckpt::put_u64(&mut b, "step", 0);
+        crate::ckpt::put_u64(&mut b, "rng", 1);
+        let data = vec![0.0f32; L as usize];
+        for i in 0..n_params {
+            crate::ckpt::put_param(&mut b, i, &data, &[0.0], &[0.0]);
+        }
+        let clean = b.into_bytes();
+        // The file is ~(3 * n_params) directory entries plus ~L*4 data bytes
+        // after aliasing; the net it claims would be ~2*vocab*16 B = ~51 MB.
+        let mut bytes = clean.clone();
+        for i in 0..3 * n_params {
+            crate::gguf::patch_tensor_offset(&mut bytes, i, 0);
+        }
+        let t = std::time::Instant::now();
+        let e = TransformerNet::load_checkpoint(&bytes).err().unwrap();
+        assert!(e.to_string().contains("overlap"), "{e}");
+        assert!(t.elapsed().as_secs() < 5, "took {:?}", t.elapsed());
+        // Without aliasing the tensors are legitimate extents but wrong dims
+        // for this header (data tensors are L long, the header wants 1 or
+        // vocab): check_header refuses them before `new` allocates.
+        let e = TransformerNet::load_checkpoint(&clean).err().unwrap();
+        assert!(e.to_string().contains("does not match its tensors"), "{e}");
     }
 
     // ─────────────────────────────────────────────────────────────────────────

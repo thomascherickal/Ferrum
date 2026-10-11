@@ -414,6 +414,42 @@ fn parse_header(b: &[u8]) -> Result<ParsedHeader> {
     Ok((version, metadata, tensors, data_offset))
 }
 
+/// Reject a tensor directory whose extents leave the data section (`avail`
+/// bytes) or overlap one another. Valid GGUF files never overlap (only
+/// alignment padding separates tensors), and a hostile one that points many
+/// tensors at the same bytes would otherwise make summed element counts
+/// quadratic in the file size. Tensors whose size cannot be computed
+/// (unsupported type, ragged block count, overflow) or that are empty are
+/// skipped here; they still fail cleanly when read.
+fn check_extents(tensors: &[TensorInfo], avail: usize) -> Result<()> {
+    let avail = avail as u64;
+    let mut spans: Vec<(u64, u64, &str)> = Vec::new();
+    for t in tensors {
+        let Ok(len) = type_nbytes(t.ggml_type, t.num_elements()) else {
+            continue;
+        };
+        if len == 0 {
+            continue;
+        }
+        let end = t
+            .offset
+            .checked_add(len as u64)
+            .filter(|&e| e <= avail)
+            .ok_or_else(|| fmt(&format!("tensor '{}' data runs past EOF", t.name)))?;
+        spans.push((t.offset, end, &t.name));
+    }
+    spans.sort_unstable_by_key(|s| s.0);
+    for w in spans.windows(2) {
+        if w[1].0 < w[0].1 {
+            return Err(fmt(&format!(
+                "tensors '{}' and '{}' overlap",
+                w[0].2, w[1].2
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Whether an error is the "ran off the end of the buffer" kind (vs. a real
 /// format error). Used by [`Gguf::open`] to know when to read a larger prefix.
 fn is_truncation(e: &InferError) -> bool {
@@ -464,6 +500,7 @@ impl Gguf {
                     if data_offset > len {
                         return Err(fmt("GGUF tensor-data section begins past EOF"));
                     }
+                    check_extents(&tensors, len - data_offset)?;
                     return Ok(Self {
                         version,
                         metadata,
@@ -491,6 +528,7 @@ impl Gguf {
         if data_offset > bytes.len() {
             return Err(fmt("GGUF tensor-data section begins past EOF"));
         }
+        check_extents(&tensors, bytes.len() - data_offset)?;
         Ok(Self {
             version,
             metadata,
@@ -1096,6 +1134,36 @@ fn dequant_q3_k(raw: &[u8], n: usize) -> Result<Vec<f32>> {
         return Err(fmt("Q3_K data shorter than expected"));
     }
     Ok(out)
+}
+
+/// Test helper: overwrite tensor `idx`'s directory offset inside a GGUF byte
+/// buffer, to craft overlapping / reordered / out-of-range extents.
+#[cfg(test)]
+pub(crate) fn patch_tensor_offset(bytes: &mut [u8], idx: usize, off: u64) {
+    let pos = {
+        let mut c = Cur::new(bytes);
+        c.u32().unwrap();
+        c.u32().unwrap();
+        let (n_tensors, n_kv) = (c.u64().unwrap(), c.u64().unwrap());
+        for _ in 0..n_kv {
+            c.string().unwrap();
+            let vtype = c.u32().unwrap();
+            read_value(&mut c, vtype).unwrap();
+        }
+        assert!((idx as u64) < n_tensors, "tensor index out of range");
+        let mut pos = 0;
+        for _ in 0..=idx {
+            c.string().unwrap();
+            for _ in 0..c.u32().unwrap() {
+                c.u64().unwrap();
+            }
+            c.u32().unwrap();
+            pos = c.pos;
+            c.u64().unwrap();
+        }
+        pos
+    };
+    bytes[pos..pos + 8].copy_from_slice(&off.to_le_bytes());
 }
 
 #[cfg(test)]
@@ -1910,5 +1978,186 @@ mod tests {
         put_u32(&mut bytes, VT_ARRAY); // nested
         put_u64(&mut bytes, 1);
         assert!(Gguf::parse(bytes).is_err());
+    }
+
+    // ── Tensor extent validation (overlap / bounds) ───────────────────────────
+
+    fn ti(name: &str, dims: &[u64], ggml_type: u32, offset: u64) -> TensorInfo {
+        TensorInfo {
+            name: name.into(),
+            dims: dims.to_vec(),
+            ggml_type,
+            offset,
+        }
+    }
+
+    fn extents_err(ts: &[TensorInfo], avail: usize) -> String {
+        check_extents(ts, avail).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn check_extents_accepts_valid_layouts_in_any_order() {
+        // Three 16-byte F32 tensors, a gap between the 2nd and 3rd, listed out
+        // of offset order; the last ends exactly at `avail`.
+        let ts = [
+            ti("c", &[4], GGML_F32, 48),
+            ti("a", &[4], GGML_F32, 0),
+            ti("b", &[4], GGML_F32, 16),
+        ];
+        check_extents(&ts, 64).unwrap();
+        check_extents(&[], 0).unwrap();
+    }
+
+    #[test]
+    fn check_extents_rejects_overlap_and_out_of_range() {
+        let a = ti("a", &[4], GGML_F32, 0);
+        // One byte of overlap, an identical offset, and containment.
+        assert!(extents_err(&[a.clone(), ti("b", &[4], GGML_F32, 15)], 64).contains("overlap"));
+        assert!(extents_err(&[a.clone(), ti("b", &[4], GGML_F32, 0)], 64).contains("overlap"));
+        assert!(extents_err(
+            &[ti("big", &[8], GGML_F32, 0), ti("in", &[1], GGML_F32, 8)],
+            64
+        )
+        .contains("overlap"));
+        // Past the data section, and an offset that overflows u64 when the
+        // length is added.
+        assert!(extents_err(&[ti("a", &[4], GGML_F32, 52)], 64).contains("past EOF"));
+        assert!(extents_err(&[ti("a", &[4], GGML_F32, u64::MAX)], 64).contains("past EOF"));
+        // Many tensors sharing one offset: the sum exceeds `avail` by far but
+        // each is individually in range - still rejected, without allocating.
+        let many: Vec<_> = (0..5000)
+            .map(|i| ti(&format!("t{i}"), &[16], GGML_F32, 0))
+            .collect();
+        assert!(extents_err(&many, 64).contains("overlap"));
+    }
+
+    #[test]
+    fn check_extents_skips_tensors_it_cannot_size() {
+        // Unsupported type, ragged quantized count, empty, and a saturating
+        // (hostile) element count: none can be read, so none is bounded here,
+        // even where they collide with a real tensor or lie past `avail`.
+        let ts = [
+            ti("real", &[4], GGML_F32, 0),
+            ti("unsupported", &[4], 99, 0),
+            ti("ragged", &[33], GGML_Q8_0, 0),
+            ti("empty", &[0], GGML_F32, 4),
+            ti("hostile", &[u64::MAX, 8], GGML_F32, 1000),
+        ];
+        check_extents(&ts, 16).unwrap();
+        // ...and each still errors when actually read.
+        let mut b = crate::gguf_write::GgufBuilder::new();
+        b.tensor("x", &[4], 99, vec![0; 16]);
+        let g = Gguf::parse(b.into_bytes()).unwrap();
+        assert!(g.dequantize(&g.tensors[0]).is_err());
+    }
+
+    /// `n` equal F32 tensors of `floats` elements, laid out by the writer
+    /// (aligned, in order). Returns the bytes and the data-section start.
+    fn n_tensor_file(n: usize, floats: usize) -> (Vec<u8>, usize) {
+        let mut b = crate::gguf_write::GgufBuilder::new();
+        for i in 0..n {
+            let data = (0..floats)
+                .flat_map(|j| ((i * floats + j) as f32).to_le_bytes())
+                .collect();
+            b.tensor(&format!("t{i}"), &[floats as u64], GGML_F32, data);
+        }
+        let bytes = b.into_bytes();
+        let stride = (floats * 4).next_multiple_of(32);
+        let start = bytes.len() - ((n - 1) * stride + floats * 4);
+        (bytes, start)
+    }
+
+    /// Run both header paths (`parse` from memory, `open` streamed from disk).
+    fn parse_and_open(bytes: &[u8]) -> (Result<Gguf>, Result<Gguf>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "ferrum_gguf_extents_{}_{}.gguf",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let opened = Gguf::open(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        (Gguf::parse(bytes.to_vec()), opened)
+    }
+
+    #[test]
+    fn alignment_padding_and_reordered_offsets_still_load() {
+        // 5 floats = 20 bytes, so the writer pads 12 bytes between tensors.
+        let (bytes, _) = n_tensor_file(3, 5);
+        let (p, o) = parse_and_open(&bytes);
+        let (p, o) = (p.unwrap(), o.unwrap());
+        assert_eq!(p.tensors[1].offset, 32);
+        assert_eq!(o.dequantize(&o.tensors[2]).unwrap()[0], 10.0);
+        // Reverse the on-disk order (directory order unchanged): t0 <- slot 2.
+        let mut re = bytes.clone();
+        for (idx, off) in [(0, 64), (1, 32), (2, 0)] {
+            patch_tensor_offset(&mut re, idx, off);
+        }
+        let (p, o) = parse_and_open(&re);
+        let (p, o) = (p.unwrap(), o.unwrap());
+        assert_eq!(p.dequantize(&p.tensors[0]).unwrap()[0], 10.0);
+        assert_eq!(o.dequantize(&o.tensors[2]).unwrap()[0], 0.0);
+    }
+
+    #[test]
+    fn overlapping_and_oversized_tensors_are_rejected_by_parse_and_open() {
+        let (bytes, _) = n_tensor_file(3, 8);
+        // Two tensors overlapping (t1 moved onto t0).
+        let mut ov = bytes.clone();
+        patch_tensor_offset(&mut ov, 1, 0);
+        // A tensor partly overlapping its neighbour (t2 starts 4 bytes early).
+        let mut part = bytes.clone();
+        patch_tensor_offset(&mut part, 2, 60);
+        for bad in [ov, part] {
+            let (p, o) = parse_and_open(&bad);
+            for e in [p.err().unwrap(), o.err().unwrap()] {
+                assert!(e.to_string().contains("overlap"), "{e}");
+            }
+        }
+        // Extent past the data section: offset moved out, and tail truncated.
+        let mut far = bytes.clone();
+        patch_tensor_offset(&mut far, 0, 1 << 20);
+        for bad in [far, bytes[..bytes.len() - 1].to_vec()] {
+            let (p, o) = parse_and_open(&bad);
+            for e in [p.err().unwrap(), o.err().unwrap()] {
+                assert!(e.to_string().contains("past EOF"), "{e}");
+            }
+        }
+        // Control: the unmodified file loads.
+        let (p, o) = parse_and_open(&bytes);
+        p.unwrap();
+        o.unwrap();
+    }
+
+    #[test]
+    fn many_tensors_aliasing_one_buffer_fail_fast_without_allocating() {
+        // The quadratic-allocation attack: N tensors each claim the same
+        // 4 KiB at offset 0 (N x 4 KiB = 12 MiB claimed from a ~100 KiB file).
+        let (mut bytes, start) = n_tensor_file(3000, 1024);
+        for i in 0..3000 {
+            patch_tensor_offset(&mut bytes, i, 0);
+        }
+        bytes.truncate(start + 4096);
+        assert!(bytes.len() < 200_000, "{}", bytes.len());
+        let t = std::time::Instant::now();
+        let (p, o) = parse_and_open(&bytes);
+        for e in [p.err().unwrap(), o.err().unwrap()] {
+            assert!(e.to_string().contains("overlap"), "{e}");
+        }
+        assert!(t.elapsed().as_secs() < 5, "took {:?}", t.elapsed());
+    }
+
+    #[test]
+    fn patch_tensor_offset_rewrites_only_the_target_entry() {
+        // Two 16-byte tensors at offsets 0 and 32; move the second to 16.
+        let (mut bytes, _) = n_tensor_file(2, 4);
+        patch_tensor_offset(&mut bytes, 1, 16);
+        let g = Gguf::parse(bytes).unwrap();
+        assert_eq!(
+            g.tensors.iter().map(|t| t.offset).collect::<Vec<_>>(),
+            [0, 16]
+        );
     }
 }
