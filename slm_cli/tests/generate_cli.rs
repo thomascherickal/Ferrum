@@ -1,0 +1,179 @@
+//! `generate` / `run` sampling and stop flags (Phase 1A Task 2).
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::sync::OnceLock;
+
+fn bin() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_train_transformer"))
+}
+
+fn scratch() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("ferrum_gen_cli_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    })
+}
+
+/// Train a tiny model once per `name`: `corpus` text, `vocab` 0 = char-level.
+fn train(name: &str, corpus: &str, vocab: &str, epochs: &str) -> PathBuf {
+    let dir = scratch();
+    let c = dir.join(format!("{name}.txt"));
+    let m = dir.join(format!("{name}.gguf"));
+    std::fs::write(&c, corpus).unwrap();
+    let st = bin()
+        .args(["train", c.to_str().unwrap(), m.to_str().unwrap()])
+        .args(["--context", "8", "--embed", "16", "--heads", "2"])
+        .args(["--blocks", "1", "--hidden", "32", "--epochs", epochs])
+        .args(["--vocab", vocab])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "{}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+    m
+}
+
+fn tiny_model() -> &'static Path {
+    static M: OnceLock<PathBuf> = OnceLock::new();
+    M.get_or_init(|| {
+        let text = "the cat sat on the mat. the dog sat on the log. ".repeat(40);
+        train("bpe", &text, "270", "2")
+    })
+}
+
+fn out(o: Output) -> String {
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    String::from_utf8(o.stdout).unwrap()
+}
+
+fn generate_on(model: &Path, seed: &str, extra: &[&str]) -> Output {
+    bin()
+        .args(["generate", model.to_str().unwrap(), seed, "--temp", "0"])
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+fn generate(extra: &[&str]) -> String {
+    out(generate_on(tiny_model(), "the cat", extra))
+}
+
+#[test]
+fn cli_generate_stop_list_cuts_output() {
+    let free = generate(&["--max-tokens", "30"]);
+    let cont = free.trim_end().strip_prefix("the cat").unwrap().to_string();
+    // A 3-char stop taken from the middle of the free run spans token boundaries.
+    let stop: String = cont.chars().skip(2).take(3).collect();
+    assert_eq!(stop.chars().count(), 3, "{free:?}");
+    let cut = generate(&["--max-tokens", "30", "--stop", "#none#", "--stop", &stop]);
+    // Stops are matched in the continuation only and excluded from the output.
+    let at = cont.find(&stop).unwrap();
+    assert_eq!(cut.trim_end(), format!("the cat{}", &cont[..at]), "{cut:?}");
+}
+
+#[test]
+fn cli_generate_stop_alone_uses_the_chars_budget() {
+    let free = generate(&["--max-tokens", "40"]);
+    // No --max-tokens: the token budget defaults to --chars.
+    let capped = generate(&["--stop", "#none#", "--chars", "4"]);
+    assert!(
+        capped.trim_end().len() < free.trim_end().len(),
+        "{capped:?}"
+    );
+    let cont = capped.trim_end().strip_prefix("the cat").unwrap();
+    assert!(cont.chars().count() <= 4 * 4, "{capped:?}");
+}
+
+#[test]
+fn cli_generate_max_tokens_zero_returns_only_the_seed() {
+    assert_eq!(generate(&["--max-tokens", "0"]), "the cat\n");
+}
+
+#[test]
+fn cli_generate_token_path_prints_once_with_stream() {
+    let plain = generate(&["--max-tokens", "12", "--stop", "#none#"]);
+    let streamed = generate(&["--max-tokens", "12", "--stop", "#none#", "--stream"]);
+    assert_eq!(plain, streamed);
+    assert_eq!(streamed.matches("the cat").count(), 1, "{streamed:?}");
+}
+
+#[test]
+fn cli_generate_accepts_sampling_knobs() {
+    let knobs = [
+        "--top-k",
+        "5",
+        "--top-p",
+        "0.9",
+        "--repetition-penalty",
+        "1.2",
+        "--gen-seed",
+        "3",
+        "--temp",
+        "0.8",
+    ];
+    let a = generate(&knobs);
+    let b = generate(&knobs);
+    assert_eq!(a, b);
+    assert!(a.starts_with("the cat"));
+    // The knobs reach the sampler on the streaming path as well.
+    let mut s = knobs.to_vec();
+    s.push("--stream");
+    assert_eq!(generate(&s), a);
+    // top-k 1 is greedy whatever the temperature.
+    let k1 = generate(&[
+        "--top-k",
+        "1",
+        "--temp",
+        "1.5",
+        "--gen-seed",
+        "9",
+        "--chars",
+        "30",
+    ]);
+    let greedy = generate(&["--chars", "30"]);
+    assert_eq!(k1, greedy);
+}
+
+#[test]
+fn cli_run_accepts_the_new_flags() {
+    let m = tiny_model();
+    let c = scratch().join("bpe.txt");
+    let o = bin()
+        .args(["run", c.to_str().unwrap(), m.to_str().unwrap(), "the cat"])
+        .args(["--temp", "0", "--max-tokens", "6", "--stop", "#none#"])
+        .output()
+        .unwrap();
+    let text = out(o);
+    assert!(text.contains("\nthe cat"), "{text:?}");
+}
+
+#[test]
+fn cli_generate_short_seed_on_char_level_needs_the_token_path() {
+    let m = train("chars", &"abcabcabc ".repeat(40), "0", "2");
+    // Plain path: the seed must fill the context window.
+    let o = generate_on(&m, "ab", &["--chars", "5"]);
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("at least 8"));
+    // Token path: any prompt length is fine.
+    let text = out(generate_on(&m, "ab", &["--max-tokens", "5"]));
+    assert!(text.starts_with("ab"), "{text:?}");
+    assert!(text.trim_end().chars().count() <= 2 + 5, "{text:?}");
+}
+
+#[test]
+fn cli_generate_stops_at_end_of_document() {
+    let corpus = "the cat sat.<|endoftext|>the dog ran.<|endoftext|>".repeat(60);
+    let m = train("docs", &corpus, "280", "40");
+    let text = out(generate_on(&m, "the", &["--chars", "3000"]));
+    assert!(text.starts_with("the"), "{text:?}");
+    assert!(
+        text.trim_end().chars().count() < 3000,
+        "generation ignored EOS: {} chars",
+        text.len()
+    );
+}

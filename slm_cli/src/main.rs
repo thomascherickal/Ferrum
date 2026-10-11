@@ -51,6 +51,11 @@
 //!   --temp  <F>  sampling temperature              (default 0.8)
 //!   --gen-seed <N>  generation RNG seed            (default time-based)
 //!   --stream     print the completion live as it is generated
+//!   --top-k <N>  --top-p <F>  --repetition-penalty <F>   sampling knobs (off by default)
+//!   --max-tokens <N>  token budget (default --chars); --stop <S> ends the
+//!                     output before S (repeatable). Either flag selects the
+//!                     token-budgeted path: stop strings are excluded and
+//!                     --chars is ignored.
 //! ```
 
 #![forbid(unsafe_code)]
@@ -73,8 +78,6 @@ enum Kind {
     F64,
     Str,
     /// Repeatable string flag (`--stop a --stop b`).
-    // ponytail: first used by the Phase 1 serve/eval flags; keep the parser complete.
-    #[allow(dead_code)]
     StrList,
 }
 
@@ -116,6 +119,11 @@ const GENERATE_FLAGS: Spec = &[
     ("temp", Kind::F32),
     ("gen-seed", Kind::U64),
     ("stream", Kind::Bool),
+    ("top-k", Kind::Usize),
+    ("top-p", Kind::F32),
+    ("repetition-penalty", Kind::F32),
+    ("max-tokens", Kind::Usize),
+    ("stop", Kind::StrList),
 ];
 const RUN_GGUF_FLAGS: Spec = &[
     ("quant", Kind::Str),
@@ -285,7 +293,6 @@ impl Args {
             .and_then(|v| v.last())
             .map(String::as_str)
     }
-    #[allow(dead_code)] // ponytail: StrList consumers land in Phase 1.
     fn get_all(&self, key: &str) -> Vec<String> {
         self.flags.get(key).cloned().unwrap_or_default()
     }
@@ -436,6 +443,9 @@ fn print_usage() {
          \x20 --val-frac F (0.05)  --test-frac F (0.05)  --seed N (42)\n\n\
          GENERATE / RUN options:\n\
          \x20 --chars N    --temp F   --gen-seed N   --stream\n\
+         \x20 --top-k N    --top-p F  --repetition-penalty F   (sampling knobs; 0/1.0/1.0 = off)\n\
+         \x20 --max-tokens N   --stop S   (token budget [default: --chars]; --stop is repeatable,\n\
+         \x20     excluded from the output; either flag ignores --chars)\n\
          \x20 (--stream prints the completion live as it is generated)\n\n\
          RUN-GGUF options (import & run a llama/qwen2 GGUF checkpoint):\n\
          \x20 --quant int4|int8|f32  (in-memory precision; default int4)\n\
@@ -696,8 +706,27 @@ fn generate_text(
     args: &Args,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let num_chars: usize = args.get("chars", 200);
-    let temp: f32 = args.get("temp", 0.8);
+    let params = ferrum_core::SamplingParams {
+        temperature: args.get("temp", 0.8),
+        top_k: args.get("top-k", 0),
+        top_p: args.get("top-p", 1.0),
+        repetition_penalty: args.get("repetition-penalty", 1.0),
+    };
     let seed: u64 = args.get("gen-seed", time_seed());
+
+    let stops = args.get_all("stop");
+    if args.value("max-tokens").is_some() || !stops.is_empty() {
+        // Token-budgeted path: any prompt length, stop strings excluded.
+        // ponytail: not streamed live (`generate_tokens` returns the whole
+        // continuation); add a callback variant if --stop needs live output.
+        let max_tokens: usize = args.get("max-tokens", num_chars);
+        let g = slm.generate_tokens(seed_text, max_tokens, &stops, &params, &mut Rng::new(seed))?;
+        let out = format!("{seed_text}{}", g.text);
+        if args.has("stream") {
+            println!("{out}"); // callers skip their own print when streaming
+        }
+        return Ok(out);
+    }
 
     // BPE models tokenize the seed and left-pad short prompts, so the
     // char-count check only applies to character-level models.
@@ -724,14 +753,14 @@ fn generate_text(
         use std::io::Write;
         print!("{seed_text}");
         let _ = std::io::stdout().flush();
-        let out = slm.generate_stream(seed_text, num_chars, temp, &mut rng, |frag| {
+        let out = slm.generate_stream_with(seed_text, num_chars, &params, &mut rng, |frag| {
             print!("{frag}");
             let _ = std::io::stdout().flush();
         })?;
         println!();
         Ok(out)
     } else {
-        Ok(slm.generate(seed_text, num_chars, temp, &mut rng)?)
+        Ok(slm.generate_with(seed_text, num_chars, &params, &mut rng)?)
     }
 }
 
@@ -1680,7 +1709,7 @@ mod tests {
         for f in TRAIN_FLAGS.iter().chain(GENERATE_FLAGS) {
             assert!(spec.iter().any(|(n, _)| *n == f.0), "{}", f.0);
         }
-        assert!(!spec.iter().any(|(n, _)| *n == "top-k"));
+        assert!(!spec.iter().any(|(n, _)| *n == "ids" || *n == "raw"));
         assert_eq!(spec.len(), run_flags().len());
     }
 
@@ -1721,8 +1750,24 @@ mod tests {
                     "sample",
                 ],
             ),
-            ("generate", &["chars", "temp", "gen-seed", "stream"]),
-            ("run", &["force", "stream", "chars", "context"]),
+            (
+                "generate",
+                &[
+                    "chars",
+                    "temp",
+                    "gen-seed",
+                    "stream",
+                    "top-k",
+                    "top-p",
+                    "repetition-penalty",
+                    "max-tokens",
+                    "stop",
+                ],
+            ),
+            (
+                "run",
+                &["force", "stream", "chars", "context", "max-tokens", "stop"],
+            ),
             (
                 "run-gguf",
                 &[

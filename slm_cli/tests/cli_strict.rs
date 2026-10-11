@@ -130,12 +130,12 @@ fn valid_flags_pass_the_parser_and_reach_the_command() {
 
 #[test]
 fn aliases_use_their_commands_flag_table() {
-    // `gguf` accepts --top-k; `export` accepts --quant; `gen` rejects --top-k.
-    let (_, text) = run(&["gguf", "/nonexistent.gguf", "--top-k", "3"]);
+    // `gguf` accepts --rep; `gen` rejects it (--top-k is shared with generate now).
+    let (_, text) = run(&["gguf", "/nonexistent.gguf", "--rep", "3"]);
     assert!(!text.contains("unknown flag"), "{text}");
-    let (code, text) = run(&["gen", "m.gguf", "hi", "--top-k", "3"]);
+    let (code, text) = run(&["gen", "m.gguf", "hi", "--rep", "3"]);
     assert_eq!(code, 1);
-    assert!(text.contains("unknown flag --top-k for 'gen'"), "{text}");
+    assert!(text.contains("unknown flag --rep for 'gen'"), "{text}");
 }
 
 #[test]
