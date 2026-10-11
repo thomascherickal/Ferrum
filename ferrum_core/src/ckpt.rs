@@ -61,6 +61,8 @@ pub(crate) fn open(bytes: &[u8], old_magic: &[u8; 4], arch: &str) -> Result<Gguf
             String::from_utf8_lossy(old_magic)
         )));
     }
+    // ponytail: parse() copies the bytes (peak memory ~3x the file); stream the
+    // tensors via Gguf::open if checkpoints ever outgrow RAM.
     let g = Gguf::parse(bytes.to_vec())?;
     match g.architecture() {
         Some(a) if a == arch => {}
@@ -74,7 +76,23 @@ pub(crate) fn open(bytes: &[u8], old_magic: &[u8; 4], arch: &str) -> Result<Gguf
     if version != VERSION as usize {
         return Err(bad(format!("unsupported checkpoint version {version}")));
     }
+    // Every tensor must lie inside the file, so file size bounds all later
+    // sizing (checked arithmetic inside `tensor_bytes`).
+    for t in &g.tensors {
+        g.tensor_bytes(t)?;
+    }
     Ok(g)
+}
+
+/// Total element count of the `p{i}.data` tensors. Since [`open`] proved each
+/// tensor lies inside the file, this is bounded by the file size; loaders
+/// compare it with the count implied by the header *before* allocating.
+pub(crate) fn data_elements(g: &Gguf) -> Result<usize> {
+    g.tensors
+        .iter()
+        .filter(|t| t.name.ends_with(".data"))
+        .try_fold(0usize, |acc, t| acc.checked_add(t.num_elements()))
+        .ok_or_else(|| bad("checkpoint tensor sizes overflow".into()))
 }
 
 fn missing(key: &str) -> InferError {
@@ -256,6 +274,36 @@ mod tests {
         assert_eq!(get_usize(&g, "dim").unwrap(), 9);
         assert_eq!(get_f32(&g, "p0.data", 2).unwrap(), vec![1.0, -2.5]);
         assert!(get_f32(&g, "p0.v", 2).is_err());
+    }
+
+    #[test]
+    fn open_rejects_tensors_past_eof_without_allocating() {
+        // A tiny file whose directory claims enormous tensors.
+        for dims in [vec![1u64 << 40], vec![u64::MAX], vec![1 << 33, 1 << 33]] {
+            let mut b = begin(ARCH);
+            b.tensor("p0.data", &dims, GGML_F32, vec![0u8; 4]);
+            assert!(open(&b.into_bytes(), b"OLDM", ARCH).is_err(), "{dims:?}");
+        }
+        // Dropping the tail of a valid file also puts a tensor past EOF.
+        let bytes = sample();
+        assert!(open(&bytes[..bytes.len() - 4], b"OLDM", ARCH).is_err());
+    }
+
+    #[test]
+    fn data_elements_sums_data_tensors_only() {
+        let g = open(&sample(), b"OLDM", ARCH).unwrap();
+        assert_eq!(data_elements(&g).unwrap(), 2); // p0.m / p0.v excluded
+        let mut b = begin(ARCH);
+        put_param(&mut b, 0, &[1.0; 3], &[0.0; 3], &[0.0; 3]);
+        put_param(&mut b, 1, &[1.0; 5], &[0.0; 5], &[0.0; 5]);
+        let g = open(&b.into_bytes(), b"OLDM", ARCH).unwrap();
+        assert_eq!(data_elements(&g).unwrap(), 8);
+        // Overflowing sums are an error, not a wrap (directory only; no data).
+        let mut g = open(&sample(), b"OLDM", ARCH).unwrap();
+        let mut t = g.tensors[0].clone();
+        t.dims = vec![u64::MAX];
+        g.tensors = vec![t.clone(), t];
+        assert!(data_elements(&g).is_err());
     }
 
     #[test]

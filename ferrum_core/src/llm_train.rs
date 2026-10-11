@@ -2101,23 +2101,57 @@ mod tests {
             "head_dim",
             "ffn",
         ] {
-            let b = crate::ckpt::rewrite(
-                &bytes,
-                |m| {
-                    m.insert(key(k), MetaValue::U32(99));
-                },
-                None,
-            );
-            let e = fresh.load_checkpoint_into(&b).err().unwrap().to_string();
-            assert!(e.contains("does not match this model"), "{k}: {e}");
+            for v in [99, 4_000_000_000] {
+                let b = crate::ckpt::rewrite(
+                    &bytes,
+                    |m| {
+                        m.insert(key(k), MetaValue::U32(v));
+                    },
+                    None,
+                );
+                let e = fresh.load_checkpoint_into(&b).err().unwrap().to_string();
+                assert!(e.contains("does not match this model"), "{k}={v}: {e}");
+            }
         }
         // Tensors that disagree with the model's parameter sizes.
         let b = crate::ckpt::rewrite(&bytes, |_| {}, Some("p2.m"));
         let e = fresh.load_checkpoint_into(&b).err().unwrap().to_string();
         assert!(e.contains("missing tensor 'p2.m'"), "{e}");
-        // A failed load leaves the target trainer untouched.
+        // A failed load leaves the target trainer untouched: weights and Adam
+        // moments are bit-identical, even when the failure is the *last* tensor
+        // (so earlier ones were already read successfully).
+        let bits = |t: &LlamaTrainer| {
+            [t.model_flat(), t.m.to_flat(), t.v.to_flat()]
+                .map(|v| v.into_iter().map(f32::to_bits).collect::<Vec<_>>())
+        };
+        let before = bits(&fresh);
+        let last = param_data_ref(&fresh.model).len() - 1;
+        let b = crate::ckpt::rewrite(&bytes, |_| {}, Some(&format!("p{last}.v")));
+        assert!(fresh.load_checkpoint_into(&b).is_err());
+        assert_eq!(bits(&fresh), before);
         assert_eq!(fresh.step_count(), 0);
         assert!(!fresh.qat_enabled());
+    }
+
+    /// Nothing allocated or read is sized by the header: shape keys are
+    /// compared with the existing model, and tensor sizes come from the model
+    /// and the directory (a tensor claiming 4e9 elements in a tiny file is
+    /// rejected before it is read).
+    #[test]
+    fn crafted_checkpoint_sizes_do_not_drive_allocation() {
+        let mut fresh = LlamaTrainer::new(tiny(6, 8, 2, 2, 16, 1)).unwrap();
+        let mut b = ckpt::begin("ferrum-llama-checkpoint");
+        for (k, v) in fresh.shape_keys() {
+            ckpt::put_u32(&mut b, k, v);
+        }
+        ckpt::put_bool(&mut b, "qat", false);
+        ckpt::put_u64(&mut b, "step", 0);
+        ckpt::put_u64(&mut b, "rng", 1);
+        for suffix in ["data", "m", "v"] {
+            b.tensor(&format!("p0.{suffix}"), &[4_000_000_000], 0, vec![0u8; 16]);
+        }
+        assert!(fresh.load_checkpoint_into(&b.into_bytes()).is_err());
+        assert_eq!(fresh.step_count(), 0);
     }
 
     #[test]

@@ -597,6 +597,9 @@ impl ByteBpeTokenizer {
     /// rejected with a pointed error.
     pub fn from_gguf_bytes(bytes: &[u8]) -> Result<Self> {
         let bad = |m: String| InferError::Format(m);
+        if bytes.len() < 4 {
+            return Err(bad("empty or truncated tokenizer file".into()));
+        }
         if !bytes.starts_with(b"GGUF") {
             return Err(bad(
                 "old tokenizer file (pre-GGUF); delete it to retrain the tokenizer".into(),
@@ -1468,7 +1471,7 @@ mod tests {
     #[test]
     fn tokenizer_file_old_text_form_is_a_clear_error() {
         let old = trained_tok().encode_state();
-        for bytes in [old.as_bytes(), b"", b"256;257"] {
+        for bytes in [old.as_bytes(), b"256;257"] {
             let e = ByteBpeTokenizer::from_gguf_bytes(bytes)
                 .err()
                 .unwrap()
@@ -1476,6 +1479,43 @@ mod tests {
             assert!(e.contains("old tokenizer file (pre-GGUF)"), "{e}");
             assert!(e.contains("delete it to retrain the tokenizer"), "{e}");
         }
+    }
+
+    #[test]
+    fn tokenizer_file_empty_or_tiny_is_truncated_not_old() {
+        for bytes in [&b""[..], b"G", b"256"] {
+            let e = ByteBpeTokenizer::from_gguf_bytes(bytes)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(e.contains("empty or truncated tokenizer file"), "{e}");
+            assert!(!e.contains("pre-GGUF"), "{e}");
+        }
+    }
+
+    /// An array count far beyond the file size is rejected by the container
+    /// parser before anything is reserved or built from it.
+    #[test]
+    fn tokenizer_file_array_count_is_bounded_by_file_size() {
+        let mut f = Vec::new();
+        f.extend_from_slice(b"GGUF");
+        f.extend_from_slice(&3u32.to_le_bytes());
+        f.extend_from_slice(&0u64.to_le_bytes()); // tensors
+        f.extend_from_slice(&2u64.to_le_bytes()); // kv
+        let key = |f: &mut Vec<u8>, k: &str| {
+            f.extend_from_slice(&(k.len() as u64).to_le_bytes());
+            f.extend_from_slice(k.as_bytes());
+        };
+        key(&mut f, "general.architecture");
+        f.extend_from_slice(&8u32.to_le_bytes());
+        f.extend_from_slice(&16u64.to_le_bytes());
+        f.extend_from_slice(b"ferrum-tokenizer");
+        key(&mut f, "tokenizer.ggml.tokens");
+        f.extend_from_slice(&9u32.to_le_bytes()); // array
+        f.extend_from_slice(&8u32.to_le_bytes()); // of strings
+        f.extend_from_slice(&(u64::MAX / 2).to_le_bytes());
+        let e = ByteBpeTokenizer::from_gguf_bytes(&f).err().unwrap();
+        assert!(e.to_string().contains("exceeds file size"), "{e}");
     }
 
     #[test]

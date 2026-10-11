@@ -2979,8 +2979,9 @@ mod tests {
             Ok(_) => panic!("old text tokenizer must be rejected"),
         };
         assert!(err.contains("old tokenizer file (pre-GGUF)"), "{err}");
-        assert_eq!(std::fs::read(&old).unwrap(), b"256,257;258,259"); // untouched
-                                                                      // A bare file name has no parent component to create.
+        // The old file is left untouched.
+        assert_eq!(std::fs::read(&old).unwrap(), b"256,257;258,259");
+        // A bare file name has no parent component to create.
         let bare_cfg = TransformerConfig {
             tokenizer_path: dir.join("bare.gguf").to_str().unwrap().into(),
             ..cfg.clone()

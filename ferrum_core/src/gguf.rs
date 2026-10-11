@@ -519,7 +519,7 @@ impl Gguf {
 
     /// The raw on-disk bytes of one tensor — borrowed from the in-memory buffer,
     /// or read from disk into an owned buffer when streamed.
-    fn tensor_bytes(&self, t: &TensorInfo) -> Result<Cow<'_, [u8]>> {
+    pub(crate) fn tensor_bytes(&self, t: &TensorInfo) -> Result<Cow<'_, [u8]>> {
         let n = t.num_elements();
         let len = type_nbytes(t.ggml_type, n)?;
         let start = self

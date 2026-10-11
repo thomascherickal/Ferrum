@@ -797,6 +797,56 @@ impl TransformerNet {
         b.into_bytes()
     }
 
+    /// Parameter tensors per transformer block (`BlockT::params`).
+    const BLOCK_PARAMS: usize = 16;
+
+    /// Total scalar parameters for the given architecture; `None` on overflow.
+    fn expected_param_count(
+        vocab: usize,
+        ctx: usize,
+        embed: usize,
+        hidden: usize,
+        blocks: usize,
+    ) -> Option<usize> {
+        let sq = embed.checked_mul(embed)?;
+        // 4 attention matrices + 9 length-`embed` vectors + 2 FFN matrices + bias.
+        let block = sq
+            .checked_mul(4)?
+            .checked_add(embed.checked_mul(9)?)?
+            .checked_add(embed.checked_mul(hidden)?.checked_mul(2)?)?
+            .checked_add(hidden)?;
+        vocab
+            .checked_mul(embed)? // token embedding
+            .checked_add(ctx.checked_mul(embed)?)? // positions
+            .checked_add(block.checked_mul(blocks)?)?
+            .checked_add(embed.checked_mul(2)?)? // final LayerNorm
+            .checked_add(embed.checked_mul(vocab)?) // LM head
+    }
+
+    /// Reject a checkpoint whose header dims do not account for exactly the
+    /// tensors it carries (`dims` = vocab, context, embed, heads, hidden,
+    /// blocks). Runs before any header-sized allocation.
+    fn check_header(g: &crate::gguf::Gguf, dims: [usize; 6]) -> Result<()> {
+        let bad = || InferError::Format("checkpoint header does not match its tensors".into());
+        let [vocab, ctx, embed, heads, hidden, blocks] = dims;
+        if dims.contains(&0) || !embed.is_multiple_of(heads) {
+            return Err(bad());
+        }
+        // 5 non-block params (2 embeddings, final LN scale + shift, head).
+        let n_params = blocks
+            .checked_mul(Self::BLOCK_PARAMS)
+            .and_then(|b| b.checked_add(5))
+            .ok_or_else(bad)?;
+        if n_params.checked_mul(3) != Some(g.tensors.len()) {
+            return Err(bad());
+        }
+        let want = Self::expected_param_count(vocab, ctx, embed, hidden, blocks).ok_or_else(bad)?;
+        if ckpt::data_elements(g)? != want {
+            return Err(bad());
+        }
+        Ok(())
+    }
+
     /// Rebuild a net and RNG from [`TransformerNet::save_checkpoint`] bytes,
     /// restoring weights, Adam moments, optimizer timestep, and RNG state so
     /// training resumes deterministically. Pre-GGUF (`FCKP`) checkpoints are
@@ -804,16 +854,13 @@ impl TransformerNet {
     pub fn load_checkpoint(bytes: &[u8]) -> Result<(Self, Rng)> {
         let g = ckpt::open(bytes, b"FCKP", "ferrum-checkpoint")?;
         let n = |k| ckpt::get_usize(&g, k);
+        let (vocab, ctx, embed) = (n("vocab")?, n("context")?, n("embed")?);
+        let (heads, hidden, blocks) = (n("heads")?, n("hidden")?, n("blocks")?);
+        // The header must be consistent with the (file-bounded) tensors before
+        // `new` allocates anything sized by it.
+        Self::check_header(&g, [vocab, ctx, embed, heads, hidden, blocks])?;
         let mut seed_rng = Rng::new(1); // throwaway: param data is overwritten
-        let mut net = TransformerNet::new(
-            n("vocab")?,
-            n("context")?,
-            n("embed")?,
-            n("heads")?,
-            n("hidden")?,
-            n("blocks")?,
-            &mut seed_rng,
-        )?;
+        let mut net = TransformerNet::new(vocab, ctx, embed, heads, hidden, blocks, &mut seed_rng)?;
         net.qat = ckpt::get_bool(&g, "qat")?;
         net.tie_weights = ckpt::get_bool(&g, "tie")?;
         net.step_t = ckpt::get_u64(&g, "step")?;
@@ -2509,7 +2556,7 @@ mod tests {
             .err()
             .unwrap()
             .to_string();
-        assert!(e.contains("expected"), "{e}");
+        assert!(e.contains("does not match its tensors"), "{e}");
         // Invalid architecture numbers are rejected by the constructor.
         for (k, v) in [("vocab", 0), ("heads", 3)] {
             let b = crate::ckpt::rewrite(
@@ -2521,13 +2568,104 @@ mod tests {
             );
             assert!(TransformerNet::load_checkpoint(&b).is_err(), "{k}");
         }
-        // A dropped moment tensor is a clear error, never zero-filled.
+        // A dropped moment tensor is an error (the directory no longer matches
+        // the header), never zero-filled.
         let b = crate::ckpt::rewrite(&bytes, |_| {}, Some("p3.v"));
         let e = TransformerNet::load_checkpoint(&b)
             .err()
             .unwrap()
             .to_string();
-        assert!(e.contains("missing tensor 'p3.v'"), "{e}");
+        assert!(e.contains("does not match its tensors"), "{e}");
+    }
+
+    #[test]
+    fn expected_param_count_matches_real_nets_and_detects_overflow() {
+        for (v, c, e, h, hid, b) in [
+            (6, 4, 8, 2, 16, 2),
+            (30, 8, 16, 2, 32, 1),
+            (5, 3, 4, 1, 7, 3),
+        ] {
+            let net = TransformerNet::new(v, c, e, h, hid, b, &mut Rng::new(1)).unwrap();
+            let real: usize = net.params_all().iter().map(|p| p.data.data.len()).sum();
+            assert_eq!(
+                TransformerNet::expected_param_count(v, c, e, hid, b),
+                Some(real)
+            );
+            assert_eq!(net.params_all().len(), 5 + TransformerNet::BLOCK_PARAMS * b);
+        }
+        let big = usize::MAX / 2;
+        for args in [
+            (big, 1, 4, 1, 1),
+            (1, big, 4, 1, 1),
+            (1, 1, big, 1, 1),
+            (1, 1, 4, big, 1),
+            (1, 1, 4, 1, big),
+            (1, 1, 1 << 40, 1, 1),
+            (1, 1, 4, 1 << 62, 1),
+        ] {
+            let (v, c, e, h, b) = args;
+            assert_eq!(
+                TransformerNet::expected_param_count(v, c, e, h, b),
+                None,
+                "{args:?}"
+            );
+        }
+    }
+
+    /// Crafted headers must fail fast with `Err`; if any of them drove an
+    /// allocation (4e9 x 4e9 elements, 4e9 blocks) the test process would abort.
+    #[test]
+    fn crafted_headers_are_rejected_before_any_allocation() {
+        use crate::gguf::MetaValue;
+        let mut r = Rng::new(1);
+        let net = TransformerNet::new(6, 4, 8, 2, 16, 2, &mut r).unwrap();
+        let bytes = net.save_checkpoint(&r);
+        let with = |k: &str, v: u32| {
+            let k = format!("ferrum.ckpt.{k}");
+            crate::ckpt::rewrite(
+                &bytes,
+                move |m| {
+                    m.insert(k, MetaValue::U32(v));
+                },
+                None,
+            )
+        };
+        let cases: [(&str, u32); 14] = [
+            ("vocab", 4_000_000_000),
+            ("context", 4_000_000_000),
+            ("embed", 4_000_000_000),
+            ("hidden", 4_000_000_000),
+            ("blocks", 4_000_000_000),
+            ("heads", 4_000_000_000),
+            ("embed", 0),
+            ("context", 0),
+            ("hidden", 0),
+            ("blocks", 0),
+            ("heads", 0),
+            ("heads", 3),  // does not divide embed 8
+            ("blocks", 1), // fewer blocks than the tensor directory holds
+            ("blocks", 3), // more blocks than it holds
+        ];
+        for (k, v) in cases {
+            let t = std::time::Instant::now();
+            let e = TransformerNet::load_checkpoint(&with(k, v)).err();
+            assert!(e.is_some(), "{k}={v} must be rejected");
+            assert!(t.elapsed().as_secs() < 5, "{k}={v} took too long");
+        }
+        // Tensor extents beyond EOF (header untouched).
+        for cut in [4, 40] {
+            assert!(TransformerNet::load_checkpoint(&bytes[..bytes.len() - cut]).is_err());
+        }
+        // A self-consistent claim of a huge net with no tensors at all.
+        let mut huge = crate::ckpt::begin("ferrum-checkpoint");
+        for k in ["vocab", "context", "embed", "heads", "hidden", "blocks"] {
+            crate::ckpt::put_u32(&mut huge, k, 1 << 30);
+        }
+        crate::ckpt::put_bool(&mut huge, "qat", false);
+        crate::ckpt::put_bool(&mut huge, "tie", false);
+        crate::ckpt::put_u64(&mut huge, "step", 0);
+        crate::ckpt::put_u64(&mut huge, "rng", 1);
+        assert!(TransformerNet::load_checkpoint(&huge.into_bytes()).is_err());
     }
 
     // ─────────────────────────────────────────────────────────────────────────
