@@ -656,6 +656,24 @@ impl GenerativeSLM {
         Ok(())
     }
 
+    /// Save as full-precision (f32) Ferrum GGUF: exact weights, ≈4× the int8
+    /// size. Parent directories are created as needed.
+    pub fn save_f32(&self, model_path: &str) -> Result<()> {
+        let bytes = self.to_bytes()?;
+        if let Some(parent) = std::path::Path::new(model_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        std::fs::write(model_path, &bytes)?;
+        vprintln!(
+            "[slm::GenerativeSLM::save_f32] Wrote {} bytes → {}",
+            bytes.len(),
+            model_path
+        );
+        Ok(())
+    }
+
     /// Load a previously saved model (Ferrum GGUF) from `model_path`.
     pub fn load(model_path: &str) -> Result<Self> {
         let bytes = std::fs::read(model_path)?;
@@ -3643,5 +3661,27 @@ mod tests {
             out.chars().count() < 5000 && out.ends_with('\u{FFFD}')
         });
         assert!(hit, "no run ended with an incomplete character");
+    }
+
+    #[test]
+    fn save_f32_roundtrips_exactly_and_creates_parent_dirs() {
+        let slm = tiny_bpe_slm();
+        let dir = std::env::temp_dir().join(format!("ferrum_save_f32_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nested/m.gguf");
+        let path = path.to_str().unwrap();
+        slm.save_f32(path).unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(crate::loader::gguf_quant(&bytes).unwrap(), "f32");
+        let back = GenerativeSLM::load(path).unwrap();
+        let p = greedy();
+        assert_eq!(
+            back.generate_with("the", 20, &p, &mut Rng::new(1)).unwrap(),
+            slm.generate_with("the", 20, &p, &mut Rng::new(1)).unwrap()
+        );
+        // A path whose parent is a regular file cannot be created.
+        let blocked = format!("{path}/x.gguf");
+        assert!(slm.save_f32(&blocked).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

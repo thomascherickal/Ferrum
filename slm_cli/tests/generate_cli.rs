@@ -177,3 +177,84 @@ fn cli_generate_stops_at_end_of_document() {
         text.len()
     );
 }
+
+// ── train --quant and info (Phase 1A Task 3) ─────────────────────────────────
+
+fn train_quant(name: &str, quant: &[&str], extra: &[&str]) -> (PathBuf, Output) {
+    let dir = scratch();
+    let c = dir.join("q.txt");
+    std::fs::write(&c, "the cat sat on the mat. ".repeat(60)).unwrap();
+    let m = dir.join(format!("{name}.gguf"));
+    let o = bin()
+        .args(["train", c.to_str().unwrap(), m.to_str().unwrap()])
+        .args(["--context", "8", "--embed", "16", "--heads", "2"])
+        .args(["--blocks", "1", "--hidden", "32", "--epochs", "1"])
+        .args(["--vocab", "270"])
+        .args(quant)
+        .args(extra)
+        .output()
+        .unwrap();
+    (m, o)
+}
+
+fn info(model: &Path) -> String {
+    out(bin()
+        .args(["info", model.to_str().unwrap()])
+        .output()
+        .unwrap())
+}
+
+fn line<'a>(text: &'a str, key: &str) -> &'a str {
+    text.lines()
+        .find_map(|l| l.strip_prefix(key))
+        .unwrap_or_else(|| panic!("no {key:?} line in {text}"))
+        .trim_start_matches([' ', ':'])
+}
+
+#[test]
+fn info_reports_params_and_int4() {
+    let (m, o) = train_quant("q4", &["--quant", "int4"], &[]);
+    let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(stdout.contains("(int4 GGUF)"), "{stdout}");
+    let text = info(&m);
+    assert!(text.contains("GGUF v3 (gpt2, int4)"), "{text}");
+    // ctx 8, embed 16, hidden 32, 1 block, untied head, no biases on the head:
+    // tok V*16 + pos 8*16 + block (4*(16*16+16) + 4*16 + 16*32+32 + 32*16+16) + lnf 2*16 + head 16*V
+    let v: usize = line(&text, "Output dim").parse().unwrap();
+    let block = 4 * (16 * 16 + 16) + 4 * 16 + (16 * 32 + 32) + (32 * 16 + 16);
+    let want = v * 16 + 8 * 16 + block + 2 * 16 + 16 * v;
+    assert_eq!(line(&text, "Params    "), want.to_string(), "{text}");
+}
+
+#[test]
+fn train_quant_selects_the_on_disk_precision() {
+    let mut sizes = Vec::new();
+    for q in ["int8", "int4", "f32"] {
+        let (m, o) = train_quant(&format!("sz_{q}"), &["--quant", q], &[]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert!(info(&m).contains(&format!("(gpt2, {q})")));
+        sizes.push(std::fs::metadata(&m).unwrap().len());
+    }
+    assert!(sizes[1] < sizes[0] && sizes[0] < sizes[2], "{sizes:?}");
+    // The default is int8.
+    let (m, o) = train_quant("sz_default", &[], &[]);
+    assert!(o.status.success());
+    assert!(info(&m).contains("(gpt2, int8)"));
+}
+
+#[test]
+fn train_rejects_an_unknown_quant_before_training() {
+    let (m, o) = train_quant("badq", &["--quant", "int3"], &[]);
+    assert!(!o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("--quant must be int8|int4|f32 (got 'int3')"),
+        "{err}"
+    );
+    assert!(!m.exists(), "a model was written despite the bad flag");
+    assert!(
+        !String::from_utf8_lossy(&o.stdout).contains("Corpus"),
+        "trained first"
+    );
+}

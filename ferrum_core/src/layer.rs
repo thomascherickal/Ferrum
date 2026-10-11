@@ -15,6 +15,10 @@ pub trait Layer {
     fn forward(&self, input: &Tensor) -> Result<Tensor>;
     fn name(&self) -> String;
     fn as_any(&self) -> &dyn Any;
+    /// Trainable parameters held by this layer (weights + biases).
+    fn num_params(&self) -> usize {
+        0
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -38,6 +42,9 @@ pub struct Linear {
     qweight: Option<Arc<QWeight>>,
     in_f: usize,
     out_f: usize,
+    /// The zero `bias` only fills the shape: the layer has no bias parameters
+    /// (the GPT-2 LM head), so it is not counted by `num_params`.
+    bias_free: bool,
 }
 
 impl Linear {
@@ -61,7 +68,16 @@ impl Linear {
             qweight: None,
             in_f,
             out_f,
+            bias_free: false,
         })
+    }
+
+    /// A Linear with no bias parameters (the output is `x · W`), as the GPT-2
+    /// LM head. Stores a zero bias to keep the forward path uniform.
+    pub fn without_bias(in_f: usize, out_f: usize, weight: Vec<f32>) -> Result<Self> {
+        let mut l = Self::new(in_f, out_f, weight, vec![0.0; out_f])?;
+        l.bias_free = true;
+        Ok(l)
     }
 
     /// Build a Linear whose weights are kept **quantized in memory** (int8/int4).
@@ -96,6 +112,7 @@ impl Linear {
             qweight: Some(Arc::new(qw)),
             in_f,
             out_f,
+            bias_free: false,
         })
     }
 
@@ -135,6 +152,10 @@ impl Linear {
 }
 
 impl Layer for Linear {
+    fn num_params(&self) -> usize {
+        self.in_f * self.out_f + if self.bias_free { 0 } else { self.bias.numel() }
+    }
+
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         let (_, cols) = input.matrix_dims()?;
         if cols != self.in_f {
@@ -273,6 +294,10 @@ impl LayerNorm {
 }
 
 impl Layer for LayerNorm {
+    fn num_params(&self) -> usize {
+        self.gamma.numel() + self.beta.numel()
+    }
+
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         let (rows, cols) = input.matrix_dims()?;
         if cols != self.dim {
@@ -402,6 +427,10 @@ impl Embedding {
 }
 
 impl Layer for Embedding {
+    fn num_params(&self) -> usize {
+        self.token_weight.numel() + self.pos_weight.numel()
+    }
+
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         // Input has shape [B, T] (where T is sequence length)
         let (batch, seq_len) = match input.shape.as_slice() {
@@ -741,6 +770,22 @@ impl TransformerBlock {
 }
 
 impl Layer for TransformerBlock {
+    fn num_params(&self) -> usize {
+        [
+            &self.q_proj,
+            &self.k_proj,
+            &self.v_proj,
+            &self.out_proj,
+            &self.ffn1,
+            &self.ffn2,
+        ]
+        .iter()
+        .map(|l| l.num_params())
+        .sum::<usize>()
+            + self.ln1.num_params()
+            + self.ln2.num_params()
+    }
+
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         let (m, c) = input.matrix_dims()?;
         if c != self.embedding_dim {
@@ -1592,5 +1637,45 @@ mod tests {
         let y = block.forward(&x).unwrap();
         // Residual ensures y is not all-zero even with tiny weights
         assert!(y.data.iter().any(|&v| v.abs() > 0.01));
+    }
+
+    #[test]
+    fn num_params_counts_weights_and_biases_of_each_layer() {
+        // Linear 3->4: 12 weights + 4 biases, f32 and quantized alike.
+        let w: Vec<f32> = (0..12).map(|i| i as f32 * 0.1).collect();
+        let lin = Linear::new(3, 4, w, vec![0.0; 4]).unwrap();
+        assert_eq!(lin.num_params(), 16);
+        assert_eq!(lin.quantize(QKind::Int8).num_params(), 16);
+        // A bias-free head holds a zero bias for shape only; it is not a parameter.
+        let head = Linear::without_bias(3, 4, vec![0.5; 12]).unwrap();
+        assert_eq!(head.num_params(), 12);
+        assert_eq!(head.bias.data, vec![0.0; 4]);
+        let x = Tensor::matrix(1, 3, vec![1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(head.forward(&x).unwrap().data, vec![3.0; 4]);
+        assert_eq!(head.quantize(QKind::Int8).num_params(), 12);
+        assert!(Linear::without_bias(3, 4, vec![0.0; 5]).is_err());
+        let q = QWeight::from_f32(&[0.5; 12], 3, 4, QKind::Int8);
+        assert_eq!(
+            Linear::quantized(3, 4, q, vec![0.0; 4])
+                .unwrap()
+                .num_params(),
+            16
+        );
+        // Embedding: 5x4 token table + 6x4 position table.
+        let emb = Embedding::new(5, 6, 4, vec![0.0; 20], vec![0.0; 24]).unwrap();
+        assert_eq!(emb.num_params(), 44);
+        // LayerNorm: gamma + beta.
+        assert_eq!(
+            LayerNorm::new(7, vec![1.0; 7], vec![0.0; 7])
+                .unwrap()
+                .num_params(),
+            14
+        );
+        // Block c=4, hidden 8: 4 projections (16+4) + 2 norms (8) + ffn (32+8, 32+4).
+        let b = minimal_block(2, 1, 4, 8);
+        assert_eq!(b.num_params(), 4 * 20 + 2 * 8 + 40 + 36);
+        // Parameter-free layers report zero (the trait default).
+        assert_eq!(ActivationLayer::new(Activation::ReLU).num_params(), 0);
+        assert_eq!(Flatten::new().num_params(), 0);
     }
 }

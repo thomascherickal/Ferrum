@@ -33,6 +33,11 @@ impl Sequential {
         &self.layers
     }
 
+    /// Total trainable parameters across all layers.
+    pub fn num_params(&self) -> usize {
+        self.layers.iter().map(|l| l.num_params()).sum()
+    }
+
     pub fn forward(&self, input: &Tensor) -> Result<Tensor> {
         vprintln!(
             "[model::Sequential::forward] input shape={:?}, {} layers",
@@ -140,5 +145,37 @@ mod tests {
     fn layers_slice_has_correct_len() {
         let m = two_layer_model();
         assert_eq!(m.layers().len(), 2);
+    }
+
+    #[test]
+    fn num_params_sums_the_layers() {
+        assert_eq!(Sequential::new().num_params(), 0);
+        // Linear(2->2) has 4 weights + 2 biases; the activation has none.
+        assert_eq!(two_layer_model().num_params(), 6);
+    }
+
+    #[test]
+    fn inference_param_count_matches_trainable_net() {
+        // The reference 500K config: vocab 1024, ctx 128, embed 96, 4 heads, hidden 320, 3 blocks.
+        // tok 1024*96 + pos 128*96
+        //   + 3 * (4 projections (96*96 + 96) + 2 norms (2*96) + ffn (96*320 + 320 + 320*96 + 96))
+        //   + final norm 2*96 + head 96*1024 = 507,552
+        let mut rng = crate::rng::Rng::new(1);
+        let net = crate::train_transformer::TransformerNet::new(1024, 128, 96, 4, 320, 3, &mut rng)
+            .unwrap();
+        assert_eq!(net.num_params(), 507_552);
+        assert_eq!(net.to_inference().unwrap().num_params(), 507_552);
+    }
+
+    #[test]
+    fn tied_head_is_counted_once() {
+        let mut rng = crate::rng::Rng::new(1);
+        let mut net =
+            crate::train_transformer::TransformerNet::new(1024, 128, 96, 4, 320, 3, &mut rng)
+                .unwrap();
+        net.set_weight_tying(true);
+        assert_eq!(net.num_params(), 507_552 - 1024 * 96);
+        net.set_weight_tying(false);
+        assert_eq!(net.num_params(), 507_552);
     }
 }

@@ -3,7 +3,7 @@
 //! Trains a character-level decoder-only **causal Transformer** Small
 //! Language Model from any raw text corpus — entirely on CPU, zero external
 //! dependencies. Training is int8 quantization-aware (QAT) and models are
-//! always exported as int8 GGUF (≈4× smaller than f32).
+//! exported as int8 GGUF (≈4× smaller than f32) unless `--quant int4|f32` says otherwise.
 //!
 //! Trained weights are cached on disk: if the model file already exists,
 //! `train` and `run` load it instead of retraining (use `--force` to retrain).
@@ -38,6 +38,7 @@
 //!   --tokens  <N>   token budget, overrides epochs (default 0 = off)
 //!   --cosine / --warmup <N>  warmup + cosine LR decay
 //!   --clip <F>  --tie  --no-qat  --tokenizer <path>
+//!   --quant <int8|int4|f32>  on-disk precision      (default int8)
 //!   --checkpoint <path>  --checkpoint-every <N>  --resume <path>
 //!   --val <F>  --patience <N>   validation split + early stopping
 //!   --force         retrain even if the model file exists
@@ -105,6 +106,7 @@ const TRAIN_FLAGS: Spec = &[
     ("clip", Kind::F32),
     ("tie", Kind::Bool),
     ("no-qat", Kind::Bool),
+    ("quant", Kind::Str),
     ("tokenizer", Kind::Str),
     ("checkpoint", Kind::Str),
     ("checkpoint-every", Kind::U64),
@@ -429,6 +431,7 @@ fn print_usage() {
          \x20 --tokens N   (token budget, e.g. 5e7; overrides --epochs)\n\
          \x20 --cosine  --warmup N   (warmup + cosine LR decay)   --clip F (grad clip)\n\
          \x20 --tie   (tie LM head to embedding)   --no-qat   (plain fp32 training)\n\
+         \x20 --quant int8|int4|f32   (on-disk weight precision; default int8)\n\
          \x20 --tokenizer tok.gguf  (reuse this BPE tokenizer GGUF; trained + saved if missing)\n\
          \x20 --checkpoint ck.fckp  --checkpoint-every N   (save a GGUF checkpoint: weights + optimizer state)\n\
          \x20 --resume ck.fckp      (continue from a GGUF checkpoint)\n\
@@ -500,6 +503,11 @@ fn train_and_save(
         if !std::path::Path::new(ckpt).exists() {
             return Err(format!("checkpoint {ckpt} does not exist (--resume needs an existing file; use --checkpoint to start a new one)").into());
         }
+    }
+    // Check before spending time training.
+    let quant = args.value("quant").unwrap_or("int8");
+    if !matches!(quant, "int8" | "int4" | "f32") {
+        return Err(format!("--quant must be int8|int4|f32 (got '{quant}')").into());
     }
     let cfg = args.config();
     let seed: u64 = args.get("seed", 1337);
@@ -606,9 +614,13 @@ fn train_and_save(
         slm.meta.output_dim, vocab_kind, slm.meta.input_dim, slm.meta.output_dim
     );
 
-    slm.save(model_path)?;
+    match quant {
+        "int8" => slm.save(model_path)?,
+        "int4" => slm.save_int4(model_path)?,
+        _ => slm.save_f32(model_path)?,
+    }
     let size = std::fs::metadata(model_path)?.len();
-    println!("Saved {size} bytes → {model_path} (int8 GGUF)");
+    println!("Saved {size} bytes → {model_path} ({quant} GGUF)");
 
     // Verify the file roundtrips.
     let reloaded = GenerativeSLM::load(model_path)?;
@@ -850,6 +862,7 @@ fn cmd_info(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let m = &slm.meta;
     println!("Model     : {model_path}  ({} bytes)", bytes.len());
     println!("Format    : {}", ferrum_core::loader::gguf_format(&bytes)?);
+    println!("Params    : {}", slm.model.num_params());
     println!("Name      : {}", m.dataset_name);
     println!("Task      : {:?}", m.task);
     println!("Input dim : {}", m.input_dim);
@@ -1740,6 +1753,7 @@ mod tests {
                     "clip",
                     "tie",
                     "no-qat",
+                    "quant",
                     "tokenizer",
                     "checkpoint",
                     "checkpoint-every",

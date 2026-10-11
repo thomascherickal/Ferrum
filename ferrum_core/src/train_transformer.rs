@@ -992,7 +992,20 @@ impl TransformerNet {
         }
     }
 
+    /// Trainable parameters. A tied LM head shares the token embedding, so it
+    /// is counted once.
     pub fn num_params(&self) -> usize {
+        let head = if self.tie_weights {
+            self.head_w.data.numel()
+        } else {
+            0
+        };
+        self.flat_len() - head
+    }
+
+    /// Length of the flat parameter/gradient vector: every tensor, a tied head
+    /// included (its gradient is folded into the embedding's but still stored).
+    fn flat_len(&self) -> usize {
         let block = |b: &BlockT| -> usize {
             [
                 &b.ln1_g, &b.ln1_b, &b.q_w, &b.q_b, &b.k_w, &b.k_b, &b.v_w, &b.v_b, &b.o_w, &b.o_b,
@@ -1252,7 +1265,7 @@ impl TransformerNet {
         }
 
         // Assemble the flat gradient in canonical parameter order.
-        let mut out = Vec::with_capacity(self.num_params());
+        let mut out = Vec::with_capacity(self.flat_len());
         out.extend_from_slice(&g_tok);
         out.extend_from_slice(&g_pos);
         for bg in block_grads {
@@ -1371,11 +1384,10 @@ impl TransformerNet {
         } else {
             self.head_w.data.data.clone()
         };
-        m.push(Box::new(Linear::new(
+        m.push(Box::new(Linear::without_bias(
             self.embed_dim,
             self.vocab_size,
             head_w_data,
-            vec![0.0; self.vocab_size],
         )?));
         m.push(Box::new(ActivationLayer::new(
             crate::activation::Activation::Softmax,

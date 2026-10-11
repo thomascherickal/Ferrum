@@ -626,7 +626,7 @@ fn gpt2_from(r: &GgufIn) -> Result<(Sequential, Normalizer, ModelMetadata)> {
         d,
     )?));
     let head_w = transpose_2d(&head_rows, v, d);
-    model.push(Box::new(Linear::new(d, v, head_w, vec![0.0; v])?));
+    model.push(Box::new(Linear::without_bias(d, v, head_w)?));
     model.push(Box::new(ActivationLayer::new(Activation::Softmax)));
 
     let mut meta = match r.0.meta("ferrum.metadata").and_then(MetaValue::as_str) {
@@ -1361,7 +1361,7 @@ mod tests {
             block(ctx, d, h, 10),
             block(ctx, d, h, 30),
             Box::new(LayerNorm::new(d, vals(d, 90), vals(d, 91)).unwrap()),
-            Box::new(Linear::new(d, v, head, vec![0.0; v]).unwrap()),
+            Box::new(Linear::without_bias(d, v, head).unwrap()),
             Box::new(ActivationLayer::new(Activation::Softmax)),
         ];
         (layers, slm_meta(ctx, v, tok.encode_state()))
@@ -1642,6 +1642,8 @@ mod tests {
             }
             let (m2, _, meta2) = from_gguf(&f32_bytes).unwrap();
             assert_eq!(fwd(&m, &meta), fwd(&m2, &meta2), "f32 exact, tie={tie}");
+            // The reloaded head is bias-free too, so the parameter count survives.
+            assert_eq!(m2.num_params(), m.num_params(), "tie={tie}");
         }
     }
 
