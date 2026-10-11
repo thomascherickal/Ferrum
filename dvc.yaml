@@ -1,0 +1,70 @@
+stages:
+  fetch:
+    cmd: scripts/fetch.sh ${fetch.url} ${fetch.sha256} data/raw/tinystories.txt
+    deps:
+      - scripts/fetch.sh
+    params:
+      - fetch
+    outs:
+      - data/raw/tinystories.txt
+  prepare:
+    cmd: >-
+      cargo run --release -q -p slm_cli -- prepare
+      --input data/raw/tinystories.txt --out data/prepared
+      --min-chars ${prepare.min_chars} --max-chars ${prepare.max_chars}
+      --val-frac ${prepare.val_frac} --test-frac ${prepare.test_frac}
+      --seed ${prepare.seed} --dedup --nfkc
+    deps:
+      - data/raw/tinystories.txt
+      - ferrum_core/src
+      - slm_cli/src
+    params:
+      - prepare
+    outs:
+      - data/prepared/train.txt
+      - data/prepared/val.txt
+      - data/prepared/test.txt
+      - data/prepared/manifest.json:
+          cache: false
+  train:
+    cmd: >-
+      cargo run --release -q -p slm_cli -- train data/prepared/train.txt models/slm.gguf
+      --context ${model.context} --embed ${model.embed} --heads ${model.heads}
+      --blocks ${model.blocks} --hidden ${model.hidden} --vocab ${model.vocab}
+      --tokens ${train.tokens} --lr ${train.lr} --cosine --warmup ${train.warmup}
+      --clip ${train.clip} --val ${train.val} --patience ${train.patience}
+      --seed ${train.seed}
+      --tokenizer models/tokenizer.gguf --force
+    deps:
+      - data/prepared/train.txt
+      - ferrum_core/src
+      - slm_cli/src
+    params:
+      - model
+      - train
+    outs:
+      - models/slm.gguf
+      - models/tokenizer.gguf
+  eval:
+    cmd: >-
+      cargo run --release -q -p slm_cli -- eval models/slm.gguf data/prepared/val.txt --json metrics/val.json &&
+      cargo run --release -q -p slm_cli -- eval models/slm.gguf data/prepared/test.txt --json metrics/test.json
+    deps:
+      - models/slm.gguf
+      - data/prepared/val.txt
+      - data/prepared/test.txt
+    metrics:
+      - metrics/val.json:
+          cache: false
+      - metrics/test.json:
+          cache: false
+  lighteval:
+    frozen: true
+    cmd: eval/lighteval/run.sh --model models/slm.gguf --test data/prepared/test.txt --out metrics/lighteval.json
+    deps:
+      - models/slm.gguf
+      - data/prepared/test.txt
+      - eval/lighteval
+    metrics:
+      - metrics/lighteval.json:
+          cache: false

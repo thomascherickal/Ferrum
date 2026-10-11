@@ -1,0 +1,69 @@
+schema: '2.0'
+stages:
+  fetch:
+    cmd: scripts/fetch.sh 
+      https://huggingface.co/datasets/roneneldan/TinyStories/resolve/f54c09fd23315a6f9c86f9dc80f725de7d8f9c64/TinyStoriesV2-GPT4-valid.txt
+      6874bae9a4c1a4e7edcf0e53b86c17817e9cf881fc75ff2368da457b80c0585d 
+      data/raw/tinystories.txt
+    deps:
+    - path: scripts/fetch.sh
+      hash: md5
+      md5: 136211f2da70812c599911c72853024b
+      size: 503
+      isexec: true
+    params:
+      params.yaml:
+        fetch:
+          url: 
+            https://huggingface.co/datasets/roneneldan/TinyStories/resolve/f54c09fd23315a6f9c86f9dc80f725de7d8f9c64/TinyStoriesV2-GPT4-valid.txt
+          sha256: 
+            6874bae9a4c1a4e7edcf0e53b86c17817e9cf881fc75ff2368da457b80c0585d
+    outs:
+    - path: data/raw/tinystories.txt
+      hash: md5
+      md5: 8caebaf671ccbaaafe769409ef7f63c7
+      size: 22502601
+  prepare:
+    cmd: cargo run --release -q -p slm_cli -- prepare --input 
+      data/raw/tinystories.txt --out data/prepared --min-chars 50 --max-chars 
+      20000 --val-frac 0.05 --test-frac 0.05 --seed 42 --dedup --nfkc
+    deps:
+    - path: data/raw/tinystories.txt
+      hash: md5
+      md5: 8caebaf671ccbaaafe769409ef7f63c7
+      size: 22502601
+    - path: ferrum_core/src
+      hash: md5
+      md5: b726160aabb942f74b89c9be71a44f2a.dir
+      size: 769028
+      nfiles: 25
+    - path: slm_cli/src
+      hash: md5
+      md5: 21f62495f0563ce5df0c1f3aa08ef6cb.dir
+      size: 59990
+      nfiles: 2
+    params:
+      params.yaml:
+        prepare:
+          min_chars: 50
+          max_chars: 20000
+          val_frac: 0.05
+          test_frac: 0.05
+          seed: 42
+    outs:
+    - path: data/prepared/manifest.json
+      hash: md5
+      md5: 0b66f6035310c81e80ef1a31c6493b99
+      size: 1412
+    - path: data/prepared/test.txt
+      hash: md5
+      md5: 70495c3b98c810ec6542ae8615a8e863
+      size: 1154992
+    - path: data/prepared/train.txt
+      hash: md5
+      md5: 06c437596594eb7af262d28e18818295
+      size: 20190677
+    - path: data/prepared/val.txt
+      hash: md5
+      md5: e7a3d277a1919f3395ed5b800c7b62f7
+      size: 1129150

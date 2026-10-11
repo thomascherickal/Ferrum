@@ -18,6 +18,7 @@
 //! train_transformer finetune-gguf <model.gguf> <corpus.txt> <out.flck> [options]
 //! train_transformer export-gguf <in.gguf> <out.gguf> [--quant q8_0|q4_0|q4_k|…] [--resume ckpt.flck]
 //! train_transformer info     <model.gguf>
+//! train_transformer prepare  --input <file|dir> --out <dir> [options]
 //! ```
 //!
 //! ### `train` / `run` options
@@ -54,6 +55,7 @@
 
 #![forbid(unsafe_code)]
 
+mod prepare;
 mod runtime_export;
 
 use ferrum_core::{GenerativeSLM, Rng, TaskType, TransformerConfig, ValidationConfig};
@@ -153,6 +155,22 @@ const EXPORT_FLAGS: Spec = &[
 ];
 const EXPORT_OLLAMA_FLAGS: Spec = &[("bin", Kind::Str), ("modelfile-only", Kind::Str)];
 const EXPORT_LMSTUDIO_FLAGS: Spec = &[("repo", Kind::Str), ("bin", Kind::Str)];
+const PREPARE_FLAGS: Spec = &[
+    ("input", Kind::StrList),
+    ("out", Kind::Str),
+    ("doc-sep", Kind::Str),
+    ("lossy", Kind::Bool),
+    ("nfkc", Kind::Bool),
+    ("lowercase", Kind::Bool),
+    ("strip-gutenberg", Kind::Bool),
+    ("min-chars", Kind::Usize),
+    ("max-chars", Kind::Usize),
+    ("dedup", Kind::Bool),
+    ("val-frac", Kind::F64),
+    ("test-frac", Kind::F64),
+    ("seed", Kind::U64),
+];
+const EVAL_FLAGS: Spec = &[("json", Kind::Str)];
 const NO_FLAGS: Spec = &[];
 
 /// `run` takes the union of train and generate flags.
@@ -171,7 +189,9 @@ fn spec_for(cmd: &str) -> Option<Spec> {
         "export-gguf" | "export" => EXPORT_FLAGS,
         "export-ollama" => EXPORT_OLLAMA_FLAGS,
         "export-lmstudio" => EXPORT_LMSTUDIO_FLAGS,
-        "eval" | "info" => NO_FLAGS,
+        "prepare" => PREPARE_FLAGS,
+        "eval" => EVAL_FLAGS,
+        "info" => NO_FLAGS,
         _ => return None,
     })
 }
@@ -348,6 +368,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     };
     let args = Args::parse_for(&cmd, &argv[2..], spec)?;
+    let raw_args = &argv[2..];
     if args.verbose {
         ferrum_core::set_verbose(true);
     }
@@ -371,6 +392,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .map_err(Into::into),
         "eval" => cmd_eval(&args),
+        "prepare" => cmd_prepare(&args, raw_args),
         "info" => cmd_info(&args),
         _ => unreachable!("spec_for covers every command"),
     }
@@ -389,7 +411,8 @@ fn print_usage() {
          \x20 train_transformer export-gguf <in.gguf> <out.gguf> [options]\n\
          \x20 train_transformer export-ollama <model.gguf> <name> [--bin P] [--modelfile-only out.Modelfile]\n\
          \x20 train_transformer export-lmstudio <model.gguf> [--repo ferrum/<stem>] [--bin P]\n\
-         \x20 train_transformer eval     <model.gguf>  <heldout.txt>\n\
+         \x20 train_transformer eval     <model.gguf>  <heldout.txt> [--json out.json]\n\
+         \x20 train_transformer prepare  --input <file|dir> --out <dir> [options]\n\
          \x20 train_transformer info     <model.gguf>\n\n\
          TRAIN / RUN options:\n\
          \x20 --context N  --embed N  --heads N  --blocks N  --hidden N\n\
@@ -406,6 +429,11 @@ fn print_usage() {
          \x20 --threads N  --force    --sample   --verbose|-v\n\
          \x20 (--vocab 0 = character-level; >=256 = byte-level BPE, default 512)\n\
          \x20 (--threads 0 = auto-detect cores [default]; 1 = serial training)\n\n\
+         PREPARE options:\n\
+         \x20 --input P (file or dir)  --out DIR  --doc-sep S (default <|endoftext|>)\n\
+         \x20 --lossy  --nfkc  --lowercase  --strip-gutenberg  --dedup\n\
+         \x20 --min-chars N (1)  --max-chars N (0 = off)\n\
+         \x20 --val-frac F (0.05)  --test-frac F (0.05)  --seed N (42)\n\n\
          GENERATE / RUN options:\n\
          \x20 --chars N    --temp F   --gen-seed N   --stream\n\
          \x20 (--stream prints the completion live as it is generated)\n\n\
@@ -707,6 +735,35 @@ fn generate_text(
     }
 }
 
+fn cmd_prepare(args: &Args, raw: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let usage =
+        "usage: train_transformer prepare --input <file|dir> [--input ...] --out <dir> [options]";
+    let inputs = args.get_all("input");
+    if inputs.is_empty() {
+        return Err(usage.into());
+    }
+    let out = args.value("out").ok_or(usage)?;
+    prepare::run(&prepare::PrepareOptions {
+        inputs,
+        out: out.to_string(),
+        doc_sep: args
+            .value("doc-sep")
+            .unwrap_or(ferrum_core::DOC_SEP)
+            .to_string(),
+        lossy: args.has("lossy"),
+        nfkc: args.has("nfkc"),
+        lowercase: args.has("lowercase"),
+        strip_gutenberg: args.has("strip-gutenberg"),
+        min_chars: args.get("min-chars", 1),
+        max_chars: args.get("max-chars", 0),
+        dedup: args.has("dedup"),
+        val_frac: args.get("val-frac", 0.05),
+        test_frac: args.get("test-frac", 0.05),
+        seed: args.get("seed", 42),
+        args: raw.to_vec(),
+    })
+}
+
 fn cmd_eval(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.positional.len() < 2 {
         return Err("usage: train_transformer eval <model.gguf> <heldout.txt>".into());
@@ -718,7 +775,13 @@ fn cmd_eval(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("cannot load model {model_path}: {e}"))?;
     let text = read_corpus(text_path)?;
 
+    let t0 = Instant::now();
     let eval = slm.evaluate(&text)?;
+    let seconds = t0.elapsed().as_secs_f64();
+    let bytes = text.len();
+    let bits_per_byte = f64::from(eval.cross_entropy) * eval.num_predictions as f64
+        / std::f64::consts::LN_2
+        / bytes as f64;
     println!("Model        : {model_path}");
     println!(
         "Held-out text: {text_path}  ({} chars)",
@@ -728,6 +791,22 @@ fn cmd_eval(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     println!("Cross-entropy: {:.4} nats/token", eval.cross_entropy);
     println!("Bits/token   : {:.4}", eval.bits_per_token);
     println!("Perplexity   : {:.4}", eval.perplexity);
+    println!("Bits/byte    : {bits_per_byte:.4}");
+    println!("Seconds      : {seconds:.2}");
+    if let Some(path) = args.value("json") {
+        let v = serde_json::json!({
+            "perplexity": eval.perplexity, "cross_entropy_nats": eval.cross_entropy,
+            "bits_per_token": eval.bits_per_token, "bits_per_byte": bits_per_byte,
+            "tokens": eval.num_predictions, "bytes": bytes, "seconds": seconds,
+        });
+        if let Some(parent) = std::path::Path::new(path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, serde_json::to_string_pretty(&v)? + "\n")?;
+    }
     Ok(())
 }
 
@@ -1481,6 +1560,88 @@ mod tests {
     }
 
     #[test]
+    fn prepare_accepts_repeated_input_and_every_documented_flag() {
+        let a = Args::parse_for(
+            "prepare",
+            &s(&[
+                "--input",
+                "a.txt",
+                "--input",
+                "dir",
+                "--out",
+                "o",
+                "--doc-sep",
+                "<|endoftext|>",
+                "--lossy",
+                "--nfkc",
+                "--lowercase",
+                "--strip-gutenberg",
+                "--dedup",
+                "--min-chars",
+                "10",
+                "--max-chars",
+                "500",
+                "--val-frac",
+                "0.1",
+                "--test-frac",
+                "0.2",
+                "--seed",
+                "7",
+            ]),
+            PREPARE_FLAGS,
+        )
+        .unwrap();
+        assert_eq!(a.get_all("input"), vec!["a.txt", "dir"]);
+        assert_eq!(a.value("out"), Some("o"));
+        assert!(a.has("lossy") && a.has("nfkc") && a.has("dedup"));
+        assert_eq!(a.get("val-frac", 0.0f64), 0.1);
+        assert_eq!(a.get("seed", 0u64), 7);
+    }
+
+    #[test]
+    fn prepare_rejects_unknown_and_malformed_flags() {
+        let e = Args::parse_for("prepare", &s(&["--inptu", "x"]), PREPARE_FLAGS)
+            .err()
+            .unwrap();
+        assert!(e.contains("unknown flag --inptu"), "{e}");
+        let e = Args::parse_for("prepare", &s(&["--val-frac", "abc"]), PREPARE_FLAGS)
+            .err()
+            .unwrap();
+        assert!(e.contains("--val-frac"), "{e}");
+        let e = Args::parse_for("prepare", &s(&["--out"]), PREPARE_FLAGS)
+            .err()
+            .unwrap();
+        assert!(e.contains("--out needs a value"), "{e}");
+    }
+
+    #[test]
+    fn eval_takes_only_json() {
+        let a = Args::parse_for(
+            "eval",
+            &s(&["m.gguf", "t.txt", "--json", "o.json"]),
+            EVAL_FLAGS,
+        )
+        .unwrap();
+        assert_eq!(a.value("json"), Some("o.json"));
+        assert_eq!(a.positional, vec!["m.gguf", "t.txt"]);
+        assert!(Args::parse_for("eval", &s(&["--epochs", "1"]), EVAL_FLAGS).is_err());
+    }
+
+    #[test]
+    fn cmd_prepare_requires_input_and_out() {
+        let none = Args::parse_for("prepare", &s(&["--out", "o"]), PREPARE_FLAGS).unwrap();
+        assert!(cmd_prepare(&none, &[])
+            .unwrap_err()
+            .to_string()
+            .contains("usage: train_transformer prepare"));
+        let no_out = Args::parse_for("prepare", &s(&["--input", "x"]), PREPARE_FLAGS).unwrap();
+        assert!(cmd_prepare(&no_out, &[])
+            .unwrap_err()
+            .to_string()
+            .contains("usage: train_transformer prepare"));
+    }
+
+    #[test]
     fn spec_for_known_commands_and_aliases() {
         for c in [
             "train",
@@ -1495,6 +1656,7 @@ mod tests {
             "export",
             "export-ollama",
             "export-lmstudio",
+            "prepare",
             "eval",
             "info",
         ] {
@@ -1503,7 +1665,8 @@ mod tests {
         for c in ["", "help", "-h", "bogus", "TRAIN"] {
             assert!(spec_for(c).is_none(), "{c}");
         }
-        assert!(spec_for("eval").unwrap().is_empty());
+        assert_eq!(spec_for("eval").unwrap().len(), EVAL_FLAGS.len());
+        assert!(spec_for("eval").unwrap().iter().any(|(n, _)| *n == "json"));
         assert!(spec_for("info").unwrap().is_empty());
         assert_eq!(
             spec_for("gen").unwrap().len(),

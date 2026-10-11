@@ -46,3 +46,5 @@ web/datasets/wine/
 eval/lighteval/.venv/
 eval/lighteval/out/
 __pycache__/
+# DataOps virtualenv (DVC)
+.venv/

@@ -1,0 +1,65 @@
+{
+  "args": [
+    "--input",
+    "data/raw/tinystories.txt",
+    "--out",
+    "data/prepared",
+    "--min-chars",
+    "50",
+    "--max-chars",
+    "20000",
+    "--val-frac",
+    "0.05",
+    "--test-frac",
+    "0.05",
+    "--seed",
+    "42",
+    "--dedup",
+    "--nfkc"
+  ],
+  "ferrum_version": "0.3.0",
+  "inputs": [
+    {
+      "bytes": 22502601,
+      "path": "data/raw/tinystories.txt",
+      "sha256": "6874bae9a4c1a4e7edcf0e53b86c17817e9cf881fc75ff2368da457b80c0585d"
+    }
+  ],
+  "outputs": {
+    "test": {
+      "bytes": 1154992,
+      "chars": 1133662,
+      "documents": 1423,
+      "path": "data/prepared/test.txt",
+      "sha256": "e27972555d11a71805aa6bac1513d2a7753cc390fa1156fe85faf9bd5bb5e79a"
+    },
+    "train": {
+      "bytes": 20190677,
+      "chars": 19818342,
+      "documents": 24823,
+      "path": "data/prepared/train.txt",
+      "sha256": "b7fa83ba945efdfe7e5eea39eb646446dfaa78902b95eefd332b72c66253aa0d"
+    },
+    "val": {
+      "bytes": 1129150,
+      "chars": 1108405,
+      "documents": 1384,
+      "path": "data/prepared/val.txt",
+      "sha256": "f2733315db89ce9f75439ed62c4df29a2f6dda1e2f080ecd82a54119cd1b349f"
+    }
+  },
+  "rejected": {
+    "duplicate": 0,
+    "empty": 1,
+    "invalid_utf8": 0,
+    "too_long": 0,
+    "too_short": 0
+  },
+  "train_stats": {
+    "bytes": 20190677,
+    "chars": 19818342,
+    "lines": 107558,
+    "unique_chars": 78,
+    "words": 3960171
+  }
+}

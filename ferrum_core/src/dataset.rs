@@ -1,8 +1,8 @@
 //! Corpus acquisition helpers: cleaning raw text into a shape the SLM training
 //! paths expect, and summarising it.
 //!
-//! Downloading is intentionally **not** here — `ferrum_core` is zero-dependency
-//! and `std`-only, so it has no HTTP client. An embedding application (the GUI,
+//! Unicode NFKC normalization is provided by the `unicode-normalization` crate.
+//! Downloading is intentionally **not** here — `ferrum_core` has no HTTP client. An embedding application (the GUI,
 //! a script) fetches bytes however it likes and then calls [`clean_corpus`] /
 //! [`corpus_stats`] / [`validate_for_training`], all of which are pure string
 //! functions and fully tested.
@@ -69,8 +69,10 @@ pub struct CorpusStats {
 /// all flags off the only transformation is `\r` removal (the engine never wants
 /// carriage returns, matching `tokenize_corpus`).
 pub fn clean_corpus(raw: &str, opts: &CleanOptions) -> String {
+    let joined;
     let body = if opts.strip_gutenberg {
-        strip_gutenberg_boilerplate(raw)
+        joined = gutenberg_bodies(raw).join("\n\n");
+        joined.as_str()
     } else {
         raw
     };
@@ -82,7 +84,9 @@ pub fn clean_corpus(raw: &str, opts: &CleanOptions) -> String {
         if ch == '\r' {
             continue;
         }
-        if opts.strip_control_chars && ch.is_control() && ch != '\n' && ch != '\t' {
+        if opts.strip_control_chars
+            && ((ch.is_control() && ch != '\n' && ch != '\t') || is_invisible(ch))
+        {
             continue;
         }
         let mapped = if opts.normalize_punctuation {
@@ -159,19 +163,80 @@ fn collapse_whitespace(text: &str) -> String {
     out
 }
 
-/// Keep only the body of a Project Gutenberg text, dropping the license header
-/// and footer. If the markers are not both present, the input is returned
-/// unchanged.
-fn strip_gutenberg_boilerplate(raw: &str) -> &str {
-    let start = raw
-        .find("*** START OF")
-        .or_else(|| raw.find("***START OF"))
-        .and_then(|i| raw[i..].find('\n').map(|j| i + j + 1));
-    let end = raw.find("*** END OF").or_else(|| raw.find("***END OF"));
-    match (start, end) {
-        (Some(s), Some(e)) if s < e => &raw[s..e],
-        _ => raw,
+/// Characters that render as nothing but break tokenization and dedup.
+fn is_invisible(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{FEFF}' | '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}'
+    )
+}
+
+/// Remove the BOM, zero-width characters, `\r`, and control characters other
+/// than `\n` and `\t`.
+pub fn strip_invisible(text: &str) -> String {
+    text.chars()
+        .filter(|&c| !(is_invisible(c) || c == '\r' || (c.is_control() && c != '\n' && c != '\t')))
+        .collect()
+}
+
+/// The body of every Project Gutenberg book in `raw`: the text between each
+/// `*** START OF … ***` line and the following `*** END OF` marker, in order.
+/// Returns `vec![raw]` when no complete START/END pair exists.
+pub fn gutenberg_bodies(raw: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = 0usize;
+    while let Some(s) = find_marker(&raw[rest..], "START OF") {
+        let s_abs = rest + s;
+        let Some(body_start) = raw[s_abs..].find('\n').map(|j| s_abs + j + 1) else {
+            break;
+        };
+        let Some(e) = find_marker(&raw[body_start..], "END OF") else {
+            break;
+        };
+        let e_abs = body_start + e;
+        out.push(&raw[body_start..e_abs]);
+        rest = raw[e_abs..].find('\n').map_or(raw.len(), |j| e_abs + j + 1);
     }
+    if out.is_empty() {
+        vec![raw]
+    } else {
+        out
+    }
+}
+
+/// Offset of `*** <what>` or `***<what>` in `s`, whichever comes first.
+fn find_marker(s: &str, what: &str) -> Option<usize> {
+    let a = s.find(&format!("*** {what}"));
+    let b = s.find(&format!("***{what}"));
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (x, y) => x.or(y),
+    }
+}
+
+/// Collapse runs of spaces and tabs within each line to a single space.
+pub fn squeeze_spaces(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_run = false;
+    for ch in text.chars() {
+        if ch == ' ' || ch == '\t' {
+            if !in_run {
+                out.push(' ');
+            }
+            in_run = true;
+        } else {
+            out.push(ch);
+            in_run = false;
+        }
+    }
+    out
+}
+
+/// Unicode NFKC normalization (compatibility forms such as ligatures,
+/// full-width letters, and circled digits fold to their plain equivalents).
+pub fn normalize_nfkc(text: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    text.nfkc().collect()
 }
 
 /// Compute [`CorpusStats`] for `text`.
@@ -334,5 +399,69 @@ mod tests {
         assert!(validate_for_training(&cleaned, 8).is_ok());
         // Non-ASCII survives (byte-level BPE handles it).
         assert!(cleaned.contains("café"));
+    }
+
+    #[test]
+    fn strip_invisible_removes_bom_zero_width_and_controls() {
+        let raw = "\u{FEFF}he\u{200B}llo\r\n\u{2060}wor\u{0007}ld\tok\u{200D}";
+        assert_eq!(strip_invisible(raw), "hello\nworld\tok");
+    }
+
+    #[test]
+    fn gutenberg_bodies_keeps_every_book() {
+        let raw = "hdr1\n*** START OF BOOK ONE ***\nalpha\n*** END OF BOOK ONE ***\nlicense\n\
+                   hdr2\n*** START OF BOOK TWO ***\nbeta\n*** END OF BOOK TWO ***\nfooter";
+        let b = gutenberg_bodies(raw);
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[0].trim(), "alpha");
+        assert_eq!(b[1].trim(), "beta");
+        assert_eq!(gutenberg_bodies("no markers"), vec!["no markers"]);
+        let cleaned = clean_corpus(raw, &CleanOptions::default());
+        assert!(cleaned.contains("alpha") && cleaned.contains("beta"));
+        assert!(!cleaned.contains("license") && !cleaned.contains("hdr2"));
+    }
+
+    #[test]
+    fn squeeze_spaces_and_nfkc() {
+        assert_eq!(squeeze_spaces("a  b\t\t c\n  d"), "a b c\n d");
+        assert_eq!(normalize_nfkc("ﬁ ① Ａ"), "fi 1 A");
+    }
+
+    #[test]
+    fn clean_corpus_strips_bom_by_default() {
+        let out = clean_corpus("\u{FEFF}Hi\u{200B} there", &CleanOptions::default());
+        assert_eq!(out.trim_end(), "Hi there");
+    }
+    #[test]
+    fn nbsp_and_bullet_fold_and_folding_can_be_disabled() {
+        let raw = "a\u{00A0}b\u{2007}c\u{202F}d \u{2022} e\u{2014}f";
+        let on = clean_corpus(raw, &CleanOptions::default());
+        assert_eq!(on.trim_end(), "a b c d * e-f");
+        let off = clean_corpus(
+            raw,
+            &CleanOptions {
+                normalize_punctuation: false,
+                ..CleanOptions::default()
+            },
+        );
+        assert!(off.contains('\u{2022}') && off.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn gutenberg_marker_forms_and_truncated_books() {
+        // no-space marker form, and the earlier of two forms wins
+        let a = "x\n***START OF A***\nbody1\n*** END OF A ***\ny";
+        assert_eq!(gutenberg_bodies(a), vec!["body1\n"]);
+        // both forms of the START marker present: the earlier one wins
+        let e = "***START OF A***\nb1\n*** END OF A ***\n*** START OF B ***\nb2\n***END OF B***";
+        assert_eq!(gutenberg_bodies(e), vec!["b1\n", "b2\n"]);
+        // START with no newline after it, or no END: whole text passes through
+        let b = "x\n*** START OF A ***";
+        assert_eq!(gutenberg_bodies(b), vec![b]);
+        let c = "*** START OF A ***\nbody with no end";
+        assert_eq!(gutenberg_bodies(c), vec![c]);
+        // a complete book followed by a truncated one keeps only the complete one
+        let d = "*** START OF A ***\nb1\n*** END OF A ***\n*** START OF B ***\nb2";
+        assert_eq!(gutenberg_bodies(d), vec!["b1\n"]);
     }
 }

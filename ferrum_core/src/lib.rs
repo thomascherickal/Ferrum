@@ -79,7 +79,10 @@ pub mod train_transformer;
 
 pub use activation::Activation;
 pub use chat_format::ChatFormat;
-pub use dataset::{clean_corpus, corpus_stats, validate_for_training, CleanOptions, CorpusStats};
+pub use dataset::{
+    clean_corpus, corpus_stats, gutenberg_bodies, normalize_nfkc, squeeze_spaces, strip_invisible,
+    validate_for_training, CleanOptions, CorpusStats,
+};
 pub use error::{InferError, Result};
 pub use gguf::{f16_to_f32, Gguf, MetaValue, TensorInfo};
 pub use gguf_tokenizer::{GgufTokenizer, TokModel};
