@@ -405,7 +405,9 @@ fn resume_continues_from_checkpoint_to_the_budget() {
     })
     .unwrap();
     assert_eq!(ckpt_steps(&ck), 7);
-    assert_eq!(losses, 2, "4 remaining steps = 2 epochs of 2 steps");
+    // Step 3 is one step into epoch 2: finish it (1), then epoch 3 (2), then
+    // 1 step of epoch 4 -- epoch boundaries line up with an uninterrupted run.
+    assert_eq!(losses, 3, "1 + 2 + 1 steps = 3 epoch callbacks");
     assert!(slm.generate("the quic", 5, 0.7, &mut Rng::new(1)).is_ok());
 
     // A checkpoint from a different vocabulary is refused, not silently used.

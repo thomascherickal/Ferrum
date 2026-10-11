@@ -75,6 +75,9 @@ pub struct TransformerConfig {
     /// Resume from `checkpoint_path` when it exists. The checkpoint fixes the
     /// architecture; its vocab and context must match this run's.
     pub resume: bool,
+    /// Print a `[train] step S/T  tokens/s R  elapsed Xs` line every this many
+    /// optimizer steps; `0` = off.
+    pub log_every_steps: u64,
 }
 
 impl Default for TransformerConfig {
@@ -102,6 +105,7 @@ impl Default for TransformerConfig {
             checkpoint_path: String::new(),
             checkpoint_every: 0,
             resume: false,
+            log_every_steps: 0,
         }
     }
 }
@@ -575,6 +579,12 @@ impl GenerativeSLM {
         let mut best: Option<Self> = None;
         let mut best_ce = f32::INFINITY;
         let mut stale = 0usize;
+        // A resumed model is the incumbent: later epochs must beat its score.
+        if net.step_count() > 0 {
+            let candidate = Self::build_transformer_slm(&net, &tc)?;
+            best_ce = candidate.evaluate(&val_text)?.cross_entropy;
+            best = Some(candidate);
+        }
 
         run_training(
             &mut net,
@@ -611,7 +621,7 @@ impl GenerativeSLM {
             },
         )?;
 
-        // `best` is always set: epoch 1 improves on +inf.
+        // `best` is set unless zero epochs ran: epoch 1 improves on +inf.
         best.ok_or_else(|| InferError::DimMismatch("training ran zero epochs".into()))
     }
 
@@ -1803,6 +1813,12 @@ fn prepare_net(cfg: &TransformerConfig, vocab: usize, rng: &mut Rng) -> Result<T
     Ok(net)
 }
 
+/// The throttled progress line printed every `log_every_steps` steps.
+fn progress_line(step: u64, total_steps: u64, tokens_done: f64, secs: f64) -> String {
+    let rate = tokens_done / secs.max(1e-9);
+    format!("[train] step {step}/{total_steps}  tokens/s {rate:.0}  elapsed {secs:.0}s")
+}
+
 /// Write a training checkpoint atomically (temp file + rename), so a crash
 /// mid-write never leaves a truncated checkpoint behind.
 fn write_checkpoint(path: &str, net: &TransformerNet, rng: &Rng) -> Result<()> {
@@ -1847,25 +1863,46 @@ where
     let adam = Adam::new(cfg.lr);
     let ckpt = &cfg.checkpoint_path;
     let every = cfg.checkpoint_every;
+    let t0 = std::time::Instant::now();
+    let start_step = net.step_count();
+    let log_every = cfg.log_every_steps;
+    let tokens_per_step = (batch * t) as f64;
     let mut on_step = |n: &TransformerNet, r: &Rng| -> Result<()> {
         if !ckpt.is_empty() && every > 0 && n.step_count().is_multiple_of(every) {
             write_checkpoint(ckpt, n, r)?;
         }
+        if log_every > 0 && n.step_count().is_multiple_of(log_every) {
+            let done = (n.step_count() - start_step) as f64 * tokens_per_step;
+            println!(
+                "{}",
+                progress_line(
+                    n.step_count(),
+                    total_steps,
+                    done,
+                    t0.elapsed().as_secs_f64()
+                )
+            );
+        }
         Ok(())
     };
-    // ponytail: a resumed run restarts its partially-done epoch with a fresh
-    // shuffle; exact mid-epoch replay would need the permutation in the checkpoint.
+    // ponytail: a resumed run reshuffles its partially-done epoch (so the
+    // remaining steps see a fresh permutation); exact mid-epoch replay would
+    // need the permutation in the checkpoint. The epoch still ends where an
+    // uninterrupted run's would.
     let mut ep = (net.step_count() / steps_per_epoch) as usize;
+    let mut partial = net.step_count() % steps_per_epoch; // steps already done in this epoch
     loop {
         let remaining = total_steps.saturating_sub(net.step_count());
         if (budgeted && remaining == 0) || (!budgeted && ep >= cfg.epochs) {
             break;
         }
         ep += 1;
+        let epoch_left = (steps_per_epoch - partial) as usize;
+        partial = 0;
         let max_steps = if budgeted {
-            remaining as usize
+            (remaining as usize).min(epoch_left)
         } else {
-            usize::MAX
+            epoch_left
         };
         let loss = train_transformer_steps(
             net,
@@ -3683,5 +3720,213 @@ mod tests {
         let blocked = format!("{path}/x.gguf");
         assert!(slm.save_f32(&blocked).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Training fixes (Phase 1A Task 4) ──────────────────────────────────────
+
+    const RESUME_CORPUS: &str = "the cat sat on the mat. the dog sat on the log. ";
+
+    fn resume_cfg(ckpt: &str) -> TransformerConfig {
+        TransformerConfig {
+            context_len: 8,
+            embed_dim: 8,
+            num_heads: 2,
+            num_blocks: 1,
+            hidden_dim: 16,
+            epochs: 3,
+            batch_size: 4,
+            vocab_size: 270,
+            checkpoint_path: ckpt.to_string(),
+            checkpoint_every: 5,
+            ..TransformerConfig::default()
+        }
+    }
+
+    fn scratch_ckpt(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("ferrum_{name}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("r.fckp").to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// Optimizer step counts at the end of every epoch `run_training` reports.
+    fn epoch_ends(corpus: &str, cfg: &TransformerConfig) -> Vec<u64> {
+        let tc = tokenize_for_lm_cfg(corpus, cfg).unwrap();
+        let mut rng = Rng::new(1);
+        let mut net = prepare_net(cfg, tc.vocab_size, &mut rng).unwrap();
+        let mut ends = Vec::new();
+        run_training(&mut net, &tc.tokens, cfg, 1, &mut rng, |n, _, _| {
+            ends.push(n.step_count());
+            Ok(true)
+        })
+        .unwrap();
+        ends
+    }
+
+    #[test]
+    fn resume_mid_epoch_finishes_the_partial_epoch() {
+        let ckpt = scratch_ckpt("resume");
+        let corpus = RESUME_CORPUS.repeat(40);
+        let base = resume_cfg(&ckpt);
+        // Uninterrupted run: record the step count at the end of every epoch.
+        let full = epoch_ends(&corpus, &base);
+        assert_eq!(full.len(), 3);
+        let spe = full[0];
+        assert!(spe > 5 && full == vec![spe, 2 * spe, 3 * spe], "{full:?}");
+        // Interrupted run: train only 5 steps, then resume to 3 epochs.
+        let _ = std::fs::remove_file(&ckpt);
+        let short = TransformerConfig {
+            max_tokens: 5 * 4 * 8,
+            ..base.clone()
+        };
+        assert_eq!(epoch_ends(&corpus, &short), vec![5]);
+        let resumed = TransformerConfig {
+            resume: true,
+            ..base.clone()
+        };
+        // The partial epoch is finished first: epoch boundaries line up.
+        assert_eq!(epoch_ends(&corpus, &resumed), full);
+
+        // Through the public API the epochs are numbered 1..=3 as well.
+        let _ = std::fs::remove_file(&ckpt);
+        GenerativeSLM::train_transformer_config(
+            &corpus,
+            &TransformerConfig {
+                max_tokens: 5 * 4 * 8,
+                ..base.clone()
+            },
+            &mut Rng::new(1),
+            |_, _| {},
+        )
+        .unwrap();
+        let mut epochs_seen = Vec::new();
+        GenerativeSLM::train_transformer_config(&corpus, &resumed, &mut Rng::new(1), |ep, _| {
+            epochs_seen.push(ep)
+        })
+        .unwrap();
+        assert_eq!(epochs_seen, vec![1, 2, 3]);
+        let (net, _) = TransformerNet::load_checkpoint(&std::fs::read(&ckpt).unwrap()).unwrap();
+        assert_eq!(
+            net.step_count(),
+            3 * spe,
+            "resumed run must end on the same step"
+        );
+    }
+
+    #[test]
+    fn resume_mid_epoch_with_a_token_budget_keeps_epoch_boundaries() {
+        let ckpt = scratch_ckpt("resume_budget");
+        let corpus = RESUME_CORPUS.repeat(40);
+        let base = resume_cfg(&ckpt);
+        let spe = epoch_ends(&corpus, &base)[0];
+        let _ = std::fs::remove_file(&ckpt);
+        let short = TransformerConfig {
+            max_tokens: 5 * 4 * 8,
+            ..base.clone()
+        };
+        epoch_ends(&corpus, &short);
+        // Budget of 2 epochs + 3 steps, resumed 5 steps in: finishes epoch 1,
+        // runs epoch 2, then stops 3 steps into epoch 3.
+        let resumed = TransformerConfig {
+            resume: true,
+            max_tokens: (2 * spe + 3) * 4 * 8,
+            ..base
+        };
+        assert_eq!(
+            epoch_ends(&corpus, &resumed),
+            vec![spe, 2 * spe, 2 * spe + 3]
+        );
+    }
+
+    #[test]
+    fn validated_resume_starts_from_the_resumed_models_score() {
+        let ckpt = scratch_ckpt("vresume");
+        let corpus = RESUME_CORPUS.repeat(40);
+        let cfg = TransformerConfig {
+            epochs: 4,
+            checkpoint_every: 0,
+            ..resume_cfg(&ckpt)
+        };
+        let val = ValidationConfig {
+            val_fraction: 0.2,
+            patience: 0,
+        };
+        let mut first = Vec::new();
+        GenerativeSLM::train_transformer_config_validated(
+            &corpus,
+            &cfg,
+            1,
+            &val,
+            &mut Rng::new(1),
+            |p| first.push(p.is_best),
+        )
+        .unwrap();
+        assert!(first[0], "a fresh run's first epoch is the best so far");
+        // Resume with 4 more epochs at lr 0 (no change): no epoch may claim
+        // "best", because none improves on the resumed model's own score.
+        let resumed = TransformerConfig {
+            resume: true,
+            epochs: 8,
+            lr: 0.0,
+            ..cfg
+        };
+        let mut bests = Vec::new();
+        let slm = GenerativeSLM::train_transformer_config_validated(
+            &corpus,
+            &resumed,
+            1,
+            &val,
+            &mut Rng::new(1),
+            |p| bests.push(p.is_best),
+        )
+        .unwrap();
+        assert_eq!(bests.len(), 4);
+        assert!(bests.iter().all(|b| !b), "{bests:?}");
+        // The resumed model itself is what comes back.
+        assert!(slm.generate("the cat", 5, 0.5, &mut Rng::new(1)).is_ok());
+        // Resuming a run that already finished trains nothing and still returns it.
+        let done = TransformerConfig {
+            epochs: 8,
+            ..resumed
+        };
+        let mut calls = 0;
+        GenerativeSLM::train_transformer_config_validated(
+            &corpus,
+            &done,
+            1,
+            &val,
+            &mut Rng::new(1),
+            |_| calls += 1,
+        )
+        .unwrap();
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn progress_line_reports_step_rate_and_elapsed() {
+        let line = progress_line(30, 120, 3000.0, 2.0);
+        assert_eq!(line, "[train] step 30/120  tokens/s 1500  elapsed 2s");
+        // A zero elapsed time never divides by zero.
+        assert!(progress_line(1, 2, 8.0, 0.0).contains("tokens/s"));
+    }
+
+    #[test]
+    fn log_every_steps_defaults_off_and_training_runs_with_it_on() {
+        assert_eq!(TransformerConfig::default().log_every_steps, 0);
+        let cfg = TransformerConfig {
+            log_every_steps: 2,
+            epochs: 1,
+            checkpoint_every: 0,
+            ..resume_cfg("")
+        };
+        let corpus = RESUME_CORPUS.repeat(40);
+        // Epoch mode and budget mode both print progress and still train.
+        assert_eq!(epoch_ends(&corpus, &cfg).len(), 1);
+        let budget = TransformerConfig {
+            max_tokens: 6 * 4 * 8,
+            ..cfg
+        };
+        assert_eq!(epoch_ends(&corpus, &budget), vec![6]);
     }
 }

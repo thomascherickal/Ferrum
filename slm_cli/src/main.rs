@@ -43,7 +43,8 @@
 //!   --val <F>  --patience <N>   validation split + early stopping
 //!   --force         retrain even if the model file exists
 //!   --sample        print a short sample after training
-//!   --verbose | -v  print all engine internals
+//!   --verbose | -v  print a progress line every 10 steps (tokens/s, elapsed)
+//!   --debug         print all engine internals
 //! ```
 //!
 //! ### `generate` / `run` options
@@ -107,6 +108,7 @@ const TRAIN_FLAGS: Spec = &[
     ("tie", Kind::Bool),
     ("no-qat", Kind::Bool),
     ("quant", Kind::Str),
+    ("debug", Kind::Bool),
     ("tokenizer", Kind::Str),
     ("checkpoint", Kind::Str),
     ("checkpoint-every", Kind::U64),
@@ -333,8 +335,24 @@ impl Args {
                 .unwrap_or_default(),
             checkpoint_every: self.get("checkpoint-every", d.checkpoint_every),
             resume: self.value("resume").is_some(),
+            // `-v` prints a progress line every 10 optimizer steps.
+            log_every_steps: if self.verbose { 10 } else { 0 },
         }
     }
+}
+
+/// The `--tokenizer` path when `--val` is set and that file already exists: a
+/// reused tokenizer may have been trained on the held-out text too.
+fn reused_tokenizer_with_val(args: &Args) -> Option<&str> {
+    args.value("val")?;
+    args.value("tokenizer")
+        .filter(|p| std::path::Path::new(p).exists())
+}
+
+/// Whether to turn on the engine's internal logs. `train` and `run` use `-v`
+/// for periodic progress lines instead and need `--debug` for the internals.
+fn engine_debug(cmd: &str, args: &Args) -> bool {
+    args.has("debug") || (args.verbose && !matches!(cmd, "train" | "run"))
 }
 
 fn kind_name(k: Kind) -> &'static str {
@@ -378,7 +396,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let args = Args::parse_for(&cmd, &argv[2..], spec)?;
     let raw_args = &argv[2..];
-    if args.verbose {
+    if engine_debug(&cmd, &args) {
         ferrum_core::set_verbose(true);
     }
     match cmd.as_str() {
@@ -436,7 +454,8 @@ fn print_usage() {
          \x20 --checkpoint ck.fckp  --checkpoint-every N   (save a GGUF checkpoint: weights + optimizer state)\n\
          \x20 --resume ck.fckp      (continue from a GGUF checkpoint)\n\
          \x20 --val F  --patience N (hold out fraction F; keep best epoch; early stop)\n\
-         \x20 --threads N  --force    --sample   --verbose|-v\n\
+         \x20 --threads N  --force    --sample\n\
+         \x20 --verbose|-v   (progress line every 10 steps)   --debug   (engine internals)\n\
          \x20 (--vocab 0 = character-level; >=256 = byte-level BPE, default 512)\n\
          \x20 (--threads 0 = auto-detect cores [default]; 1 = serial training)\n\n\
          PREPARE options:\n\
@@ -509,6 +528,11 @@ fn train_and_save(
     if !matches!(quant, "int8" | "int4" | "f32") {
         return Err(format!("--quant must be int8|int4|f32 (got '{quant}')").into());
     }
+    if let Some(tok) = reused_tokenizer_with_val(args) {
+        println!(
+            "note: reusing {tok}; if it was trained without --val it has seen the validation text"
+        );
+    }
     let cfg = args.config();
     let seed: u64 = args.get("seed", 1337);
     // 0 = auto-detect the machine's parallelism; 1 = serial.
@@ -530,9 +554,14 @@ fn train_and_save(
     );
     println!("  Heads   : {}   Blocks: {}", cfg.num_heads, cfg.num_blocks);
     println!("  Tokenizer: {tok_desc}");
+    let epochs_desc = if cfg.max_tokens > 0 {
+        "budget".to_string()
+    } else {
+        cfg.epochs.to_string()
+    };
     println!(
-        "  Epochs  : {}   LR: {}   Batch: {}   Seed: {seed}",
-        cfg.epochs, cfg.lr, cfg.batch_size
+        "  Epochs  : {epochs_desc}   LR: {}   Batch: {}   Seed: {seed}",
+        cfg.lr, cfg.batch_size
     );
     let resolved_threads = if threads == 0 {
         ferrum_core::num_threads()
@@ -1754,6 +1783,7 @@ mod tests {
                     "tie",
                     "no-qat",
                     "quant",
+                    "debug",
                     "tokenizer",
                     "checkpoint",
                     "checkpoint-every",
@@ -1863,5 +1893,45 @@ mod tests {
         let c = a.config();
         assert_eq!(c.checkpoint_path, "b");
         assert!(c.resume);
+    }
+
+    #[test]
+    fn verbose_means_progress_lines_for_train_and_run_and_internals_elsewhere() {
+        let train = spec_for("train").unwrap();
+        let plain = Args::parse(&s(&[]), train).unwrap();
+        let v = Args::parse(&s(&["-v"]), train).unwrap();
+        let dbg = Args::parse(&s(&["--debug"]), train).unwrap();
+        assert_eq!(plain.config().log_every_steps, 0);
+        assert_eq!(v.config().log_every_steps, 10);
+        for cmd in ["train", "run"] {
+            assert!(!engine_debug(cmd, &plain), "{cmd}");
+            assert!(!engine_debug(cmd, &v), "{cmd} -v is progress only");
+            assert!(engine_debug(cmd, &dbg), "{cmd} --debug");
+        }
+        for cmd in ["generate", "run-gguf", "info", "eval"] {
+            assert!(!engine_debug(cmd, &plain), "{cmd}");
+            assert!(engine_debug(cmd, &v), "{cmd} -v keeps the old meaning");
+        }
+    }
+
+    #[test]
+    fn tokenizer_reuse_is_flagged_only_with_val_and_an_existing_file() {
+        let spec = spec_for("train").unwrap();
+        let dir = std::env::temp_dir().join(format!("ferrum_tokreuse_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tok = dir.join("t.gguf");
+        let tok_s = tok.to_str().unwrap().to_string();
+        let missing = dir.join("nope.gguf").to_str().unwrap().to_string();
+        let _ = std::fs::remove_file(&tok);
+        let parse = |a: &[&str]| Args::parse(&s(a), spec).unwrap();
+        let no_val = parse(&["--tokenizer", &tok_s]);
+        let no_tok = parse(&["--val", "0.1"]);
+        let absent = parse(&["--val", "0.1", "--tokenizer", &missing]);
+        std::fs::write(&tok, b"x").unwrap();
+        let both = parse(&["--val", "0.1", "--tokenizer", &tok_s]);
+        assert_eq!(reused_tokenizer_with_val(&no_val), None);
+        assert_eq!(reused_tokenizer_with_val(&no_tok), None);
+        assert_eq!(reused_tokenizer_with_val(&absent), None);
+        assert_eq!(reused_tokenizer_with_val(&both), Some(tok_s.as_str()));
     }
 }

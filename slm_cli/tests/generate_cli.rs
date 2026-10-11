@@ -258,3 +258,85 @@ fn train_rejects_an_unknown_quant_before_training() {
         "trained first"
     );
 }
+
+// ── training banner, -v progress, --debug, tokenizer reuse (Phase 1A Task 4) ──
+
+fn train_with(name: &str, extra: &[&str]) -> (PathBuf, Output) {
+    let dir = scratch();
+    let c = dir.join("q.txt");
+    std::fs::write(
+        &c,
+        "the cat sat on the mat. the dog sat on the log. ".repeat(60),
+    )
+    .unwrap();
+    let m = dir.join(format!("{name}.gguf"));
+    let _ = std::fs::remove_file(&m);
+    let o = bin()
+        .args(["train", c.to_str().unwrap(), m.to_str().unwrap()])
+        .args(["--context", "8", "--embed", "16", "--heads", "2"])
+        .args(["--blocks", "1", "--hidden", "32", "--batch", "2"])
+        .args(["--vocab", "270"])
+        .args(extra)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    (m, o)
+}
+
+fn stdout_of(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stdout).to_string()
+}
+
+#[test]
+fn train_banner_says_budget_instead_of_a_misleading_epoch_count() {
+    let (_, o) = train_with("banner_budget", &["--tokens", "2000"]);
+    let text = stdout_of(&o);
+    assert!(text.contains("Epochs  : budget"), "{text}");
+    assert!(!text.contains("Epochs  : 100"), "{text}");
+    let (_, o) = train_with("banner_epochs", &["--epochs", "3"]);
+    assert!(stdout_of(&o).contains("Epochs  : 3 "), "{}", stdout_of(&o));
+}
+
+#[test]
+fn verbose_train_prints_progress_and_debug_prints_engine_internals() {
+    let (_, o) = train_with("verbose", &["--epochs", "3", "-v"]);
+    let text = stdout_of(&o);
+    assert!(text.contains("[train] step 10/"), "{text}");
+    assert!(text.contains("tokens/s"), "{text}");
+    // -v alone no longer dumps engine internals.
+    let all = text + &String::from_utf8_lossy(&o.stderr);
+    assert!(!all.contains("[slm::"), "{all}");
+    let (_, quiet) = train_with("quiet", &["--epochs", "3"]);
+    assert!(!stdout_of(&quiet).contains("[train] step"));
+    let (_, o) = train_with("debug", &["--epochs", "1", "--debug"]);
+    let all = stdout_of(&o) + &String::from_utf8_lossy(&o.stderr);
+    assert!(all.contains("[slm::"), "{all}");
+}
+
+#[test]
+fn val_with_an_existing_tokenizer_file_prints_a_leak_note() {
+    let tok = scratch().join("reuse_tok.gguf");
+    let tok_s = tok.to_str().unwrap();
+    let _ = std::fs::remove_file(&tok);
+    // The tokenizer is created by the first run: nothing to warn about yet.
+    let (_, o) = train_with(
+        "tok1",
+        &["--epochs", "1", "--val", "0.1", "--tokenizer", tok_s],
+    );
+    assert!(
+        !stdout_of(&o).contains("note: reusing"),
+        "{}",
+        stdout_of(&o)
+    );
+    assert!(tok.exists());
+    let (_, o) = train_with(
+        "tok2",
+        &["--epochs", "1", "--val", "0.1", "--tokenizer", tok_s],
+    );
+    let text = stdout_of(&o);
+    assert!(text.contains(&format!("note: reusing {tok_s}")), "{text}");
+    assert!(text.contains("validation text"), "{text}");
+    // Without --val there is no leak to warn about.
+    let (_, o) = train_with("tok3", &["--epochs", "1", "--tokenizer", tok_s]);
+    assert!(!stdout_of(&o).contains("note: reusing"));
+}

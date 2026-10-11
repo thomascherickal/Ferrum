@@ -335,6 +335,7 @@ fn train_inner(app: AppHandle, p: TrainParams) -> Result<TrainResult, String> {
                 checkpoint_path: p.checkpoint_path.trim().to_string(),
                 checkpoint_every: p.checkpoint_every,
                 resume: p.resume,
+                log_every_steps: 0,
             };
             if p.val_fraction > 0.0 {
                 let val = ValidationConfig {
