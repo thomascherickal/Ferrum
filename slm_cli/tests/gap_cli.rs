@@ -43,7 +43,6 @@ fn tiny_train(dir: &std::path::Path, extra: &[&str]) -> std::process::Output {
 }
 
 #[test]
-#[ignore = "gap: train accepts --lr nan / negative / zero and saves a garbage model"]
 fn train_rejects_nonpositive_or_nonfinite_lr() {
     for lr in ["nan", "-1", "0", "inf"] {
         let d = tmp("lr");

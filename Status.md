@@ -247,6 +247,8 @@ These are directions, not commitments.
   accepted, and perplexities shift slightly versus earlier releases (which
   skipped the first `context_len` tokens). Char-level models now error on
   characters outside the vocabulary instead of scoring them as id 0.
+- `train` and `finetune-gguf` now reject a non-positive or non-finite `--lr`
+  with an error instead of saving a garbage model.
 - The GUI `train_slm` command ignores the removed `momentum` field. New fields
   are optional and default sensibly, so older front-ends keep working.
 

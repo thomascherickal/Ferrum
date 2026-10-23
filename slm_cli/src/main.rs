@@ -534,6 +534,7 @@ fn train_and_save(
         );
     }
     let cfg = args.config();
+    check_lr(cfg.lr)?;
     let seed: u64 = args.get("seed", 1337);
     // 0 = auto-detect the machine's parallelism; 1 = serial.
     let threads: usize = args.get("threads", 0);
@@ -739,6 +740,15 @@ fn cmd_generate(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         println!("{out}");
     }
     Ok(())
+}
+
+/// A learning rate must be a positive finite number; anything else trains garbage.
+fn check_lr(lr: f32) -> Result<(), Box<dyn std::error::Error>> {
+    if lr.is_finite() && lr > 0.0 {
+        Ok(())
+    } else {
+        Err(format!("--lr must be a positive, finite number (got {lr})").into())
+    }
 }
 
 fn generate_text(
@@ -1225,6 +1235,7 @@ fn cmd_finetune_gguf(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // 3. Hyperparameters.
     let epochs: usize = args.get("epochs", 3);
     let lr: f32 = args.get("lr", 1e-4);
+    check_lr(lr)?;
     let batch: usize = args.get("batch", 8);
     let seq: usize = args.get("seq", 64).min(model.cfg.context_len).max(2);
     let weight_decay: f32 = args.get("weight_decay", 0.0);
