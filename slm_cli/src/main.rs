@@ -65,7 +65,7 @@
 mod prepare;
 mod runtime_export;
 
-use ferrum_core::{GenerativeSLM, Rng, TaskType, TransformerConfig, ValidationConfig};
+use ferrum_core::{GenerativeSLM, Rng, TransformerConfig, ValidationConfig};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// How a `--flag` is parsed. Values are validated at parse time, so a typo
@@ -777,24 +777,6 @@ fn generate_text(
             println!("{out}"); // callers skip their own print when streaming
         }
         return Ok(out);
-    }
-
-    // BPE models tokenize the seed and left-pad short prompts, so the
-    // char-count check only applies to character-level models.
-    if slm.meta.tokenizer_state.is_empty() {
-        let context_len = if slm.meta.task == TaskType::TransformerSLM {
-            slm.meta.input_dim
-        } else {
-            slm.meta.input_dim / slm.meta.output_dim.max(1)
-        };
-        let seed_chars = seed_text.chars().count();
-        if seed_chars < context_len {
-            return Err(format!(
-                "seed text is {seed_chars} chars but the model needs at least {context_len} \
-                 (context window). Provide a longer seed."
-            )
-            .into());
-        }
     }
 
     let mut rng = Rng::new(seed);

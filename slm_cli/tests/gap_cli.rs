@@ -53,7 +53,6 @@ fn train_rejects_nonpositive_or_nonfinite_lr() {
 }
 
 #[test]
-#[ignore = "gap: char-level generate demands seed >= context chars; BPE models accept short seeds"]
 fn char_level_generate_accepts_short_seed_like_bpe() {
     let d = tmp("charseed");
     assert!(tiny_train(&d, &["--vocab", "0"]).status.success());

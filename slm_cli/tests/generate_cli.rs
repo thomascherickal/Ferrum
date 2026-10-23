@@ -153,12 +153,12 @@ fn cli_run_accepts_the_new_flags() {
 }
 
 #[test]
-fn cli_generate_short_seed_on_char_level_needs_the_token_path() {
+fn cli_generate_short_seed_on_char_level_is_left_padded() {
     let m = train("chars", &"abcabcabc ".repeat(40), "0", "2");
-    // Plain path: the seed must fill the context window.
+    // Plain path: a seed shorter than the context window is accepted.
     let o = generate_on(&m, "ab", &["--chars", "5"]);
-    assert!(!o.status.success());
-    assert!(String::from_utf8_lossy(&o.stderr).contains("at least 8"));
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(out(o).starts_with("ab"));
     // Token path: any prompt length is fine.
     let text = out(generate_on(&m, "ab", &["--max-tokens", "5"]));
     assert!(text.starts_with("ab"), "{text:?}");

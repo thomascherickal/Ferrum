@@ -9,7 +9,7 @@
 use crate::AppState;
 use ferrum_core::{
     clean_corpus, corpus_stats, validate_for_training, Adam, CleanOptions, GenerativeSLM, Gguf,
-    GgufTokenizer, LlamaTrainer, LrSchedule, QKind, Rng, SamplingParams, TaskType,
+    GgufTokenizer, LlamaTrainer, LrSchedule, QKind, Rng, SamplingParams,
     TransformerConfig, ValidationConfig,
 };
 use serde::{Deserialize, Serialize};
@@ -426,22 +426,6 @@ fn gen_inner(app: AppHandle, p: GenParams) -> Result<String, String> {
     }
     let slm = GenerativeSLM::load(&p.model_path)
         .map_err(|e| format!("cannot load model {}: {e}", p.model_path))?;
-
-    // Character-level models need a seed at least as long as the context window.
-    if slm.meta.tokenizer_state.is_empty() {
-        let ctx = if slm.meta.task == TaskType::TransformerSLM {
-            slm.meta.input_dim
-        } else {
-            slm.meta.input_dim / slm.meta.output_dim.max(1)
-        };
-        let seed_chars = p.seed_text.chars().count();
-        if seed_chars < ctx {
-            return Err(format!(
-                "seed is {seed_chars} characters but this model needs at least {ctx} \
-                 (its context window). Provide a longer seed."
-            ));
-        }
-    }
 
     ferrum_core::set_verbose(p.verbose);
     let mut rng = Rng::new(p.gen_seed.unwrap_or_else(time_seed));

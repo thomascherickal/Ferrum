@@ -249,6 +249,10 @@ These are directions, not commitments.
   characters outside the vocabulary instead of scoring them as id 0.
 - `train` and `finetune-gguf` now reject a non-positive or non-finite `--lr`
   with an error instead of saving a garbage model.
+- **Char-level `generate` accepts seeds shorter than the context** (library,
+  CLI and GUI): the window is left-padded with token 0 (cached path primes a
+  partial window), as BPE models already did. Output for seeds at least
+  `context_len` long is unchanged.
 - The GUI `train_slm` command ignores the removed `momentum` field. New fields
   are optional and default sensibly, so older front-ends keep working.
 

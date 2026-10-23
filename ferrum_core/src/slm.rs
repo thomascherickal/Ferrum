@@ -892,16 +892,8 @@ impl GenerativeSLM {
         // per-block KV cache (O(context) per token). Token-ID models without
         // transformer blocks fall through to the full-forward loop.
         if let Some(cached) = CachedTransformer::try_new(&self.model) {
-            return self.generate_char_cached_stream(
-                seed,
-                num_chars,
-                params,
-                stop,
-                rng,
-                on_text,
-                cached,
-                context_len,
-            );
+            return self
+                .generate_char_cached_stream(seed, num_chars, params, stop, rng, on_text, cached);
         }
 
         let mut on_text = on_text;
@@ -926,17 +918,15 @@ impl GenerativeSLM {
 
         for step in 0..num_chars {
             let current_len = generated.chars().count();
-            if current_len < context_len {
-                vprintln!(
-                    "[slm::generate] Step {}: generated length {} < context_len {}, stopping",
-                    step,
-                    current_len,
-                    context_len
-                );
-                break;
+            if current_len == 0 {
+                break; // nothing to condition on
             }
-            let context_chars: Vec<char> =
-                generated.chars().skip(current_len - context_len).collect();
+            // Short seeds are left-padded with token 0 (as the BPE path does).
+            let pad = context_len.saturating_sub(current_len);
+            let context_chars: Vec<char> = generated
+                .chars()
+                .skip(current_len.saturating_sub(context_len))
+                .collect();
 
             vprintln!(
                 "[slm::generate] Step {}: context=\"{}\"",
@@ -946,9 +936,8 @@ impl GenerativeSLM {
 
             // Token-ID input → [T, vocab] probabilities; keep the last row.
             let next_dist: Vec<f32> = {
-                let ids: Vec<f32> = context_chars
-                    .iter()
-                    .map(|&ch| char_idx(ch) as f32)
+                let ids: Vec<f32> = std::iter::repeat_n(0.0, pad)
+                    .chain(context_chars.iter().map(|&ch| char_idx(ch) as f32))
                     .collect();
                 let input = Tensor::matrix(1, context_len, ids)?;
                 let out = self.model.forward(&input)?;
@@ -1026,7 +1015,6 @@ impl GenerativeSLM {
         rng: &mut Rng,
         mut on_text: F,
         mut cached: CachedTransformer,
-        context_len: usize,
     ) -> Result<String>
     where
         F: FnMut(&str),
@@ -1053,9 +1041,10 @@ impl GenerativeSLM {
 
         // The window holds the token IDs currently represented in the cache.
         let mut window: Vec<usize> = seed.chars().map(char_idx).collect();
-        // Preserve the old contract: a seed shorter than one context window
-        // cannot start char-level generation.
-        if window.len() < context_len || num_chars == 0 {
+        // A seed shorter than the context window primes a partial window
+        // (positions 0..len), exactly like the BPE cached path. Only an empty
+        // seed has nothing to condition on.
+        if window.is_empty() || num_chars == 0 {
             return Ok(generated);
         }
         // Prime with the most recent `cap` tokens (positions 0..cap-1).
