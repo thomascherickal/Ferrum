@@ -258,9 +258,12 @@ fn read_value(c: &mut Cur, vtype: u32) -> Result<MetaValue> {
                 return Err(fmt("GGUF nested arrays are not supported"));
             }
             let count = c.u64()? as usize;
-            // Guard against absurd counts before reserving.
+            // Guard against absurd counts before reserving. Every element takes
+            // at least one byte, so a count beyond the bytes read means "read
+            // more" (the "GGUF EOF" prefix lets `Gguf::open` grow its prefix;
+            // on the whole file it is final).
             if count > c.b.len() {
-                return Err(fmt("GGUF array count exceeds file size"));
+                return Err(fmt("GGUF EOF: array count exceeds the bytes read"));
             }
             let mut items = Vec::with_capacity(count.min(1024));
             for _ in 0..count {
@@ -414,18 +417,53 @@ fn parse_header(b: &[u8]) -> Result<ParsedHeader> {
     Ok((version, metadata, tensors, data_offset))
 }
 
-/// Reject a tensor directory whose extents leave the data section (`avail`
-/// bytes) or overlap one another. Valid GGUF files never overlap (only
-/// alignment padding separates tensors), and a hostile one that points many
-/// tensors at the same bytes would otherwise make summed element counts
-/// quadratic in the file size. Tensors whose size cannot be computed
-/// (unsupported type, ragged block count, overflow) or that are empty are
-/// skipped here; they still fail cleanly when read.
+/// The one bound every count read from a GGUF (a metadata int, a tensor dim,
+/// an array length) must pass before it sizes an allocation or a loop: `n` may
+/// not exceed `max`, what the file actually holds (its bytes, tensors or
+/// metadata entries), so a few hostile bytes can never request more memory or
+/// work than the file itself justifies.
+pub(crate) fn bounded(n: usize, max: usize, what: &str) -> Result<usize> {
+    if n > max {
+        return Err(fmt(&format!(
+            "GGUF {what} = {n} exceeds what the file can hold ({max})"
+        )));
+    }
+    Ok(n)
+}
+
+/// Every GGML type spends at least one bit per element (the smallest, the
+/// IQ1 formats, ~1.56), so `avail` bytes can hold at most `8 · avail` elements.
+const MAX_ELEMS_PER_BYTE: usize = 8;
+
+/// Validate the tensor directory against the data section (`avail` bytes),
+/// so every tensor dim is bounded by the file:
+/// - an empty tensor must be exactly 1-D `[0]` (how Ferrum writes an empty
+///   parameter); a zero in a multi-dim shape would let the other dims claim
+///   any size while costing no bytes;
+/// - no tensor, even one of a type we cannot size, may claim more elements
+///   than [`MAX_ELEMS_PER_BYTE`] · `avail`;
+/// - sized tensors must lie inside the section and must not overlap. Valid
+///   GGUF files never overlap (only alignment padding separates tensors), and
+///   a hostile one that points many tensors at the same bytes would otherwise
+///   make summed element counts quadratic in the file size.
+///
+/// Tensors whose byte size cannot be computed (unsupported type, ragged block
+/// count) skip the extent check; their element count is still bounded above
+/// and they fail cleanly when read.
 fn check_extents(tensors: &[TensorInfo], avail: usize) -> Result<()> {
+    let max_elems = avail.saturating_mul(MAX_ELEMS_PER_BYTE);
     let avail = avail as u64;
     let mut spans: Vec<(u64, u64, &str)> = Vec::new();
     for t in tensors {
-        let Ok(len) = type_nbytes(t.ggml_type, t.num_elements()) else {
+        let n = t.num_elements();
+        if n == 0 && t.dims != [0] {
+            return Err(fmt(&format!(
+                "tensor '{}' has empty shape {:?}; only a 1-D [0] tensor may be empty",
+                t.name, t.dims
+            )));
+        }
+        bounded(n, max_elems, &format!("tensor '{}' element count", t.name))?;
+        let Ok(len) = type_nbytes(t.ggml_type, n) else {
             continue;
         };
         if len == 0 {
@@ -550,6 +588,15 @@ impl Gguf {
         self.metadata.get(key)
     }
 
+    /// Size of the whole file in bytes: the bound for metadata-sized
+    /// allocations that no single tensor accounts for.
+    pub(crate) fn file_len(&self) -> usize {
+        match &self.source {
+            Source::Memory(b) => b.len(),
+            Source::Streamed { len, .. } => *len,
+        }
+    }
+
     /// Find a tensor by name.
     pub fn tensor(&self, name: &str) -> Option<&TensorInfo> {
         self.tensors.iter().find(|t| t.name == name)
@@ -666,22 +713,27 @@ impl Gguf {
     /// None` it is kept full **f32** — the precision-preserving import (G-Q) that
     /// avoids re-quantizing an already-quantized GGUF onto Ferrum's coarser
     /// per-row grid, at the cost of resident RAM. An optional bias is loaded if
-    /// present.
+    /// present. The tensor must be exactly `[n_in, n_out]` (the shape the
+    /// metadata implies), checked before anything is allocated, which ties
+    /// every metadata dim the model later sizes buffers by to real weights.
     fn linear_from(
         &self,
         name: &str,
         bias_name: Option<&str>,
         prec: Option<QKind>,
+        n_in: usize,
+        n_out: usize,
     ) -> Result<Linear> {
         let t = self
             .tensor(name)
             .ok_or_else(|| fmt(&format!("GGUF tensor '{name}' not found")))?
             .clone();
-        if t.dims.len() != 2 {
-            return Err(fmt(&format!("tensor '{name}' is not 2-D")));
+        if t.dims != [n_in as u64, n_out as u64] {
+            return Err(fmt(&format!(
+                "tensor '{name}' has dims {:?}, expected [{n_in}, {n_out}] from the metadata",
+                t.dims
+            )));
         }
-        let n_in = t.dims[0] as usize;
-        let n_out = t.dims[1] as usize;
         let flat = self.dequantize(&t)?; // row-major [n_out, n_in]
         let w = transpose_2d(&flat, n_out, n_in); // → [n_in, n_out]
         let bias = match bias_name.and_then(|b| self.tensor(b)).cloned() {
@@ -732,7 +784,13 @@ impl Gguf {
             RopeType::Norm
         };
         let dim = self.meta_usize(&format!("{arch}.embedding_length"))?;
-        let n_layers = self.meta_usize(&format!("{arch}.block_count"))?;
+        // Each layer needs nine tensors, so the tensor count bounds the
+        // layer count before it sizes `blocks`.
+        let n_layers = bounded(
+            self.meta_usize(&format!("{arch}.block_count"))?,
+            self.tensors.len(),
+            "block_count",
+        )?;
         let n_heads = self.meta_usize(&format!("{arch}.attention.head_count"))?;
         let n_kv = self
             .meta_opt_usize(&format!("{arch}.attention.head_count_kv"))
@@ -760,10 +818,31 @@ impl Gguf {
         } else {
             self.meta_usize(&format!("{arch}.vocab_size"))?
         };
-        let tok_emb = self.dequantize(emb_t)?;
-        if tok_emb.len() != vocab * dim {
+        // The (file-bounded) embedding must be exactly [dim, vocab]: this ties
+        // both to real data before the tied LM head allocates by them.
+        let emb_ok = match emb_t.dims[..] {
+            [d, v] => d == dim as u64 && v == vocab as u64,
+            _ => vocab.checked_mul(dim) == Some(emb_t.num_elements()),
+        };
+        if !emb_ok || vocab == 0 || dim == 0 {
             return Err(fmt("token_embd.weight size does not match vocab × dim"));
         }
+        let tok_emb = self.dequantize(emb_t)?;
+        // Every other metadata dim must match the weights it describes (checked
+        // in `linear_from` / `norm` before allocating), so the buffers the
+        // model later sizes by them are bounded by the file too.
+        let mul = |a: usize, b: usize| {
+            a.checked_mul(b)
+                .ok_or_else(|| fmt("GGUF attention dims overflow"))
+        };
+        let (q_dim, kv_dim) = (mul(n_heads, head_dim)?, mul(n_kv, head_dim)?);
+        let norm = |name: &str| -> Result<RmsNorm> {
+            let w = self.dequant_named(name)?;
+            if w.len() != dim {
+                return Err(fmt(&format!("tensor '{name}' length is not {dim}")));
+            }
+            Ok(RmsNorm::new(w, eps))
+        };
 
         let mut blocks = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
@@ -780,32 +859,30 @@ impl Gguf {
                     )));
                 }
             }
-            let attn_norm =
-                RmsNorm::new(self.dequant_named(&format!("{p}.attn_norm.weight"))?, eps);
+            let attn_norm = norm(&format!("{p}.attn_norm.weight"))?;
             // Qwen2 carries q/k/v biases; Llama does not (loaded only if present).
-            let wq = self.linear_from(
-                &format!("{p}.attn_q.weight"),
-                Some(&format!("{p}.attn_q.bias")),
-                prec,
-            )?;
-            let wk = self.linear_from(
-                &format!("{p}.attn_k.weight"),
-                Some(&format!("{p}.attn_k.bias")),
-                prec,
-            )?;
-            let wv = self.linear_from(
-                &format!("{p}.attn_v.weight"),
-                Some(&format!("{p}.attn_v.bias")),
-                prec,
-            )?;
-            let wo = self.linear_from(&format!("{p}.attn_output.weight"), None, prec)?;
+            let qkv = |s: &str, n_out: usize| {
+                self.linear_from(
+                    &format!("{p}.attn_{s}.weight"),
+                    Some(&format!("{p}.attn_{s}.bias")),
+                    prec,
+                    dim,
+                    n_out,
+                )
+            };
+            let (wq, wk, wv) = (qkv("q", q_dim)?, qkv("k", kv_dim)?, qkv("v", kv_dim)?);
+            let wo =
+                self.linear_from(&format!("{p}.attn_output.weight"), None, prec, q_dim, dim)?;
             let attn = Attention::new(
                 wq, wk, wv, wo, n_heads, n_kv, head_dim, rope_dim, rope_base, rope_type,
             )?;
-            let ffn_norm = RmsNorm::new(self.dequant_named(&format!("{p}.ffn_norm.weight"))?, eps);
-            let gate = self.linear_from(&format!("{p}.ffn_gate.weight"), None, prec)?;
-            let up = self.linear_from(&format!("{p}.ffn_up.weight"), None, prec)?;
-            let down = self.linear_from(&format!("{p}.ffn_down.weight"), None, prec)?;
+            let ffn_norm = norm(&format!("{p}.ffn_norm.weight"))?;
+            let lin = |s: &str, n_in: usize, n_out: usize| {
+                self.linear_from(&format!("{p}.{s}.weight"), None, prec, n_in, n_out)
+            };
+            let gate = lin("ffn_gate", dim, ffn)?;
+            let up = lin("ffn_up", dim, ffn)?;
+            let down = lin("ffn_down", ffn, dim)?;
             blocks.push(LlamaBlock {
                 attn_norm,
                 attn,
@@ -814,7 +891,7 @@ impl Gguf {
             });
         }
 
-        let final_norm = RmsNorm::new(self.dequant_named("output_norm.weight")?, eps);
+        let final_norm = norm("output_norm.weight")?;
         // Same rule for the LM head: a bias there is never loaded, so refuse it.
         if self.tensor("output.bias").is_some() {
             return Err(fmt(
@@ -824,7 +901,7 @@ impl Gguf {
         }
         // LM head: explicit `output.weight`, or tied to the token embedding.
         let lm_head = if self.tensor("output.weight").is_some() {
-            self.linear_from("output.weight", None, prec)?
+            self.linear_from("output.weight", None, prec, dim, vocab)?
         } else {
             let w = transpose_2d(&tok_emb, vocab, dim); // [vocab,dim] → [dim,vocab]
             match prec {
@@ -1624,7 +1701,9 @@ mod tests {
         bytes.extend_from_slice(&t.data);
 
         let g = Gguf::parse(bytes).unwrap();
-        let lin = g.linear_from("w", None, Some(QKind::Int8)).unwrap();
+        let lin = g
+            .linear_from("w", None, Some(QKind::Int8), n_in, n_out)
+            .unwrap();
         use crate::layer::Layer;
         let x = vec![0.3f32, -0.7, 0.2, 0.9];
         let y = lin
@@ -2033,15 +2112,14 @@ mod tests {
 
     #[test]
     fn check_extents_skips_tensors_it_cannot_size() {
-        // Unsupported type, ragged quantized count, empty, and a saturating
-        // (hostile) element count: none can be read, so none is bounded here,
+        // Unsupported type, ragged quantized count, and the legal 1-D empty
+        // tensor: none has a byte extent, so none is extent-checked here,
         // even where they collide with a real tensor or lie past `avail`.
         let ts = [
             ti("real", &[4], GGML_F32, 0),
             ti("unsupported", &[4], 99, 0),
             ti("ragged", &[33], GGML_Q8_0, 0),
             ti("empty", &[0], GGML_F32, 4),
-            ti("hostile", &[u64::MAX, 8], GGML_F32, 1000),
         ];
         check_extents(&ts, 16).unwrap();
         // ...and each still errors when actually read.
@@ -2147,6 +2225,329 @@ mod tests {
             assert!(e.to_string().contains("overlap"), "{e}");
         }
         assert!(t.elapsed().as_secs() < 5, "took {:?}", t.elapsed());
+    }
+
+    // ── Round 3: every file-sourced count is bounded by the file ─────────────
+
+    #[test]
+    fn bounded_accepts_up_to_max_and_rejects_beyond() {
+        assert_eq!(bounded(0, 0, "x").unwrap(), 0);
+        assert_eq!(bounded(7, 7, "x").unwrap(), 7);
+        let e = bounded(8, 7, "block_count").unwrap_err().to_string();
+        assert!(e.contains("block_count = 8") && e.contains("(7)"), "{e}");
+    }
+
+    #[test]
+    fn check_extents_allows_empty_only_as_1d_zero() {
+        check_extents(&[ti("e", &[0], GGML_F32, 0)], 0).unwrap();
+        // A zero anywhere in a multi-dim (or 1-D-of-0-in-2-D) shape lets the
+        // other dims claim anything for free: rejected, whatever the type.
+        for dims in [&[0u64, 1 << 40][..], &[1 << 40, 0], &[0, 0], &[4, 0, 4]] {
+            for ty in [GGML_F32, GGML_Q8_0, 99] {
+                let e = extents_err(&[ti("z", dims, ty, 0)], 64);
+                assert!(e.contains("only a 1-D [0]"), "{dims:?}: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn check_extents_bounds_element_count_even_for_unsizable_tensors() {
+        // 16 bytes hold at most 128 elements of any GGML type.
+        check_extents(&[ti("ok", &[128], 99, 0)], 16).unwrap();
+        for t in [
+            ti("unsupported", &[129], 99, 0),
+            ti("ragged", &[1 << 40], GGML_Q8_0, 0),
+            ti("hostile", &[u64::MAX, 8], GGML_F32, 1000),
+        ] {
+            assert!(extents_err(&[t], 16).contains("exceeds what the file"));
+        }
+    }
+
+    /// A llama GGUF from (dims, tensors) via the shared writer. `meta` values
+    /// are U32 unless listed in `meta64` (U64).
+    fn llama_file(meta: &[(&str, u32)], meta64: &[(&str, u64)], ts: &[(&str, &[u64])]) -> Gguf {
+        let mut b = crate::gguf_write::GgufBuilder::new();
+        b.meta("general.architecture", MetaValue::String("llama".into()));
+        for &(k, v) in meta {
+            b.meta(&format!("llama.{k}"), MetaValue::U32(v));
+        }
+        for &(k, v) in meta64 {
+            b.meta(&format!("llama.{k}"), MetaValue::U64(v));
+        }
+        for &(name, dims) in ts {
+            let n = dims.iter().product::<u64>() as usize;
+            b.tensor(name, dims, GGML_F32, vec![0u8; 4 * n]);
+        }
+        Gguf::parse(b.into_bytes()).unwrap()
+    }
+
+    /// Run `load_llama` in both precisions; both must fail fast with `want`.
+    fn llama_err(g: &Gguf, want: &str) {
+        let t = std::time::Instant::now();
+        for prec in [Some(QKind::Int8), None] {
+            let e = g.load_llama_prec(prec).err().expect("must be rejected");
+            assert!(e.to_string().contains(want), "{e}");
+        }
+        assert!(t.elapsed().as_secs() < 5, "took {:?}", t.elapsed());
+    }
+
+    #[test]
+    fn zero_size_embedding_attack_is_rejected_at_parse() {
+        // Finding 1: token_embd [0, 2^40] with no data used to pass the size
+        // check (0 == 0) and then size a 4 TiB tied LM head by its vocab.
+        let mut b = crate::gguf_write::GgufBuilder::new();
+        b.meta("general.architecture", MetaValue::String("llama".into()));
+        for (k, v) in [
+            ("embedding_length", 0),
+            ("block_count", 0),
+            ("attention.head_count", 1),
+            ("feed_forward_length", 1),
+        ] {
+            b.meta(&format!("llama.{k}"), MetaValue::U32(v));
+        }
+        b.tensor("token_embd.weight", &[0, 1 << 40], GGML_F32, vec![]);
+        b.tensor("output_norm.weight", &[0], GGML_F32, vec![]);
+        let (p, o) = parse_and_open(&b.into_bytes());
+        for e in [p.err().unwrap(), o.err().unwrap()] {
+            assert!(e.to_string().contains("only a 1-D [0]"), "{e}");
+        }
+        // linear_from's zero-size [0, 2^40] weight: same rejection.
+        let mut b = crate::gguf_write::GgufBuilder::new();
+        b.tensor("w", &[0, 1 << 40], GGML_F32, vec![]);
+        assert!(Gguf::parse(b.into_bytes()).is_err());
+    }
+
+    #[test]
+    fn huge_block_count_is_bounded_by_the_tensor_count() {
+        // Finding 3: block_count = 2^40 (U64) with one tiny valid tensor used
+        // to abort in Vec::with_capacity.
+        let g = llama_file(
+            &[
+                ("embedding_length", 1),
+                ("attention.head_count", 1),
+                ("feed_forward_length", 1),
+            ],
+            &[("block_count", 1 << 40)],
+            &[("token_embd.weight", &[1, 1])],
+        );
+        llama_err(&g, "block_count");
+    }
+
+    /// Valid 1-layer llama shapes: dim 2, 1 head (head_dim 2), ffn 2, vocab 3.
+    const L_META: [(&str, u32); 4] = [
+        ("embedding_length", 2),
+        ("block_count", 1),
+        ("attention.head_count", 1),
+        ("feed_forward_length", 2),
+    ];
+    fn l_tensors() -> Vec<(&'static str, Vec<u64>)> {
+        [
+            ("token_embd.weight", vec![2, 3]),
+            ("blk.0.attn_norm.weight", vec![2]),
+            ("blk.0.attn_q.weight", vec![2, 2]),
+            ("blk.0.attn_k.weight", vec![2, 2]),
+            ("blk.0.attn_v.weight", vec![2, 2]),
+            ("blk.0.attn_output.weight", vec![2, 2]),
+            ("blk.0.ffn_norm.weight", vec![2]),
+            ("blk.0.ffn_gate.weight", vec![2, 2]),
+            ("blk.0.ffn_up.weight", vec![2, 2]),
+            ("blk.0.ffn_down.weight", vec![2, 2]),
+            ("output_norm.weight", vec![2]),
+        ]
+        .into()
+    }
+    /// `l_tensors()` with `name`'s dims replaced (or `name` dropped if `None`),
+    /// plus `extra` metadata overriding `L_META`.
+    fn l_file(name: &str, dims: Option<Vec<u64>>, extra: &[(&str, u32)]) -> Gguf {
+        let mut meta: Vec<(&str, u32)> = L_META.to_vec();
+        meta.retain(|(k, _)| !extra.iter().any(|(e, _)| e == k));
+        meta.extend_from_slice(extra);
+        let ts: Vec<(&str, Vec<u64>)> = l_tensors()
+            .into_iter()
+            .filter_map(|(n, d)| match (n == name, &dims) {
+                (true, Some(nd)) => Some((n, nd.clone())),
+                (true, None) => None,
+                _ => Some((n, d)),
+            })
+            .collect();
+        let ts: Vec<(&str, &[u64])> = ts.iter().map(|(n, d)| (*n, &d[..])).collect();
+        llama_file(&meta, &[], &ts)
+    }
+
+    #[test]
+    fn metadata_dims_must_match_the_weights_they_describe() {
+        // Control: the consistent file loads, tied head and all.
+        let m = l_file("", None, &[]).load_llama_prec(None).unwrap();
+        assert_eq!(
+            (m.cfg.vocab_size, m.cfg.model_dim, m.blocks.len()),
+            (3, 2, 1)
+        );
+        // A head count / key length that does not match attn_q (it would size
+        // the q/context buffers at decode time) - including one whose product
+        // with head_dim overflows.
+        llama_err(
+            &l_file("", None, &[("attention.head_count", 1 << 20)]),
+            "attn_q",
+        );
+        llama_err(
+            &l_file("", None, &[("attention.key_length", 1 << 20)]),
+            "attn_q",
+        );
+        let ts = l_tensors();
+        let ts: Vec<(&str, &[u64])> = ts.iter().map(|(n, d)| (*n, &d[..])).collect();
+        let meta: Vec<(&str, u32)> = L_META
+            .into_iter()
+            .filter(|(k, _)| *k != "attention.head_count")
+            .collect();
+        let huge = &[
+            ("attention.head_count", 1 << 40),
+            ("attention.key_length", 1 << 40),
+        ];
+        llama_err(&llama_file(&meta, huge, &ts), "overflow");
+        let huge_kv = &[
+            ("attention.head_count_kv", 1 << 40),
+            ("attention.key_length", 1 << 40),
+        ];
+        llama_err(&llama_file(&L_META, huge_kv, &ts), "overflow");
+        // Missing block_count; each other projection / norm checked too.
+        let no_blocks: Vec<(&str, u32)> = L_META
+            .into_iter()
+            .filter(|(k, _)| *k != "block_count")
+            .collect();
+        llama_err(&llama_file(&no_blocks, &[], &ts), "block_count");
+        for (name, dims) in [
+            ("blk.0.attn_v.weight", Some(vec![2, 3])),
+            ("blk.0.attn_output.weight", Some(vec![3, 2])),
+            ("blk.0.ffn_up.weight", Some(vec![2, 3])),
+            ("blk.0.attn_norm.weight", None),
+            ("blk.0.ffn_norm.weight", None),
+        ] {
+            let short = name.trim_start_matches("blk.0.");
+            llama_err(&l_file(name, dims, &[]), short.trim_end_matches(".weight"));
+        }
+        // An embedding of the right shape that cannot be decoded.
+        let mut b = crate::gguf_write::GgufBuilder::new();
+        b.meta("general.architecture", MetaValue::String("llama".into()));
+        for (k, v) in L_META {
+            b.meta(&format!("llama.{k}"), MetaValue::U32(v));
+        }
+        b.tensor("token_embd.weight", &[2, 3], 99, vec![0; 24]);
+        llama_err(
+            &Gguf::parse(b.into_bytes()).unwrap(),
+            "unsupported for sizing",
+        );
+        // A KV head count that does not match attn_k.
+        llama_err(
+            &l_file("", None, &[("attention.head_count_kv", 2)]),
+            "attn_k",
+        );
+        // feed_forward_length not matching the FFN weights.
+        llama_err(
+            &l_file("", None, &[("feed_forward_length", 1 << 20)]),
+            "ffn_gate",
+        );
+        llama_err(
+            &l_file("blk.0.ffn_down.weight", Some(vec![2, 3]), &[]),
+            "ffn_down",
+        );
+        // embedding_length not matching token_embd, or a 2-D [1, 6] reshaping.
+        llama_err(
+            &l_file("", None, &[("embedding_length", 1 << 20)]),
+            "vocab × dim",
+        );
+        llama_err(
+            &l_file("token_embd.weight", Some(vec![1, 6]), &[]),
+            "vocab × dim",
+        );
+        // Norm weights must be `dim` long.
+        llama_err(
+            &l_file("blk.0.attn_norm.weight", Some(vec![3]), &[]),
+            "attn_norm",
+        );
+        llama_err(
+            &l_file("output_norm.weight", Some(vec![1]), &[]),
+            "output_norm",
+        );
+        // An explicit LM head must be [dim, vocab].
+        let mut ts = l_tensors();
+        ts.push(("output.weight", vec![2, 4]));
+        let ts: Vec<(&str, &[u64])> = ts.iter().map(|(n, d)| (*n, &d[..])).collect();
+        llama_err(&llama_file(&L_META, &[], &ts), "output.weight");
+    }
+
+    #[test]
+    fn one_d_embedding_needs_matching_nonzero_vocab_and_dim() {
+        let ts = |n: u64| {
+            let mut v = l_tensors();
+            v[0].1 = vec![n];
+            v
+        };
+        let file = |n: u64, vocab: u32, dim: u32| {
+            let t = ts(n);
+            let t: Vec<(&str, &[u64])> = t.iter().map(|(n, d)| (*n, &d[..])).collect();
+            let mut meta = L_META.to_vec();
+            meta[0].1 = dim;
+            meta.push(("vocab_size", vocab));
+            llama_file(&meta, &[], &t)
+        };
+        // [6] = 3 × 2 loads; vocab_size from the metadata.
+        assert_eq!(
+            file(6, 3, 2).load_llama_prec(None).unwrap().cfg.vocab_size,
+            3
+        );
+        // Wrong product, and the empty [0] with dim 0 claiming 2^30 tokens
+        // (0 × anything == 0, so only the non-zero check catches it).
+        llama_err(&file(6, 4, 2), "vocab × dim");
+        llama_err(&file(0, 1 << 30, 0), "vocab × dim");
+        // vocab × dim not matching (overflowing usize on 32-bit targets).
+        llama_err(&file(6, u32::MAX, u32::MAX), "vocab × dim");
+    }
+
+    #[test]
+    fn hostile_header_counts_fail_fast() {
+        let header = |n_tensors: u64, n_kv: u64| {
+            let mut o = Vec::new();
+            put_u32(&mut o, GGUF_MAGIC);
+            put_u32(&mut o, 3);
+            put_u64(&mut o, n_tensors);
+            put_u64(&mut o, n_kv);
+            o
+        };
+        // tensor / kv counts far beyond the bytes present.
+        assert!(Gguf::parse(header(u64::MAX, 0)).is_err());
+        assert!(Gguf::parse(header(0, u64::MAX)).is_err());
+        // An array count larger than the file, and a string length past EOF.
+        let mut a = header(0, 1);
+        put_str(&mut a, "k");
+        put_u32(&mut a, VT_ARRAY);
+        put_u32(&mut a, VT_U8);
+        put_u64(&mut a, 1 << 40);
+        let e = Gguf::parse(a).err().unwrap().to_string();
+        assert!(e.contains("array count exceeds"), "{e}");
+        let mut s = header(0, 1);
+        put_u64(&mut s, u64::MAX);
+        assert!(Gguf::parse(s).is_err());
+        // More than 8 dims.
+        let mut d = header(1, 0);
+        put_str(&mut d, "t");
+        put_u32(&mut d, 9);
+        assert!(Gguf::parse(d).err().unwrap().to_string().contains("9 dims"));
+    }
+
+    #[test]
+    fn open_grows_its_prefix_past_an_array_longer_than_the_first_read() {
+        // 1.1 Mi one-byte elements: more than `open`'s first 1 MiB read, so
+        // the count check must ask for more bytes, not reject the file.
+        let n = 1_100_000;
+        let mut b = crate::gguf_write::GgufBuilder::new();
+        b.meta("big", MetaValue::Array(vec![MetaValue::U8(7); n]));
+        b.tensor("t", &[2], GGML_F32, vec![0; 8]);
+        let bytes = b.into_bytes();
+        let (p, o) = parse_and_open(&bytes);
+        for g in [p.unwrap(), o.unwrap()] {
+            assert!(matches!(g.meta("big"), Some(MetaValue::Array(a)) if a.len() == n));
+            assert_eq!(g.file_len(), bytes.len());
+        }
     }
 
     #[test]

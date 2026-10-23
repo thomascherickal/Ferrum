@@ -14,7 +14,7 @@
 //! assert_eq!(tok.decode(&ids), "lowest");
 //! ```
 use crate::error::{InferError, Result};
-use crate::gguf::{Gguf, MetaValue};
+use crate::gguf::{bounded, Gguf, MetaValue};
 use crate::gguf_write::GgufBuilder;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -677,6 +677,15 @@ impl ByteBpeTokenizer {
             Some((m, s)) => (m, Some(s)),
             None => (state, None),
         };
+        // Each merge concatenates two earlier tokens, so a chain of merges can
+        // double a token's length per entry: 40 entries (~400 bytes of state)
+        // would build a 1 TiB vocab. Real vocabularies hold well under a byte
+        // of token text per state byte, so cap the total.
+        // ponytail: 64 B per state byte + 64 MiB; a tokenizer whose tokens
+        // really exceed that (trained on one giant word) would need a lazier
+        // vocab representation.
+        let max_bytes = state.len().saturating_mul(64).saturating_add(64 << 20);
+        let mut vocab_bytes = 0usize;
         if !merge_part.is_empty() {
             for entry in merge_part.split(';') {
                 let (a, b) = entry
@@ -696,6 +705,12 @@ impl ByteBpeTokenizer {
                         tok.vocab.len()
                     )));
                 }
+                let len = tok.vocab[a as usize].len() + tok.vocab[b as usize].len();
+                vocab_bytes = bounded(
+                    vocab_bytes.saturating_add(len),
+                    max_bytes,
+                    "tokenizer state vocab bytes",
+                )?;
                 let merged =
                     [tok.vocab[a as usize].clone(), tok.vocab[b as usize].clone()].concat();
                 tok.vocab.push(merged);
@@ -843,6 +858,26 @@ mod tests {
         assert!(ByteBpeTokenizer::from_state("not-a-pair").is_err());
         assert!(ByteBpeTokenizer::from_state("1,2;9999,3").is_err()); // undefined id
         assert!(ByteBpeTokenizer::from_state("x,y").is_err());
+    }
+
+    #[test]
+    fn doubling_merge_chain_in_state_is_capped() {
+        // "97,97;256,256;257,257;…": token 256+i is 2^(i+1) bytes, so 40
+        // entries (~400 bytes) would build a 1 TiB vocab. Rejected near the
+        // 64 MiB floor of the cap instead, fast.
+        let chain = |n: u32| {
+            std::iter::once("97,97".to_string())
+                .chain((0..n - 1).map(|i| format!("{0},{0}", 256 + i)))
+                .collect::<Vec<_>>()
+                .join(";")
+        };
+        let t = std::time::Instant::now();
+        let e = ByteBpeTokenizer::from_state(&chain(40)).err().unwrap();
+        assert!(e.to_string().contains("tokenizer state vocab bytes"), "{e}");
+        assert!(t.elapsed().as_secs() < 5, "took {:?}", t.elapsed());
+        // A 20-long chain (1 MiB token, 2 MiB total) is within the cap.
+        let tok = ByteBpeTokenizer::from_state(&chain(20)).unwrap();
+        assert_eq!(tok.vocab.last().unwrap().len(), 1 << 20);
     }
 
     #[test]
@@ -1515,7 +1550,7 @@ mod tests {
         f.extend_from_slice(&8u32.to_le_bytes()); // of strings
         f.extend_from_slice(&(u64::MAX / 2).to_le_bytes());
         let e = ByteBpeTokenizer::from_gguf_bytes(&f).err().unwrap();
-        assert!(e.to_string().contains("exceeds file size"), "{e}");
+        assert!(e.to_string().contains("array count exceeds"), "{e}");
     }
 
     #[test]

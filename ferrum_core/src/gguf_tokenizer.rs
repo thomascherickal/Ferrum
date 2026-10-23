@@ -453,6 +453,31 @@ mod tests {
         }
     }
 
+    /// Round 3: a tokenizer array whose declared count dwarfs the file is
+    /// rejected while parsing, before `from_gguf` sizes its maps by it.
+    #[test]
+    fn hostile_token_array_count_is_rejected_before_allocating() {
+        let mut kvs = Vec::new();
+        kv_str(&mut kvs, "tokenizer.ggml.model", "llama");
+        for key in ["tokenizer.ggml.tokens", "tokenizer.ggml.merges"] {
+            let mut k = kvs.clone();
+            put_str(&mut k, key);
+            put_u32(&mut k, 9); // VT_ARRAY
+            put_u32(&mut k, 8); // of strings
+            put_u64(&mut k, 1 << 40);
+            let mut bytes = Vec::new();
+            put_u32(&mut bytes, 0x4655_4747);
+            put_u32(&mut bytes, 3);
+            put_u64(&mut bytes, 0);
+            put_u64(&mut bytes, 2);
+            bytes.extend_from_slice(&k);
+            let t = std::time::Instant::now();
+            let e = Gguf::parse(bytes).err().expect("must be rejected");
+            assert!(e.to_string().contains("array count exceeds"), "{e}");
+            assert!(t.elapsed().as_secs() < 5);
+        }
+    }
+
     /// A GGUF carrying only a tokenizer metadata table (no tensors).
     fn tok_gguf(kvs: &[u8], n_kv: u64) -> Gguf {
         let mut bytes = Vec::new();

@@ -29,7 +29,7 @@
 
 use crate::activation::Activation;
 use crate::error::{InferError, Result};
-use crate::gguf::{transpose_2d, Gguf, MetaValue, GGML_F32, GGML_Q4_0, GGML_Q8_0};
+use crate::gguf::{bounded, transpose_2d, Gguf, MetaValue, GGML_F32, GGML_Q4_0, GGML_Q8_0};
 use crate::gguf_write::{encode_tensor, GgufBuilder};
 use crate::layer::Layer;
 use crate::layer::{ActivationLayer, Embedding, Flatten, LayerNorm, Linear, TransformerBlock};
@@ -681,6 +681,11 @@ fn generic_from(r: &GgufIn) -> Result<(Sequential, Normalizer, ModelMetadata)> {
             "layernorm" => Box::new(r.layernorm(&t("gamma"), &t("beta"), k("dim")?)?),
             "transformer_block" => {
                 let (ctx, heads, c, h) = (k("context")?, k("heads")?, k("dim")?, k("hidden")?);
+                // No tensor carries a block's context, yet it sizes the KV cache
+                // (2 · ctx · dim floats): bound ctx · dim by the file. A real
+                // model's F32 [dim, ctx] position table alone takes 4 · ctx · dim
+                // bytes, so valid files pass.
+                bounded(mul_dims(ctx, c)?, r.0.file_len(), "block context × dim")?;
                 let lin = |p: &str, a: usize, b: usize| {
                     r.linear(&t(&format!("{p}.weight")), &t(&format!("{p}.bias")), a, b)
                 };
@@ -1993,6 +1998,34 @@ mod tests {
         }
     }
 
+    /// Round 3, finding 2: a foreign gpt2 file with `embedding_length = 0`,
+    /// a 2^40 context and zero-size `[0, n]` tensors used to load and then
+    /// allocate feature names / ranges by the context (TBs from ~2 KB). Such
+    /// tensors are illegal now (only 1-D `[0]` may be empty), so it fails at
+    /// parse, fast.
+    #[test]
+    fn zero_width_gpt2_with_huge_context_fails_fast() {
+        let (m, n, meta) = bpe_parts(32, 64, true);
+        let gpt2 = to_gguf(&m, &n, &meta, QPrec::F32).unwrap();
+        let v = parse(&gpt2).tensor("token_embd.weight").unwrap().dims[1];
+        let bad = rebuild(&gpt2, |kv, ts| {
+            kv.insert("gpt2.embedding_length".into(), MetaValue::U32(0));
+            kv.insert("gpt2.block_count".into(), MetaValue::U32(0));
+            kv.insert("gpt2.context_length".into(), MetaValue::U64(1 << 40));
+            kv.remove("ferrum.metadata");
+            *ts = vec![
+                ("token_embd.weight".into(), vec![0, v], vec![]),
+                ("position_embd.weight".into(), vec![0, 1 << 40], vec![]),
+                ("output_norm.weight".into(), vec![0], vec![]),
+                ("output_norm.bias".into(), vec![0], vec![]),
+            ];
+        });
+        let t = std::time::Instant::now();
+        let e = load_err(&bad);
+        assert!(e.contains("only a 1-D [0]"), "{e}");
+        assert!(t.elapsed().as_secs() < 5, "took {:?}", t.elapsed());
+    }
+
     #[test]
     fn from_gguf_reports_bad_fields() {
         let s = |x: &str| MetaValue::String(x.into());
@@ -2152,6 +2185,43 @@ mod tests {
                     kv.insert("gpt2.attention.head_count".into(), MetaValue::U32(3));
                 }),
             ),
+            // Round 3: every metadata dim is tied to a (file-bounded) tensor
+            // before it sizes anything, so huge values fail on a shape check.
+            (
+                "huge context",
+                "position_embd.weight",
+                Box::new(|kv, _| {
+                    kv.insert("gpt2.context_length".into(), MetaValue::U64(1 << 40));
+                }),
+            ),
+            (
+                "zero width",
+                "token_embd.weight",
+                Box::new(|kv, _| {
+                    kv.insert("gpt2.embedding_length".into(), MetaValue::U32(0));
+                }),
+            ),
+            (
+                "huge width",
+                "token_embd.weight",
+                Box::new(|kv, _| {
+                    kv.insert("gpt2.embedding_length".into(), MetaValue::U64(1 << 40));
+                }),
+            ),
+            (
+                "huge ffn",
+                "ffn_up.weight",
+                Box::new(|kv, _| {
+                    kv.insert("gpt2.feed_forward_length".into(), MetaValue::U64(1 << 40));
+                }),
+            ),
+            (
+                "huge block count",
+                "missing tensor 'blk.2.attn_qkv.weight'",
+                Box::new(|kv, _| {
+                    kv.insert("gpt2.block_count".into(), MetaValue::U64(1 << 40));
+                }),
+            ),
         ];
         for (why, want, edit) in &cases {
             check(&gpt2, why, want, edit.as_ref());
@@ -2241,6 +2311,46 @@ mod tests {
                 "missing layernorm",
                 "missing tensor 'l2.gamma'",
                 Box::new(|_, ts| ts.retain(|t| t.0 != "l2.gamma")),
+            ),
+            (
+                &big,
+                "huge block context",
+                "block context × dim",
+                Box::new(|kv, _| {
+                    kv.insert("ferrum.layer.1.context".into(), MetaValue::U64(1 << 40));
+                }),
+            ),
+            (
+                &big,
+                "block context × dim overflows",
+                "overflows",
+                Box::new(|kv, _| {
+                    kv.insert("ferrum.layer.1.context".into(), MetaValue::U64(u64::MAX));
+                }),
+            ),
+            (
+                &big,
+                "huge embedding seq",
+                "l0.pos",
+                Box::new(|kv, _| {
+                    kv.insert("ferrum.layer.0.seq".into(), MetaValue::U64(1 << 40));
+                }),
+            ),
+            (
+                &tab,
+                "huge linear width",
+                "l0.weight",
+                Box::new(|kv, _| {
+                    kv.insert("ferrum.layer.0.out".into(), MetaValue::U64(1 << 40));
+                }),
+            ),
+            (
+                &tab,
+                "huge layer count",
+                "ferrum.layer.4.type",
+                Box::new(|kv, _| {
+                    kv.insert("ferrum.layer_count".into(), MetaValue::U64(1 << 40));
+                }),
             ),
             (
                 &big,

@@ -582,17 +582,25 @@ fn gguf_resident_bytes(g: &Gguf, prec: Option<QKind>) -> usize {
     for t in &g.tensors {
         let n = t.num_elements();
         let bytes = if t.name == "token_embd.weight" {
-            n * 4
+            n.saturating_mul(4)
         } else {
             match prec {
                 Some(QKind::Int4) => n.div_ceil(2),
                 Some(QKind::Int8) => n,
-                None => n * 4,
+                None => n.saturating_mul(4),
             }
         };
         total = total.saturating_add(bytes);
     }
     total
+}
+
+/// Total elements across all tensors. Saturating: a hostile directory's
+/// element counts must not overflow the sum (panic in debug, wrap in release).
+fn param_count(g: &Gguf) -> u64 {
+    g.tensors
+        .iter()
+        .fold(0u64, |acc, t| acc.saturating_add(t.num_elements() as u64))
 }
 
 /// Best-effort available RAM (Linux `/proc/meminfo`); `None` elsewhere.
@@ -662,7 +670,7 @@ pub async fn gguf_info(path: String) -> Result<GgufSummary, String> {
             "decode is a few tok/s on CPU; prefer int8 for speed, int4 for memory".to_string()
         };
         let mb = |b: usize| b as f64 / 1e6;
-        let param_count: u64 = g.tensors.iter().map(|t| t.num_elements() as u64).sum();
+        let param_count = param_count(&g);
         Ok(GgufSummary {
             path: path.clone(),
             bytes,
@@ -1282,6 +1290,27 @@ pub fn system_stats(state: State<'_, AppState>) -> Result<SysStats, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gguf_sums_saturate_on_hostile_element_counts() {
+        let mut b = ferrum_core::GgufBuilder::new();
+        b.tensor("token_embd.weight", &[2], 0, vec![0; 8]);
+        b.tensor("w", &[3], 0, vec![0; 12]);
+        let mut g = Gguf::parse(b.into_bytes()).unwrap();
+        assert_eq!(param_count(&g), 5);
+        assert_eq!(gguf_resident_bytes(&g, None), 20);
+        assert_eq!(gguf_resident_bytes(&g, Some(QKind::Int8)), 8 + 3);
+        assert_eq!(gguf_resident_bytes(&g, Some(QKind::Int4)), 8 + 2);
+        // Saturated dims (`parse` rejects them, but the sums must not rely
+        // on that): no overflow panic, no wrap-around.
+        for t in &mut g.tensors {
+            t.dims = vec![u64::MAX, 8];
+        }
+        assert_eq!(param_count(&g), u64::MAX);
+        for prec in [None, Some(QKind::Int8), Some(QKind::Int4)] {
+            assert_eq!(gguf_resident_bytes(&g, prec), usize::MAX);
+        }
+    }
 
     #[test]
     fn model_info_reports_gguf_format_and_rejects_other_files() {
