@@ -26,7 +26,7 @@ is a precise tool for small models. It is not a runtime for frontier LLMs.
 | **Quantization-aware** | Train against int8-snapped weights and ship models 4× smaller (int8) or 8× smaller (int4) that behave like what you trained. |
 | **Byte-level BPE** | Any UTF-8 text round-trips, with no unknown-token fallback. Tokenizers train quickly and can be saved and reused across runs. |
 | **A real training pipeline** | Non-overlapping windows, token budgets, warmup plus cosine LR, gradient clipping, weight tying, validation with early stopping, and checkpoint/resume. |
-| **GGUF in and out** | Import Llama/Qwen checkpoints (F32/F16/Q8_0/Q8_1/Q4_0/Q4_1, Q2_K–Q6_K k-quants) with their own tokenizer. Run them, fine-tune them with AdamW, and export them back to GGUF for llama.cpp, ollama, or LM Studio. |
+| **GGUF in and out** | Import Llama/Qwen checkpoints (F32/F16/Q8_0/Q8_1/Q4_0/Q4_1/Q5_0/Q5_1, Q2_K–Q6_K k-quants) with their own tokenizer. Run them, fine-tune them with AdamW, and export them back to GGUF for llama.cpp, ollama, or LM Studio. |
 
 ---
 

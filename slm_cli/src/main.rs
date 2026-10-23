@@ -477,7 +477,7 @@ fn print_usage() {
          \x20 --raw          (disable automatic chat-template formatting for instruct GGUFs)\n\
          \x20 --force        (load even if the memory estimate exceeds available RAM)\n\
          \x20 --resume ckpt.flck  (overlay fine-tuned weights; forces f32 load)\n\
-         \x20 NOTE: only F32/F16/Q8_0/Q8_1/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K GGUFs; on CPU\n\
+         \x20 NOTE: only F32/F16/Q8_0/Q8_1/Q4_0/Q4_1/Q5_0/Q5_1/Q4_K/Q5_K/Q6_K GGUFs; on CPU\n\
          \x20 a 1B model decodes at only a few tokens/sec (see Manual.md §13).\n\n\
          FINETUNE-GGUF options (AdamW fine-tune an imported GGUF; f32 masters):\n\
          \x20 --epochs N  --lr F  --batch N  --seq N   (window length; capped at ctx)\n\
@@ -1453,6 +1453,8 @@ fn ggml_type_name(t: u32) -> String {
         1 => "F16".into(),
         2 => "Q4_0".into(),
         3 => "Q4_1".into(),
+        6 => "Q5_0".into(),
+        7 => "Q5_1".into(),
         8 => "Q8_0".into(),
         9 => "Q8_1".into(),
         12 => "Q4_K".into(),

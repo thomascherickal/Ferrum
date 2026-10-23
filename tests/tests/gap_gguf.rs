@@ -11,7 +11,6 @@ fn one_tensor(ggml_type: u32, block: &[u8]) -> Result<Vec<f32>, String> {
 }
 
 #[test]
-#[ignore = "gap: Q5_0 tensors (written by llama-quantize Q5_0 and by Q4_K_M/Q5_K_M mixes) cannot be read"]
 fn q5_0_block_dequantizes() {
     // d = 1.0 (f16 0x3C00), qh = 0, qs = 0x32 -> low nibble 2 -> -14 (first 16), high nibble 3 -> -13 (last 16)
     let mut blk = vec![0x00, 0x3C, 0, 0, 0, 0];
@@ -22,7 +21,6 @@ fn q5_0_block_dequantizes() {
 }
 
 #[test]
-#[ignore = "gap: Q5_1 tensors cannot be read"]
 fn q5_1_block_dequantizes() {
     // d = 1.0, m = 0.5, qh = 0, qs = 0x21 -> low 1 -> 1.5 ; high 2 -> 2.5
     let mut blk = vec![0x00, 0x3C, 0x00, 0x38, 0, 0, 0, 0];

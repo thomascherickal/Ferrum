@@ -9,8 +9,8 @@
 use crate::AppState;
 use ferrum_core::{
     clean_corpus, corpus_stats, validate_for_training, Adam, CleanOptions, GenerativeSLM, Gguf,
-    GgufTokenizer, LlamaTrainer, LrSchedule, QKind, Rng, SamplingParams,
-    TransformerConfig, ValidationConfig,
+    GgufTokenizer, LlamaTrainer, LrSchedule, QKind, Rng, SamplingParams, TransformerConfig,
+    ValidationConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -1115,6 +1115,8 @@ fn ggml_type_name(t: u32) -> String {
         1 => "F16".into(),
         2 => "Q4_0".into(),
         3 => "Q4_1".into(),
+        6 => "Q5_0".into(),
+        7 => "Q5_1".into(),
         8 => "Q8_0".into(),
         9 => "Q8_1".into(),
         12 => "Q4_K".into(),

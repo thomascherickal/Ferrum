@@ -4,7 +4,7 @@
 //! quantized LLM/SLM weights. This module parses it with **zero dependencies**
 //! and **no `unsafe`**: header, the full typed metadata key/value table, the
 //! tensor directory, and dequantization of the common block formats (F32, F16,
-//! Q8_0, Q4_0, Q4_1, Q8_1) into f32 — from which [`crate::quant::QWeight`] packs
+//! Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_1) into f32 — from which [`crate::quant::QWeight`] packs
 //! them to Ferrum's in-memory int4/int8 (Opt#1).
 //!
 //! There is no `mmap` (it would need `unsafe`), so [`Gguf::from_path`] reads the
@@ -41,6 +41,8 @@ pub(crate) const GGML_F32: u32 = 0;
 pub(crate) const GGML_F16: u32 = 1;
 pub(crate) const GGML_Q4_0: u32 = 2;
 pub(crate) const GGML_Q4_1: u32 = 3;
+pub(crate) const GGML_Q5_0: u32 = 6;
+pub(crate) const GGML_Q5_1: u32 = 7;
 pub(crate) const GGML_Q8_0: u32 = 8;
 pub(crate) const GGML_Q8_1: u32 = 9;
 // k-quant super-block formats (G-K). These dominate modern GGUF downloads:
@@ -338,6 +340,8 @@ fn type_nbytes(ggml_type: u32, n: usize) -> Result<usize> {
         GGML_Q8_1 => mul(blocks()?, 2 + 2 + QK), // f16 d + f16 s + 32×i8
         GGML_Q4_0 => mul(blocks()?, 2 + QK / 2), // f16 d + 16 bytes
         GGML_Q4_1 => mul(blocks()?, 2 + 2 + QK / 2), // f16 d + f16 m + 16 bytes
+        GGML_Q5_0 => mul(blocks()?, 2 + 4 + QK / 2), // f16 d + 4-byte qh + 16 bytes
+        GGML_Q5_1 => mul(blocks()?, 2 + 2 + 4 + QK / 2), // f16 d + f16 m + qh + 16 bytes
         GGML_Q2_K => mul(kblocks()?, Q2_K_BLOCK),
         GGML_Q3_K => mul(kblocks()?, Q3_K_BLOCK),
         GGML_Q4_K => mul(kblocks()?, Q4_K_BLOCK),
@@ -653,6 +657,8 @@ impl Gguf {
             GGML_Q8_1 => dequant_q8_1(raw, n),
             GGML_Q4_0 => dequant_q4_0(raw, n),
             GGML_Q4_1 => dequant_q4_1(raw, n),
+            GGML_Q5_0 => dequant_q5(raw, n, false),
+            GGML_Q5_1 => dequant_q5(raw, n, true),
             GGML_Q2_K => dequant_q2_k(raw, n),
             GGML_Q3_K => dequant_q3_k(raw, n),
             GGML_Q4_K => dequant_q4_k(raw, n),
@@ -1012,6 +1018,34 @@ fn dequant_q4_1(raw: &[u8], n: usize) -> Result<Vec<f32>> {
             let x1 = (byte >> 4) as f32;
             out[blk * QK + j] = d * x0 + m;
             out[blk * QK + j + QK / 2] = d * x1 + m;
+        }
+    }
+    Ok(out)
+}
+
+/// Q5_0 (`f16 d`, 4-byte `qh`, 16 bytes `qs`; value `(q-16)*d`) and Q5_1 (adds
+/// `f16 m`; value `q*d+m`). `q` is the 4-bit nibble plus bit `j` (first half) /
+/// bit `j+16` (second half) of `qh` as the fifth bit, as in ggml.
+fn dequant_q5(raw: &[u8], n: usize, with_min: bool) -> Result<Vec<f32>> {
+    let nb = n / QK;
+    let mut out = vec![0.0f32; n];
+    let mut c = Cur::new(raw);
+    for blk in 0..nb {
+        let d = f16_to_f32(c.u16()?);
+        let m = if with_min { f16_to_f32(c.u16()?) } else { 0.0 };
+        let qh = c.take(4)?;
+        let qh = u32::from_le_bytes([qh[0], qh[1], qh[2], qh[3]]);
+        let qs = c.take(QK / 2)?;
+        for (j, &byte) in qs.iter().enumerate() {
+            let x0 = ((byte & 0x0F) as u32 | (((qh >> j) & 1) << 4)) as i32;
+            let x1 = ((byte >> 4) as u32 | (((qh >> (j + 16)) & 1) << 4)) as i32;
+            let (v0, v1) = if with_min {
+                (d * x0 as f32 + m, d * x1 as f32 + m)
+            } else {
+                (d * (x0 - 16) as f32, d * (x1 - 16) as f32)
+            };
+            out[blk * QK + j] = v0;
+            out[blk * QK + j + QK / 2] = v1;
         }
     }
     Ok(out)
@@ -1812,6 +1846,30 @@ mod tests {
             assert!((out[j] - (d * los[j] as f32 + m)).abs() < 1e-3);
             assert!((out[j + 16] - (d * his[j] as f32 + m)).abs() < 1e-3);
         }
+    }
+
+    #[test]
+    fn dequant_q5_high_bit_and_sizing() {
+        // qh bit j sets the 5th bit of element j; bit j+16 of element j+16.
+        let qh: u32 = (1 << 0) | (1 << 17);
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&f32_to_f16(2.0).to_le_bytes());
+        raw.extend_from_slice(&qh.to_le_bytes());
+        raw.extend_from_slice(&[0x21u8; 16]); // lo 1, hi 2
+        let q5_0 = dequant_q5(&raw, QK, false).unwrap();
+        assert_eq!(q5_0[0], 2.0 * (17 - 16) as f32); // 1 + 16
+        assert_eq!(q5_0[1], 2.0 * (1 - 16) as f32);
+        assert_eq!(q5_0[17], 2.0 * (18 - 16) as f32); // 2 + 16
+        assert_eq!(q5_0[16], 2.0 * (2 - 16) as f32);
+        raw.splice(2..2, f32_to_f16(0.5).to_le_bytes()); // d, m, qh, qs
+        let q5_1 = dequant_q5(&raw, QK, true).unwrap();
+        assert_eq!(q5_1[0], 2.0 * 17.0 + 0.5);
+        assert_eq!(q5_1[17], 2.0 * 18.0 + 0.5);
+        assert_eq!(type_nbytes(GGML_Q5_0, 64).unwrap(), 2 * 22);
+        assert_eq!(type_nbytes(GGML_Q5_1, 64).unwrap(), 2 * 24);
+        assert!(type_nbytes(GGML_Q5_0, 30).is_err());
+        // Truncated data errors instead of panicking.
+        assert!(dequant_q5(&raw[..10], QK, true).is_err());
     }
 
     #[test]

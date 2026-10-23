@@ -145,7 +145,7 @@ a 1–3 day job.
 | Tokenizer | `tokenizer` | ✅ Byte-level BPE, **incremental trainer**, whitespace pre-tokenization, rank-based encode, special tokens |
 | Data tools | `dataset` | ✅ `clean_corpus`, `corpus_stats`, `validate_for_training` |
 | Model format | `meta`, `loader` | ✅ FINF v4/v5; per-vector f32/int8/int4; bounds-checked |
-| GGUF reader | `gguf` | ✅ F32/F16/Q8_0/Q8_1/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K; Q2_K/Q3_K (read-only); streamed `open`; IQ* rejected |
+| GGUF reader | `gguf` | ✅ F32/F16/Q8_0/Q8_1/Q4_0/Q4_1/Q5_0/Q5_1/Q4_K/Q5_K/Q6_K; Q2_K/Q3_K (read-only); streamed `open`; IQ* rejected |
 | GGUF tokenizer | `gguf_tokenizer` | ✅ BPE exact; SPM decode exact, encode greedy |
 | Llama/Qwen runner | `llm` | ✅ RMSNorm, RoPE, GQA, SwiGLU; cached decode equals full forward |
 | Llama/Qwen fine-tuning | `llm_train` | ✅ Gradient-checked backprop, AdamW, schedules, QAT, dropout, `.flck` checkpoints, threaded epochs |

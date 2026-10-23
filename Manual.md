@@ -790,7 +790,7 @@ Ferrum imports small open-weight **Llama/Qwen** checkpoints in GGUF, the
 standard open-model format. It runs them, fine-tunes them, and writes them back
 out.
 
-**Formats read:** `F32, F16, Q8_0, Q8_1, Q4_0, Q4_1` and the k-quants
+**Formats read:** `F32, F16, Q8_0, Q8_1, Q4_0, Q4_1, Q5_0, Q5_1` and the k-quants
 `Q2_K, Q3_K, Q4_K, Q5_K, Q6_K`. The `IQ*` families are rejected with a clear
 message. **Architectures:** `llama`, `qwen2`.
 
