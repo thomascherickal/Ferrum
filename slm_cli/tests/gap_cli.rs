@@ -96,7 +96,6 @@ fn bpe_generate_accepts_short_seed_and_is_deterministic() {
 }
 
 #[test]
-#[ignore = "gap: CLI `generate --chars` ignores EOS (library generate_tokens stops with StopReason::Eos)"]
 fn cli_generate_stops_at_eos() {
     let d = tmp("eosgen");
     let corpus = d.join("c.txt");
