@@ -1154,7 +1154,7 @@ impl GenerativeSLM {
 
         if let Some(mut cached) = CachedTransformer::try_new(&self.model) {
             // Fast path: KV-cached incremental decoding over a rolling window.
-            let cap = cached.capacity().max(2);
+            let cap = cached.capacity().max(1);
             let mut window: Vec<usize> = if ids.is_empty() {
                 vec![eos.unwrap_or(0)]
             } else {
@@ -1206,7 +1206,7 @@ impl GenerativeSLM {
                 window.push(next);
                 if window.len() > cap {
                     // One re-prime per cap/2 tokens, not one per token.
-                    window.drain(..window.len() - cap / 2);
+                    window.drain(..window.len() - (cap / 2).max(1));
                     dist = cached.prime(&window)?;
                 } else {
                     dist = cached.feed(next)?;
@@ -1376,8 +1376,8 @@ impl GenerativeSLM {
         let mut cached = CachedTransformer::try_new(&self.model).ok_or_else(|| {
             InferError::DimMismatch("generate_tokens needs a transformer model".into())
         })?;
-        let cap = cached.capacity().max(2);
-        let keep = cap / 2;
+        let cap = cached.capacity().max(1);
+        let keep = (cap / 2).max(1);
 
         let mut window = self.encode_text(prompt)?;
         if window.is_empty() {
@@ -3537,6 +3537,41 @@ mod tests {
                 .unwrap();
         let out = slm.generate("a", 12, 0.8, &mut Rng::new(1)).unwrap();
         assert_eq!(out.chars().count(), 13);
+    }
+
+    #[test]
+    fn bpe_generation_survives_a_one_token_window() {
+        // Context 1: the window may hold one token, never the two `cap.max(2)`
+        // would allow (the cache would overflow).
+        let corpus = "the cat sat on the mat. ".repeat(30);
+        let cfg = TransformerConfig {
+            context_len: 1,
+            embed_dim: 8,
+            num_heads: 2,
+            num_blocks: 1,
+            hidden_dim: 16,
+            epochs: 1,
+            vocab_size: 270,
+            ..TransformerConfig::default()
+        };
+        let slm =
+            GenerativeSLM::train_transformer_config(&corpus, &cfg, &mut Rng::new(1), |_, _| {})
+                .unwrap();
+        let out = slm.generate("the", 40, 0.8, &mut Rng::new(1)).unwrap();
+        assert!(
+            out.starts_with("the") && out.chars().count() == 43,
+            "{out:?}"
+        );
+        let g = slm
+            .generate_tokens(
+                "the",
+                20,
+                &[],
+                &SamplingParams::with_temperature(0.8),
+                &mut Rng::new(2),
+            )
+            .unwrap();
+        assert_eq!(g.stop_reason, StopReason::MaxTokens, "{g:?}");
     }
 
     #[test]

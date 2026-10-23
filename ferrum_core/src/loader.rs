@@ -586,9 +586,12 @@ fn gpt2_from(r: &GgufIn) -> Result<(Sequential, Normalizer, ModelMetadata)> {
     let v = perm.len();
 
     let tok_rows = permute_rows(&r.rows("token_embd.weight", v, d)?, &perm, d);
-    let head_rows = match r.0.tensor("output.weight") {
-        Some(_) => permute_rows(&r.rows("output.weight", v, d)?, &perm, d),
-        None => tok_rows.clone(),
+    // No `output.weight`: the head is the token embedding (weight tying).
+    let tied = r.0.tensor("output.weight").is_none();
+    let head_rows = if tied {
+        tok_rows.clone()
+    } else {
+        permute_rows(&r.rows("output.weight", v, d)?, &perm, d)
     };
     let pos = r.rows("position_embd.weight", ctx, d)?;
     let mut model = Sequential::new().with(Box::new(Embedding::new(v, ctx, d, tok_rows, pos)?));
@@ -626,7 +629,11 @@ fn gpt2_from(r: &GgufIn) -> Result<(Sequential, Normalizer, ModelMetadata)> {
         d,
     )?));
     let head_w = transpose_2d(&head_rows, v, d);
-    model.push(Box::new(Linear::without_bias(d, v, head_w)?));
+    model.push(Box::new(if tied {
+        Linear::tied_head(d, v, head_w)?
+    } else {
+        Linear::without_bias(d, v, head_w)?
+    }));
     model.push(Box::new(ActivationLayer::new(Activation::Softmax)));
 
     let mut meta = match r.0.meta("ferrum.metadata").and_then(MetaValue::as_str) {
@@ -1642,8 +1649,11 @@ mod tests {
             }
             let (m2, _, meta2) = from_gguf(&f32_bytes).unwrap();
             assert_eq!(fwd(&m, &meta), fwd(&m2, &meta2), "f32 exact, tie={tie}");
-            // The reloaded head is bias-free too, so the parameter count survives.
-            assert_eq!(m2.num_params(), m.num_params(), "tie={tie}");
+            // The reloaded head is bias-free, so the parameter count survives;
+            // a tied file omits `output.weight`, so its head is not counted
+            // again (the fixture `m` carries an untied head Linear).
+            let shared = if tie { (v * d) as usize } else { 0 };
+            assert_eq!(m2.num_params(), m.num_params() - shared, "tie={tie}");
         }
     }
 

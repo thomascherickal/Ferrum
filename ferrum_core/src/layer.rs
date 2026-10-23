@@ -45,6 +45,9 @@ pub struct Linear {
     /// The zero `bias` only fills the shape: the layer has no bias parameters
     /// (the GPT-2 LM head), so it is not counted by `num_params`.
     bias_free: bool,
+    /// The weight is the transposed token embedding (a tied GPT-2 head): its
+    /// values are not separate parameters, so `num_params` counts none of it.
+    tied: bool,
 }
 
 impl Linear {
@@ -69,6 +72,7 @@ impl Linear {
             in_f,
             out_f,
             bias_free: false,
+            tied: false,
         })
     }
 
@@ -77,6 +81,15 @@ impl Linear {
     pub fn without_bias(in_f: usize, out_f: usize, weight: Vec<f32>) -> Result<Self> {
         let mut l = Self::new(in_f, out_f, weight, vec![0.0; out_f])?;
         l.bias_free = true;
+        Ok(l)
+    }
+
+    /// A bias-free head whose weight is shared with the token embedding
+    /// (weight tying). Behaves like [`Linear::without_bias`] but contributes no
+    /// parameters, so `Sequential::num_params` counts the shared matrix once.
+    pub fn tied_head(in_f: usize, out_f: usize, weight: Vec<f32>) -> Result<Self> {
+        let mut l = Self::without_bias(in_f, out_f, weight)?;
+        l.tied = true;
         Ok(l)
     }
 
@@ -113,6 +126,7 @@ impl Linear {
             in_f,
             out_f,
             bias_free: false,
+            tied: false,
         })
     }
 
@@ -153,6 +167,9 @@ impl Linear {
 
 impl Layer for Linear {
     fn num_params(&self) -> usize {
+        if self.tied {
+            return 0;
+        }
         self.in_f * self.out_f + if self.bias_free { 0 } else { self.bias.numel() }
     }
 
@@ -1653,6 +1670,13 @@ mod tests {
         let x = Tensor::matrix(1, 3, vec![1.0, 2.0, 3.0]).unwrap();
         assert_eq!(head.forward(&x).unwrap().data, vec![3.0; 4]);
         assert_eq!(head.quantize(QKind::Int8).num_params(), 12);
+        // A tied head shares the embedding's values: no parameters of its own,
+        // and it still computes x · W (quantized or not).
+        let tied = Linear::tied_head(3, 4, vec![0.5; 12]).unwrap();
+        assert_eq!(tied.num_params(), 0);
+        assert_eq!(tied.forward(&x).unwrap().data, vec![3.0; 4]);
+        assert_eq!(tied.quantize(QKind::Int8).num_params(), 0);
+        assert!(Linear::tied_head(3, 4, vec![0.0; 5]).is_err());
         assert!(Linear::without_bias(3, 4, vec![0.0; 5]).is_err());
         let q = QWeight::from_f32(&[0.5; 12], 3, 4, QKind::Int8);
         assert_eq!(

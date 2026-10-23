@@ -228,6 +228,25 @@ fn info_reports_params_and_int4() {
 }
 
 #[test]
+fn info_counts_a_tied_head_once() {
+    // Same tiny config as `info_reports_params_and_int4`, trained with --tie:
+    // the file omits output.weight, so `info` must not count the head again.
+    let block = 4 * (16 * 16 + 16) + 4 * 16 + (16 * 32 + 32) + (32 * 16 + 16);
+    for q in ["f32", "int8", "int4"] {
+        let (m, o) = train_quant(&format!("tied_{q}"), &["--quant", q], &["--tie"]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let text = info(&m);
+        let v: usize = line(&text, "Output dim").parse().unwrap();
+        let untied = v * 16 + 8 * 16 + block + 2 * 16 + 16 * v;
+        assert_eq!(
+            line(&text, "Params    "),
+            (untied - v * 16).to_string(),
+            "{q}: {text}"
+        );
+    }
+}
+
+#[test]
 fn train_quant_selects_the_on_disk_precision() {
     let mut sizes = Vec::new();
     for q in ["int8", "int4", "f32"] {

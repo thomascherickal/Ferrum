@@ -33,7 +33,9 @@ impl Sequential {
         &self.layers
     }
 
-    /// Total trainable parameters across all layers.
+    /// Count of distinct trainable parameters across all layers. A weight-tied
+    /// head shares the token embedding's values and adds none (see
+    /// [`crate::layer::Linear::tied_head`]).
     pub fn num_params(&self) -> usize {
         self.layers.iter().map(|l| l.num_params()).sum()
     }
@@ -175,6 +177,11 @@ mod tests {
                 .unwrap();
         net.set_weight_tying(true);
         assert_eq!(net.num_params(), 507_552 - 1024 * 96);
+        // The inference model built from a tied net reports the same count.
+        assert_eq!(
+            net.to_inference().unwrap().num_params(),
+            507_552 - 1024 * 96
+        );
         net.set_weight_tying(false);
         assert_eq!(net.num_params(), 507_552);
     }

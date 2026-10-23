@@ -1384,7 +1384,12 @@ impl TransformerNet {
         } else {
             self.head_w.data.data.clone()
         };
-        m.push(Box::new(Linear::without_bias(
+        let head = if self.tie_weights {
+            Linear::tied_head
+        } else {
+            Linear::without_bias
+        };
+        m.push(Box::new(head(
             self.embed_dim,
             self.vocab_size,
             head_w_data,
