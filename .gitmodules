@@ -1,0 +1,12 @@
+[submodule "ferrum-cpu"]
+	path = ferrum-cpu
+	url = git@github.com:thomascherickal/ferrum-cpu.git
+[submodule "ferrum-gpu"]
+	path = ferrum-gpu
+	url = git@github.com:thomascherickal/ferrum-gpu.git
+[submodule "ferrum-ml"]
+	path = ferrum-ml
+	url = git@github.com:thomascherickal/ferrum-ml.git
+[submodule "ferrum-junk"]
+	path = ferrum-junk
+	url = git@github.com:thomascherickal/ferrum-junk.git
